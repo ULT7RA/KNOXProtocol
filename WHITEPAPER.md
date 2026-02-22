@@ -19,7 +19,7 @@ or open-source library beyond standard cryptographic primitives (Argon2, BLAKE3,
 ChaCha20-Poly1305). KNOX is not a fork of Bitcoin, Monero, Ethereum, or any other chain.
 Every cryptographic construction — the ring signature scheme, the commitment scheme, the
 range proofs, the stealth address system, the P2P handshake, the consensus engine, and the
-mining kernel — was designed and implemented specifically for KNOX
+mining kernel — was designed and implemented specifically for KNOX.
 
 KNOX is the first Layer-1 blockchain in existence to run fully end-to-end lattice cryptography
 across every protocol layer: transaction signing, output commitments, range proofs, stealth
