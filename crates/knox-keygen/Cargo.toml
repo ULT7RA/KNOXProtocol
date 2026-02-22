@@ -1,0 +1,10 @@
+[package]
+name = "knox-keygen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+knox-crypto = { path = "../knox-crypto" }
+knox-lattice = { path = "../knox-lattice" }
+knox-types = { path = "../knox-types" }

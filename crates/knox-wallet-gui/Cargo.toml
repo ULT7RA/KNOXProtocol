@@ -1,0 +1,11 @@
+[package]
+name = "knox-wallet-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe = { version = "0.24", default-features = false, features = ["glow", "default_fonts"] }
+knox-wallet = { path = "../knox-wallet" }
+knox-types = { path = "../knox-types" }
+winapi = { version = "0.3", features = ["winuser", "windef"] }

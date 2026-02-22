@@ -1,0 +1,30 @@
+# Local/private data
+/nonpublic/
+/data/
+/data-smoke/
+/launch-mainnet/
+/testnet/
+/certs/
+wallet*.bin
+node-wallet.bin
+*.key
+
+# Build artifacts
+/target/
+/target-*/
+/tmp-smoke/
+/cargo-msvc-test-target/
+apps/**/node_modules/
+apps/**/dist/
+apps/**/out/
+apps/**/bin/
+fuzz/target/
+fuzz/corpus/
+
+# Crash dumps / logs
+*.dmp
+*.log
+
+# OS cruft
+.DS_Store
+Thumbs.db

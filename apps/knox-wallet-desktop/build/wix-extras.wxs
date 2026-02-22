@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Fragment>
+
+    <Property Id="OLDNSIS_HKCU">
+      <RegistrySearch Id="FindOldNSIS_HKCU" Type="raw" Root="HKCU"
+        Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\knox-wallet"
+        Name="UninstallString" Win64="yes" />
+    </Property>
+
+    <Property Id="OLDNSIS_HKLM">
+      <RegistrySearch Id="FindOldNSIS_HKLM" Type="raw" Root="HKLM"
+        Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\knox-wallet"
+        Name="UninstallString" Win64="yes" />
+    </Property>
+
+    <!-- Step 1: Kill running Knox processes -->
+    <SetProperty Id="CA_KillKnox"
+      Value='"[SystemFolder]cmd.exe" /C "taskkill /F /T /IM &quot;KNOX WALLET.exe&quot; 2&gt;nul &amp; taskkill /F /T /IM &quot;knox-wallet.exe&quot; 2&gt;nul &amp; taskkill /F /T /IM &quot;knox-node.exe&quot; 2&gt;nul &amp; taskkill /F /T /IM &quot;knox-wallet-cli.exe&quot; 2&gt;nul"'
+      Sequence="execute" Before="CA_KillKnox" />
+    <CustomAction Id="CA_KillKnox" BinaryKey="WixCA" DllEntry="WixQuietExec64"
+      Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- Step 2: Wait for handles to release -->
+    <SetProperty Id="CA_WaitForKill"
+      Value='"[SystemFolder]cmd.exe" /C "ping -n 4 127.0.0.1 &gt;nul"'
+      Sequence="execute" Before="CA_WaitForKill" />
+    <CustomAction Id="CA_WaitForKill" BinaryKey="WixCA" DllEntry="WixQuietExec64"
+      Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- Step 3a: Silent uninstall old NSIS (HKCU) -->
+    <SetProperty Id="CA_RemoveOldNSIS_HKCU"
+      Value='"[OLDNSIS_HKCU]" /S'
+      Sequence="execute" Before="CA_RemoveOldNSIS_HKCU" />
+    <CustomAction Id="CA_RemoveOldNSIS_HKCU" BinaryKey="WixCA" DllEntry="WixQuietExec64"
+      Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- Step 3b: Silent uninstall old NSIS (HKLM) -->
+    <SetProperty Id="CA_RemoveOldNSIS_HKLM"
+      Value='"[OLDNSIS_HKLM]" /S'
+      Sequence="execute" Before="CA_RemoveOldNSIS_HKLM" />
+    <CustomAction Id="CA_RemoveOldNSIS_HKLM" BinaryKey="WixCA" DllEntry="WixQuietExec64"
+      Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- Step 4: Force-delete old dir if uninstaller failed/crashed -->
+    <SetProperty Id="CA_ForceDeleteOld"
+      Value='"[SystemFolder]cmd.exe" /C "rd /s /q &quot;[LocalAppDataFolder]Programs\KNOX WALLET&quot; 2&gt;nul"'
+      Sequence="execute" Before="CA_ForceDeleteOld" />
+    <CustomAction Id="CA_ForceDeleteOld" BinaryKey="WixCA" DllEntry="WixQuietExec64"
+      Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="CA_KillKnox"           After="InstallInitialize">NOT REMOVE~="ALL"</Custom>
+      <Custom Action="CA_WaitForKill"         After="CA_KillKnox">NOT REMOVE~="ALL"</Custom>
+      <Custom Action="CA_RemoveOldNSIS_HKCU"  After="CA_WaitForKill">OLDNSIS_HKCU AND NOT REMOVE~="ALL"</Custom>
+      <Custom Action="CA_RemoveOldNSIS_HKLM"  After="CA_RemoveOldNSIS_HKCU">OLDNSIS_HKLM AND NOT REMOVE~="ALL"</Custom>
+      <Custom Action="CA_ForceDeleteOld"      After="CA_RemoveOldNSIS_HKLM">NOT REMOVE~="ALL"</Custom>
+    </InstallExecuteSequence>
+
+  </Fragment>
+</Wix>

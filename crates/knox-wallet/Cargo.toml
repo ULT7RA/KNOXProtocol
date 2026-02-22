@@ -1,0 +1,22 @@
+[package]
+name = "knox-wallet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+autobins = false
+
+[[bin]]
+name = "knox-wallet-cli"
+path = "src/main.rs"
+
+[dependencies]
+bincode.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+argon2.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+knox-crypto = { path = "../knox-crypto" }
+knox-lattice = { path = "../knox-lattice" }
+knox-types = { path = "../knox-types" }
+curve25519-dalek.workspace = true

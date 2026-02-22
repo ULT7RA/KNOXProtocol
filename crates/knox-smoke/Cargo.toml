@@ -1,0 +1,24 @@
+[package]
+name = "knox-smoke"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+types = ["knox-types"]
+crypto = ["knox-crypto"]
+consensus = ["knox-consensus"]
+ledger = ["knox-ledger"]
+p2p = ["knox-p2p"]
+core = ["knox-core", "knox-p2p", "knox-consensus", "knox-types"]
+tokio = ["dep:tokio"]
+
+[dependencies]
+knox-types = { path = "../knox-types", optional = true }
+knox-crypto = { path = "../knox-crypto", optional = true }
+knox-consensus = { path = "../knox-consensus", optional = true }
+knox-ledger = { path = "../knox-ledger", optional = true }
+knox-p2p = { path = "../knox-p2p", optional = true }
+knox-core = { path = "../knox-core", optional = true }
+tokio = { workspace = true, optional = true }

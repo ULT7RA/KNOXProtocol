@@ -1,0 +1,9 @@
+[package]
+name = "knox-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+bincode.workspace = true

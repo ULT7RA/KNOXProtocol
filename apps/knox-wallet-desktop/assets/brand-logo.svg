@@ -1,0 +1,47 @@
+<svg width="1200" height="800" viewBox="0 0 1200 800" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g1" x1="0" y1="0" x2="1200" y2="800" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#050C1D"/>
+      <stop offset="0.55" stop-color="#0A1A3D"/>
+      <stop offset="1" stop-color="#102650"/>
+    </linearGradient>
+    <radialGradient id="g2" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(260 120) rotate(24) scale(420 260)">
+      <stop stop-color="#FF35D2" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#FF35D2" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="g3" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(980 680) rotate(-16) scale(520 320)">
+      <stop stop-color="#00E5FF" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#00E5FF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1200" height="800" fill="url(#g1)"/>
+  <rect width="1200" height="800" fill="url(#g2)"/>
+  <rect width="1200" height="800" fill="url(#g3)"/>
+
+  <g stroke="#00E5FF" stroke-opacity="0.16" stroke-width="1">
+    <path d="M0 780H1200"/>
+    <path d="M0 744H1200"/>
+    <path d="M0 708H1200"/>
+    <path d="M0 672H1200"/>
+    <path d="M0 636H1200"/>
+    <path d="M0 600H1200"/>
+    <path d="M0 564H1200"/>
+  </g>
+
+  <g>
+    <circle cx="600" cy="400" r="230" stroke="#00E5FF" stroke-opacity="0.2" stroke-width="2"/>
+    <circle cx="600" cy="400" r="168" stroke="#FF35D2" stroke-opacity="0.14" stroke-width="2"/>
+  </g>
+
+  <g fill="none" stroke-linecap="round">
+    <path d="M320 472C420 412 540 388 720 364" stroke="#00E5FF" stroke-opacity="0.48" stroke-width="3"/>
+    <path d="M330 506C450 486 556 464 782 438" stroke="#FF35D2" stroke-opacity="0.40" stroke-width="3"/>
+  </g>
+
+  <g>
+    <rect x="494" y="320" width="212" height="146" rx="20" fill="#081631" stroke="#00E5FF" stroke-opacity="0.72"/>
+    <text x="600" y="388" text-anchor="middle" fill="#E5F7FF" font-size="36" font-family="Orbitron, Rajdhani, sans-serif" font-weight="700">KNOX</text>
+    <text x="600" y="420" text-anchor="middle" fill="#8FB2CE" font-size="16" font-family="Rajdhani, sans-serif" letter-spacing="2">WALLET</text>
+  </g>
+</svg>

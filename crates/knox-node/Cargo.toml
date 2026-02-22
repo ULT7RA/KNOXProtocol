@@ -1,0 +1,16 @@
+[package]
+name = "knox-node"
+version = "1.1.9"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+knox-core = { path = "../knox-core" }
+knox-consensus = { path = "../knox-consensus" }
+knox-p2p = { path = "../knox-p2p" }
+knox-crypto = { path = "../knox-crypto" }
+knox-lattice = { path = "../knox-lattice" }
+knox-types = { path = "../knox-types" }
+knox-ledger = { path = "../knox-ledger" }
+bincode.workspace = true
+tokio.workspace = true
