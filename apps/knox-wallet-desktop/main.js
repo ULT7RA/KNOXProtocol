@@ -1793,8 +1793,14 @@ function createWindow() {
     const effectiveProfile = profile || miningProfileState || loadMiningConfig().profile;
     miningProfileState = effectiveProfile;
     if (!service.node) return { ok: true, result: 'saved (node not running)' };
+    // Detect whether the running node was using a GPU backend before stopping it.
+    // CUDA/OpenCL drivers on Windows need extra time to release the GPU context
+    // after a forced kill; 300ms is not sufficient for high-end GPUs (e.g. RTX 4090).
+    const wasGpu = ['cuda', 'opencl'].includes(
+      String(runtimeStats.node.activeBackend || runtimeStats.node.configuredBackend || '').toLowerCase()
+    );
     stopSvc('node');
-    await waitMs(300);
+    await waitMs(wasGpu ? 2000 : 400);
     const validatorsPath = ensureValidatorsFile(win);
     const nodeBin = resolveBin('knox-node.exe');
     const minerAddress = await resolveMinerAddress();
