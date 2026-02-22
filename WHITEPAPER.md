@@ -243,6 +243,72 @@ A monthly event window lasting ~16 hours 18 minutes, starting at an unpredictabl
 
     Post-Emission: After 21 years, miners are sustained by transaction fees only. The hard cap is absolute.
 
-10. Conclusion
+10. KNOX Desktop Wallet
+
+Most post-quantum research ends at the protocol layer. KNOX ships a complete, production-ready
+desktop wallet alongside the node — because a protocol that cannot be used by real people is
+not a finished protocol.
+
+The KNOX Desktop Wallet is a native Windows application distributed as a single MSI installer
+with no external dependencies. It bundles the full KNOX node, the wallet daemon, and a polished
+React-based UI into one cohesive package. A user can go from a blank machine to a live,
+mining, privacy-preserving KNOX node in under two minutes.
+
+10.1 Architecture
+
+The desktop wallet is composed of three integrated layers:
+
+    knox-node: The full Layer-1 node — mempool, block production, P2P networking,
+    consensus participation — running locally on the user's machine.
+
+    knox-walletd: A wallet daemon exposing a JSON API over local TLS. All wallet operations
+    (UTXO scanning, transaction building, address derivation) happen here, isolated from
+    the UI layer and accessible only over localhost with TLS certificate enforcement.
+
+    Electron UI: A desktop shell built with React, TanStack Query, and Zustand.
+    Communicates with walletd exclusively through the secure local API.
+
+This separation means the cryptographic core and key material never touch the UI process.
+The wallet daemon is a trust boundary — the UI layer is treated as untrusted by design.
+
+10.2 Key Management and Encryption
+
+Wallet files are encrypted with Argon2id key derivation and XChaCha20-Poly1305 authenticated
+encryption — the same cryptographic discipline applied to the chain itself. View keys and
+spend keys are separated: a recipient can share their view key for auditing without exposing
+any spend authority. Multiple stealth addresses can be derived from a single wallet file,
+each producing a fresh unlinkable one-time address for every transaction received.
+
+10.3 What Ships in the Box
+
+    One-click Quick Start: Starts the node, wallet daemon, and mining in a single action.
+
+    Live Mining Dashboard: Real-time hash rate, difficulty, streak bonus, surge phase,
+    and block count — all visible at a glance.
+
+    Multi-Address Wallet: Generate as many stealth addresses as needed from a single
+    wallet file. Each address is independently unlinkable on-chain.
+
+    Full Send UI: Ring size selection, fee control, recipient address, and confirmation
+    dialog — everything needed to send a private lattice transaction from a desktop.
+
+    TLS Certificate Generation: First-run generates a self-signed TLS certificate for
+    the local wallet daemon. This is a one-click operation. The wallet will not start
+    without it, enforcing encrypted local communication by default.
+
+    Sync Control: Manual sync triggers a full UTXO rescan so balance always reflects
+    the true chain state.
+
+10.4 Why This Matters
+
+Shipping a full desktop wallet is not a cosmetic feature. It is a statement about what
+KNOX is. Privacy cryptography that lives only in academic papers or CLI tools reaches
+almost no one. The KNOX desktop wallet makes post-quantum, ring-signature, stealth-address
+privacy accessible to any user on a standard Windows machine — no Rust toolchain, no
+command line, no configuration files required.
+
+The wallet exists because KNOX was built to be used, not just theorized.
+
+11. Conclusion
 
 KNOX is a mathematical fortress. It is the first protocol to combine Post-Quantum Ring Signatures, Confidential Transactions, Lattice Stealth Addresses, and Forward-Immunity Hardening into a single, cohesive Layer-1. The "Unpredictable Excitement" of the Surge, the "Loyalty Incentive" of the Streak, and the "Total Privacy" of Lattice-LSAG create a protocol designed to be a permanent digital asset that survives the quantum age.
