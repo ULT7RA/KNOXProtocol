@@ -628,7 +628,7 @@ fn decode_envelope(frame: &[u8], psk: Option<[u8; 32]>) -> Option<Envelope> {
         (FRAME_ENCRYPTED, None) => return None,
         _ => return None,
     };
-    bincode::decode_from_slice::<Envelope, _>(&payload, bincode::config::standard())
+    bincode::decode_from_slice::<Envelope, _>(&payload, bincode::config::standard().with_limit::<{ 32 * 1024 * 1024 }>())
         .ok()
         .map(|(env, _)| env)
 }

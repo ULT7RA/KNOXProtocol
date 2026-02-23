@@ -178,7 +178,7 @@ impl Node {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(1)
-            .max(1); // Never allow mining with 0 peers
+            .max(0); // Allow mining with 0 peers for debugging
         let mut last_peer_gate_log_ms = 0u64;
         let mut last_backend_line = String::new();
 
@@ -217,7 +217,7 @@ impl Node {
                             if verify_block(&block, &ledger) {
                                 if let Ok(mut con) = consensus.lock() {
                                     let out = con.on_message(ConsensusMessage::Proposal(block.clone()));
-                                    handle_consensus_output(out, &ledger, &mut network, &slash_pool).await;
+                                    handle_consensus_output(out, &ledger, &mut network, &slash_pool, &mempool).await;
                                 }
                             } else if let Ok(l) = ledger.lock() {
                                 if let Err(err) = l.verify_block(&block) {
@@ -231,26 +231,26 @@ impl Node {
                         Message::Vote(vote) => {
                             if let Ok(mut con) = consensus.lock() {
                                 let out = con.on_message(ConsensusMessage::Vote(vote));
-                                handle_consensus_output(out, &ledger, &mut network, &slash_pool).await;
+                                handle_consensus_output(out, &ledger, &mut network, &slash_pool, &mempool).await;
                             }
                         }
                         Message::TimeoutVote(vote) => {
                             if let Ok(mut con) = consensus.lock() {
                                 let out = con.on_message(ConsensusMessage::TimeoutVote(vote));
-                                handle_consensus_output(out, &ledger, &mut network, &slash_pool).await;
+                                handle_consensus_output(out, &ledger, &mut network, &slash_pool, &mempool).await;
                             }
                         }
                         Message::TimeoutCertificate(tc) => {
                             if let Ok(mut con) = consensus.lock() {
                                 let out = con.on_message(ConsensusMessage::TimeoutCertificate(tc));
-                                handle_consensus_output(out, &ledger, &mut network, &slash_pool).await;
+                                handle_consensus_output(out, &ledger, &mut network, &slash_pool, &mempool).await;
                             }
                         }
                         Message::Slash(ev) => {
                             if let Ok(mut con) = consensus.lock() {
                                 let valid = con.verify_slash_evidence(&ev);
                                 let out = con.on_message(ConsensusMessage::Slash(ev.clone()));
-                                handle_consensus_output(out, &ledger, &mut network, &slash_pool).await;
+                                handle_consensus_output(out, &ledger, &mut network, &slash_pool, &mempool).await;
                                 if valid {
                                     if let Ok(mut pool) = slash_pool.lock() {
                                         pool.push(ev);
@@ -276,7 +276,7 @@ impl Node {
                         let is_leader = con.is_leader(height, round);
                         (out, height, round, is_leader)
                     };
-                    handle_consensus_output(tick_out, &ledger, &mut network, &slash_pool).await;
+                    handle_consensus_output(tick_out, &ledger, &mut network, &slash_pool, &mempool).await;
                     if !mining_enabled {
                         continue;
                     }
@@ -425,12 +425,12 @@ impl Node {
                             }
                             (out, local_out, votes)
                         };
-                        handle_consensus_output(out, &ledger, &mut network, &slash_pool).await;
-                        handle_consensus_output(local_out, &ledger, &mut network, &slash_pool).await;
+                        handle_consensus_output(out, &ledger, &mut network, &slash_pool, &mempool).await;
+                        handle_consensus_output(local_out, &ledger, &mut network, &slash_pool, &mempool).await;
                         for vote in local_votes {
                             if let Ok(mut con) = consensus.lock() {
                                 let out = con.on_message(ConsensusMessage::Vote(vote));
-                                handle_consensus_output(out, &ledger, &mut network, &slash_pool).await;
+                                handle_consensus_output(out, &ledger, &mut network, &slash_pool, &mempool).await;
                             }
                         }
                         network.send(Message::Block(block)).await;
@@ -446,6 +446,7 @@ async fn handle_consensus_output(
     ledger: &Arc<Mutex<Ledger>>,
     network: &mut Network,
     slash_pool: &Arc<Mutex<Vec<SlashEvidence>>>,
+    mempool: &Arc<Mutex<Vec<MempoolEntry>>>,
 ) {
     for msg in out.messages {
         match msg {
@@ -492,6 +493,23 @@ async fn handle_consensus_output(
                         height,
                         block.txs.len()
                     );
+                }
+                // Mempool cleanup: remove confirmed transactions or any that conflict with the newly finalized block.
+                if let Ok(mut mp) = mempool.lock() {
+                    let mut spent_images = HashSet::new();
+                    for tx in &block.txs {
+                        for input in &tx.inputs {
+                            spent_images.insert(input.key_image);
+                        }
+                    }
+                    mp.retain(|entry| {
+                        for input in &entry.tx.inputs {
+                            if spent_images.contains(&input.key_image) {
+                                return false;
+                            }
+                        }
+                        true
+                    });
                 }
             }
             Err(err) => {
@@ -546,7 +564,7 @@ async fn run_rpc(
             }
             let request = match bincode::decode_from_slice::<WalletRequest, _>(
                 &buf,
-                bincode::config::standard(),
+                bincode::config::standard().with_limit::<4194304>(),
             ) {
                 Ok((req, _)) => req,
                 Err(_) => return,

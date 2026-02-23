@@ -17,6 +17,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 
 const LATTICE_PUBKEY_BYTES: usize = knox_lattice::params::N * 2;
+const GENESIS_BYTES: &[u8] = include_bytes!("genesis.bin");
 
 fn main() {
     if std::env::var("KNOX_NODE_EXIT_IMMEDIATELY").is_ok() {
@@ -150,6 +151,8 @@ async fn async_main() {
             std::process::exit(1);
         }
     }
+
+    seed_genesis_if_empty(&data_dir, &validators.validators);
 
     let cfg = NodeConfig {
         data_dir,
@@ -561,6 +564,40 @@ fn path_within(child: &Path, base: &Path) -> bool {
     #[cfg(not(windows))]
     {
         child == base || child.starts_with(base)
+    }
+}
+
+fn seed_genesis_if_empty(data_dir: &str, validators: &[LatticePublicKey]) {
+    let ledger_path = format!("{}/ledger", data_dir);
+    let mut ledger = match Ledger::open(&ledger_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[knox-node] genesis seed: ledger open failed: {e}");
+            return;
+        }
+    };
+    match ledger.get_block(0) {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("[knox-node] genesis seed: get_block failed: {e}");
+            return;
+        }
+    }
+    let (block, _): (knox_types::Block, usize) = match bincode::decode_from_slice(
+        GENESIS_BYTES,
+        bincode::config::standard().with_limit::<{ 32 * 1024 * 1024 }>(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[knox-node] genesis seed: decode failed: {e}");
+            return;
+        }
+    };
+    ledger.set_validators(validators.to_vec());
+    match ledger.append_block(&block) {
+        Ok(()) => eprintln!("[knox-node] genesis seeded from bundle (h=0)"),
+        Err(e) => eprintln!("[knox-node] genesis seed: append failed: {e}"),
     }
 }
 

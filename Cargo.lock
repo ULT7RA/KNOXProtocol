@@ -1102,7 +1102,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "knox-consensus"
-version = "1.1.9"
+version = "1.2.0"
 dependencies = [
  "bincode",
  "blake3",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "knox-core"
-version = "1.1.9"
+version = "1.2.0"
 dependencies = [
  "bincode",
  "curve25519-dalek",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "knox-crypto"
-version = "1.1.9"
+version = "1.2.0"
 dependencies = [
  "bincode",
  "blake3",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "knox-keygen"
-version = "1.1.9"
+version = "1.2.0"
 dependencies = [
  "knox-crypto",
  "knox-lattice",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "knox-lattice"
-version = "1.1.9"
+version = "1.2.0"
 dependencies = [
  "argon2",
  "bincode",
@@ -1161,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "knox-ledger"
-version = "1.1.9"
+version = "1.2.0"
 dependencies = [
  "bincode",
  "curve25519-dalek",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "knox-p2p"
-version = "1.1.9"
+version = "1.2.0"
 dependencies = [
  "bincode",
  "blake3",
@@ -1201,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "knox-smoke"
-version = "1.1.9"
+version = "1.2.0"
 dependencies = [
  "knox-consensus",
  "knox-core",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "knox-storage"
-version = "1.1.9"
+version = "1.2.0"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -1224,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "knox-types"
-version = "1.1.9"
+version = "1.2.0"
 dependencies = [
  "bincode",
  "blake3",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "knox-wallet"
-version = "1.1.9"
+version = "1.2.0"
 dependencies = [
  "argon2",
  "bincode",
@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "knox-wallet-gui"
-version = "1.1.9"
+version = "1.2.0"
 dependencies = [
  "eframe",
  "knox-types",

@@ -62,17 +62,17 @@ impl Ledger {
         if self.get_block(height)?.is_some() {
             return Err(format!("block height {} already exists", height));
         }
-        self.verify_block(block)?;
+        self.verify_block(block).map_err(|e| format!("verify: {e}"))?;
         let key = block_key(height);
         let bytes = bincode::encode_to_vec(block, bincode::config::standard())
-            .map_err(|e| e.to_string())?;
-        self.db.put(&key, &bytes)?;
-        self.db.put(b"height", &height.to_le_bytes())?;
+            .map_err(|e| format!("encode: {e}"))?;
+        self.db.put(&key, &bytes).map_err(|e| format!("db-put-block: {e}"))?;
+        self.db.put(b"height", &height.to_le_bytes()).map_err(|e| format!("db-put-height: {e}"))?;
         let mut decoy_bucket = Vec::new();
         for tx in &block.txs {
-            self.apply_tx(tx, height, &mut decoy_bucket)?;
+            self.apply_tx(tx, height, &mut decoy_bucket).map_err(|e| format!("apply-tx: {e}"))?;
         }
-        self.store_decoy_bucket(height, &decoy_bucket)?;
+        self.store_decoy_bucket(height, &decoy_bucket).map_err(|e| format!("decoy-bucket: {e}"))?;
         for ev in &block.slashes {
             self.record_slash(ev.vote_a.voter)?;
         }
@@ -84,7 +84,7 @@ impl Ledger {
         match self.db.get(&key)? {
             Some(bytes) => {
                 let decoded: Result<(Block, usize), _> =
-                    bincode::decode_from_slice(&bytes, bincode::config::standard());
+                    bincode::decode_from_slice(&bytes, bincode::config::standard().with_limit::<{ 32 * 1024 * 1024 }>());
                 Ok(decoded.ok().map(|(b, _)| b))
             }
             None => Ok(None),
@@ -580,7 +580,7 @@ impl Ledger {
                 continue;
             };
             let (members, _): (Vec<RingMember>, usize) =
-                bincode::decode_from_slice(&bytes, bincode::config::standard())
+                bincode::decode_from_slice(&bytes, bincode::config::standard().with_limit::<{ 32 * 1024 * 1024 }>())
                     .map_err(|e| e.to_string())?;
             for m in members {
                 out.push((m, h));
@@ -611,7 +611,7 @@ impl Ledger {
         match self.db.get(b"slashed")? {
             Some(bytes) => {
                 let (list, _): (Vec<u16>, usize) =
-                    bincode::decode_from_slice(&bytes, bincode::config::standard())
+                    bincode::decode_from_slice(&bytes, bincode::config::standard().with_limit::<{ 32 * 1024 * 1024 }>())
                         .map_err(|e| e.to_string())?;
                 Ok(list)
             }
@@ -1124,7 +1124,7 @@ fn output_by_ref(ledger: &Ledger, out_ref: &OutputRef) -> Result<Option<TxOut>, 
         return Ok(None);
     };
     let (out, _): (TxOut, usize) =
-        bincode::decode_from_slice(&bytes, bincode::config::standard())
+        bincode::decode_from_slice(&bytes, bincode::config::standard().with_limit::<{ 32 * 1024 * 1024 }>())
             .map_err(|e| e.to_string())?;
     Ok(Some(out))
 }

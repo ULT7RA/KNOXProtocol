@@ -1143,6 +1143,8 @@ function nodeDesktopEnv(mine, profile = null) {
       env.KNOX_LATTICE_DEBUG_MEMORY_BYTES = String(mem);
     }
   }
+  // Always emit a full backtrace on node crash so allocation failures are traceable.
+  env.RUST_BACKTRACE = 'full';
   return env;
 }
 

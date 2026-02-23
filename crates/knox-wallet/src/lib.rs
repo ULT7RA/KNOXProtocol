@@ -203,7 +203,7 @@ pub fn load_wallet(path: &str) -> Result<WalletState, String> {
         buf
     };
     if let Ok((mut state, _)) =
-        bincode::decode_from_slice::<WalletState, _>(&raw, bincode::config::standard())
+        bincode::decode_from_slice::<WalletState, _>(&raw, bincode::config::standard().with_limit::<4194304>())
     {
         if state.subaddress_indices.is_empty() {
             state.subaddress_indices.push(0);
@@ -222,7 +222,7 @@ pub fn load_wallet(path: &str) -> Result<WalletState, String> {
     }
 
     if let Ok((legacy_v2, _)) =
-        bincode::decode_from_slice::<WalletStateV2, _>(&raw, bincode::config::standard())
+        bincode::decode_from_slice::<WalletStateV2, _>(&raw, bincode::config::standard().with_limit::<4194304>())
     {
         let mut state = WalletState {
             view_secret: legacy_v2.view_secret,
@@ -267,7 +267,7 @@ pub fn load_wallet(path: &str) -> Result<WalletState, String> {
     }
 
     let (legacy, _): (WalletStateV1, usize) =
-        bincode::decode_from_slice(&raw, bincode::config::standard()).map_err(|e| e.to_string())?;
+        bincode::decode_from_slice(&raw, bincode::config::standard().with_limit::<4194304>()).map_err(|e| e.to_string())?;
     let mut state = WalletState {
         view_secret: legacy.view_secret,
         spend_secret: legacy.spend_secret,
@@ -1489,7 +1489,7 @@ fn rpc_request(
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).map_err(|e| e.to_string())?;
     let (resp, _): (knox_types::WalletResponse, usize) =
-        bincode::decode_from_slice(&buf, bincode::config::standard()).map_err(|e| e.to_string())?;
+        bincode::decode_from_slice(&buf, bincode::config::standard().with_limit::<16777216>()).map_err(|e| e.to_string())?;
     Ok(resp)
 }
 

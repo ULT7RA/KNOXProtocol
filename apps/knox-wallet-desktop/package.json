@@ -1,6 +1,6 @@
 {
   "name": "knox-wallet-desktop",
-  "version": "1.1.10",
+  "version": "1.2.0",
   "description": "KNOX desktop wallet (React rewrite)",
   "main": "main.js",
   "author": "KNOX",

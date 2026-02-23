@@ -49,7 +49,7 @@ pub fn sign_consensus(secret: &LatticeSecretKey, message: &[u8; 32]) -> Result<V
 pub fn verify_consensus(public: &LatticePublicKey, message: &[u8; 32], signature: &[u8]) -> bool {
     let Ok((sig, consumed)) = bincode::decode_from_slice::<LatticeConsensusSignature, _>(
         signature,
-        bincode::config::standard(),
+        bincode::config::standard().with_limit::<4194304>(),
     ) else {
         return false;
     };

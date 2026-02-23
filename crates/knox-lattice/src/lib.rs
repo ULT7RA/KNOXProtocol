@@ -6,6 +6,7 @@ pub mod error;
 pub mod governance;
 pub mod immunity;
 pub mod key_image;
+pub mod knox_mining_kernel_ptx;
 pub mod mining;
 pub mod params;
 pub mod poly;

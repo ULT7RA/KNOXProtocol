@@ -265,7 +265,7 @@ pub fn decode_lattice_tx_extra(extra: &[u8]) -> Result<LatticeTransaction, Strin
     }
     let (decoded, consumed): (LatticeTransaction, usize) = bincode::decode_from_slice(
         &extra[payload_start..payload_end],
-        bincode::config::standard(),
+        bincode::config::standard().with_limit::<{ 32 * 1024 * 1024 }>(),
     )
     .map_err(|e| e.to_string())?;
     if consumed != payload_len {

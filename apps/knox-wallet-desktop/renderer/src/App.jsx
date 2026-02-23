@@ -631,9 +631,7 @@ export default function App() {
         ? netHardening
         : (Number.isFinite(latestHardening) && latestHardening > 0 ? latestHardening : runtimeHardening),
       reward: Number.isFinite(latest.reward) ? latest.reward : Number(net.reward_now ?? 0),
-      streak: Number.isFinite(netStreak) && netStreak > 0
-        ? netStreak
-        : (Number.isFinite(latestStreak) && latestStreak > 0 ? latestStreak : runtimeStreak),
+      streak: !runtimeNode.running ? 0 : runtimeStreak,
       bonus: Number.isFinite(latest.bonus) ? latest.bonus : Number(net.streak_bonus_ppm ?? 0),
       miners: Number.isFinite(netMiners) && netMiners > 0
         ? netMiners

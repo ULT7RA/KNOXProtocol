@@ -50,4 +50,13 @@ if (!(Test-Path $cert) -or !(Test-Path $key)) {
     -keyout $key -out $cert -subj "/CN=localhost"
 }
 
+# Also copy to the installed MSI location so the running app picks up changes.
+$installedBin = Join-Path $env:LOCALAPPDATA "Programs/knox-wallet-desktop/resources/bin"
+if (Test-Path $installedBin) {
+  Copy-Item -Force (Join-Path $binDir "knox-node.exe") $installedBin
+  Copy-Item -Force (Join-Path $binDir "knox-wallet.exe") $installedBin
+  Copy-Item -Force (Join-Path $binDir "knox-wallet-cli.exe") $installedBin
+  Write-Host "Desktop binaries also copied to installed app at $installedBin"
+}
+
 Write-Host "Desktop binaries copied to $binDir"

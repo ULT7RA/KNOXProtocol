@@ -9,6 +9,10 @@ autobins = false
 name = "knox-wallet-cli"
 path = "src/main.rs"
 
+[[bin]]
+name = "genesis_export"
+path = "src/bin/genesis_export.rs"
+
 [dependencies]
 bincode.workspace = true
 blake3.workspace = true

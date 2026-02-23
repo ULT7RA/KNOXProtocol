@@ -133,7 +133,7 @@ pub fn decode_coinbase_payload(extra: &[u8]) -> Result<LatticeCoinbasePayload, S
         return Err("coinbase lattice payload trailing bytes".to_string());
     }
     let (payload, consumed): (LatticeCoinbasePayload, usize) =
-        bincode::decode_from_slice(&extra[start..end], bincode::config::standard())
+        bincode::decode_from_slice(&extra[start..end], bincode::config::standard().with_limit::<{ 32 * 1024 * 1024 }>())
             .map_err(|e| e.to_string())?;
     if consumed != payload_len {
         return Err("coinbase lattice payload invalid length".to_string());
