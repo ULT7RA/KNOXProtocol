@@ -4,8 +4,28 @@ $root = Split-Path -Parent $PSScriptRoot
 $binDir = Join-Path $root "apps/knox-wallet-desktop/bin"
 $certDir = Join-Path $binDir "certs"
 $target = "x86_64-pc-windows-msvc"
+$embeddedGenesis = Join-Path $root "crates/knox-node/src/genesis.bin"
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 New-Item -ItemType Directory -Force -Path $certDir | Out-Null
+
+$genesisCandidates = @()
+if ($env:KNOX_GENESIS_BIN) { $genesisCandidates += $env:KNOX_GENESIS_BIN }
+$genesisCandidates += (Join-Path $root "genesis.bin")
+$selectedGenesis = $null
+foreach ($candidate in $genesisCandidates) {
+  if ($candidate -and (Test-Path $candidate)) {
+    $selectedGenesis = $candidate
+    break
+  }
+}
+if ($selectedGenesis) {
+  Copy-Item -Force $selectedGenesis $embeddedGenesis
+  $g = Get-Item $embeddedGenesis
+  $h = (Get-FileHash -Algorithm SHA256 $embeddedGenesis).Hash.ToLower()
+  Write-Host "Embedded genesis synced from $selectedGenesis (sha256=$h bytes=$($g.Length))"
+} elseif (!(Test-Path $embeddedGenesis)) {
+  throw "Missing embedded genesis at $embeddedGenesis and no source genesis provided"
+}
 
 $env:RUSTUP_TOOLCHAIN = "stable-x86_64-pc-windows-msvc"
 $env:CARGO_TARGET_DIR = Join-Path $root "target-msvc-clean"
@@ -53,10 +73,15 @@ if (!(Test-Path $cert) -or !(Test-Path $key)) {
 # Also copy to the installed MSI location so the running app picks up changes.
 $installedBin = Join-Path $env:LOCALAPPDATA "Programs/knox-wallet-desktop/resources/bin"
 if (Test-Path $installedBin) {
-  Copy-Item -Force (Join-Path $binDir "knox-node.exe") $installedBin
-  Copy-Item -Force (Join-Path $binDir "knox-wallet.exe") $installedBin
-  Copy-Item -Force (Join-Path $binDir "knox-wallet-cli.exe") $installedBin
-  Write-Host "Desktop binaries also copied to installed app at $installedBin"
+  try {
+    Copy-Item -Force (Join-Path $binDir "knox-node.exe") $installedBin
+    Copy-Item -Force (Join-Path $binDir "knox-wallet.exe") $installedBin
+    Copy-Item -Force (Join-Path $binDir "knox-wallet-cli.exe") $installedBin
+    Write-Host "Desktop binaries also copied to installed app at $installedBin"
+  } catch {
+    Write-Warning "Installed app binaries are in use; skipped in-place copy to $installedBin"
+    Write-Warning "Close KNOX WALLET and rerun build, or install the fresh MSI via scripts/upgrade-knox.ps1"
+  }
 }
 
 Write-Host "Desktop binaries copied to $binDir"

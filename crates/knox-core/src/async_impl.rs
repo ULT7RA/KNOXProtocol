@@ -1,11 +1,11 @@
-use knox_consensus::{ConsensusConfig, ConsensusMessage, PulsarBft, ValidatorSet};
+use knox_consensus::{ConsensusConfig, ValidatorSet};
 use knox_crypto::os_random_bytes;
 use knox_lattice::{
     consensus_public_key_id, consensus_secret_from_seed, sign_consensus,
     coinbase_split, encode_coinbase_payload, encrypt_amount_with_level,
     mine_block_proof_with_profile, private_coinbase_outputs, tx_hardening_level,
-    LatticeCoinbasePayload, LatticeCommitment, LatticeCommitmentKey, LatticeOutput,
-    LatticePublicKey, LatticeSecretKey, MiningProfile,
+    verify_consensus, LatticeCoinbasePayload, LatticeCommitment, LatticeCommitmentKey,
+    LatticeOutput, LatticePublicKey, LatticeSecretKey, MiningProfile,
 };
 use knox_ledger::Ledger;
 use knox_p2p::{Message, Network, NetworkConfig, NetworkSender};
@@ -17,11 +17,13 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{interval, Duration};
 
 const MAX_MEMPOOL_TX: usize = 50_000;
-const MAX_RPC_BYTES: usize = 2 * 1024 * 1024;
+// Diamond-auth requests include full block payloads; keep headroom for
+// larger blocks to avoid mid-write resets between peer nodes.
+const MAX_RPC_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RPC_BLOCKS: u32 = 200;
 const RATE_LIMIT_SUBMIT_PER_SEC: u32 = 10;
 const RATE_LIMIT_BLOCKS_PER_SEC: u32 = 5;
@@ -30,6 +32,8 @@ const MAX_SLASHES_PER_BLOCK: usize = 128;
 const MAX_DECOY_SCAN_BLOCKS: u64 = 5_000;
 const MAX_DECOY_CANDIDATES: usize = 200_000;
 const DECOY_CACHE_TTL_MS: u64 = 10_000;
+const DIAMOND_AUTH_RPC_TIMEOUT_MS: u64 = 10_000;
+const MAX_DIAMOND_AUTH_ENDPOINTS: usize = 32;
 
 #[derive(Clone, Default)]
 struct RateLimiter {
@@ -66,6 +70,9 @@ pub struct NodeConfig {
     pub premine_address: Address,
     pub mining_enabled: bool,
     pub mining_profile: MiningProfile,
+    pub diamond_authenticators: Vec<LatticePublicKey>,
+    pub diamond_auth_quorum: usize,
+    pub diamond_auth_endpoints: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -76,7 +83,6 @@ struct MempoolEntry {
 
 pub struct Node {
     ledger: Arc<Mutex<Ledger>>,
-    consensus: Arc<Mutex<PulsarBft>>,
     network: Network,
     mempool: Arc<Mutex<Vec<MempoolEntry>>>,
     slash_pool: Arc<Mutex<Vec<SlashEvidence>>>,
@@ -89,7 +95,10 @@ pub struct Node {
     premine_address: Address,
     mining_enabled: bool,
     mining_profile: MiningProfile,
-    round_tick_ms: u64,
+    mine_tick_ms: u64,
+    diamond_authenticators: Vec<LatticePublicKey>,
+    diamond_auth_quorum: usize,
+    diamond_auth_endpoints: Vec<String>,
 }
 
 impl Node {
@@ -107,20 +116,13 @@ impl Node {
                 (secret, public)
             }
         };
-        ledger.set_validators(cfg.validators.validators.clone());
-        let mut consensus =
-            PulsarBft::new(cfg.consensus, cfg.validators, secret.clone(), public.clone());
-        let tip = ledger.height().unwrap_or(0);
-        let has_tip_block = ledger.get_block(tip).unwrap_or(None).is_some();
-        let next_height = if has_tip_block {
-            tip.saturating_add(1)
-        } else {
-            0
-        };
-        consensus.set_height(next_height);
-        if let Ok(list) = ledger.slashed_list() {
-            consensus.apply_slashed(&list);
-        }
+        // Open mining: no validator whitelist. Optional Diamond Authenticator
+        // certs can be enforced at the ledger layer.
+        ledger.set_validators(Vec::new());
+        ledger.set_diamond_authenticators(
+            cfg.diamond_authenticators.clone(),
+            cfg.diamond_auth_quorum,
+        );
         let mut net_config = cfg.network.clone();
         net_config.lattice_public = Some(public.p.to_bytes());
         net_config.lattice_secret = Some(secret.s.to_bytes());
@@ -130,7 +132,6 @@ impl Node {
 
         Ok(Self {
             ledger: Arc::new(Mutex::new(ledger)),
-            consensus: Arc::new(Mutex::new(consensus)),
             network,
             mempool: Arc::new(Mutex::new(Vec::new())),
             slash_pool: Arc::new(Mutex::new(Vec::new())),
@@ -143,7 +144,10 @@ impl Node {
             premine_address: cfg.premine_address,
             mining_enabled: cfg.mining_enabled,
             mining_profile: cfg.mining_profile,
-            round_tick_ms,
+            mine_tick_ms: round_tick_ms,
+            diamond_authenticators: cfg.diamond_authenticators,
+            diamond_auth_quorum: cfg.diamond_auth_quorum,
+            diamond_auth_endpoints: cfg.diamond_auth_endpoints,
         })
     }
 
@@ -152,15 +156,33 @@ impl Node {
         let rpc_mempool = self.mempool.clone();
         let rpc_network = self.network.sender();
         let rpc_bind = self.rpc_bind.clone();
+        let rpc_secret = self.secret.clone();
         if rpc_bind != "-" {
             tokio::spawn(async move {
-                let _ = run_rpc(rpc_bind, rknox_ledger, rpc_mempool, rpc_network).await;
+                loop {
+                    let res = run_rpc(
+                        rpc_bind.clone(),
+                        rknox_ledger.clone(),
+                        rpc_mempool.clone(),
+                        rpc_network.clone(),
+                        rpc_secret.clone(),
+                    )
+                    .await;
+                    match res {
+                        Ok(()) => {
+                            eprintln!("[knox-node] rpc server exited; restarting");
+                        }
+                        Err(err) => {
+                            eprintln!("[knox-node] rpc server error: {}", err);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             });
         }
 
-        let mut ticker = interval(Duration::from_millis(self.round_tick_ms));
+        let mut ticker = interval(Duration::from_millis(self.mine_tick_ms));
         let mut network = self.network;
-        let consensus = self.consensus.clone();
         let ledger = self.ledger.clone();
         let mempool = self.mempool.clone();
         let slash_pool = self.slash_pool.clone();
@@ -173,14 +195,33 @@ impl Node {
         let premine_address = self.premine_address;
         let mining_enabled = self.mining_enabled;
         let mining_profile = self.mining_profile.clone();
+        let diamond_authenticators = self.diamond_authenticators.clone();
+        let diamond_auth_quorum = self.diamond_auth_quorum.max(1);
+        let diamond_auth_endpoints = self.diamond_auth_endpoints.clone();
         let mut last_propose_ms = 0u64;
         let min_peers_for_mining = std::env::var("KNOX_MIN_PEERS_FOR_MINING")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(1)
-            .max(0); // Allow mining with 0 peers for debugging
+            .max(1);
         let mut last_peer_gate_log_ms = 0u64;
         let mut last_backend_line = String::new();
+
+        // If ledger is empty (no genesis yet), proactively request from h=0
+        // after peers have had time to connect.
+        {
+            let has_genesis = ledger.lock().ok()
+                .and_then(|l| l.get_block(0).ok().flatten())
+                .is_some();
+            if !has_genesis {
+                let sync_sender = network.sender();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    eprintln!("[knox-node] ledger empty at boot — requesting sync from h=0");
+                    sync_sender.send(knox_p2p::Message::GetBlocks { from_height: 0, max_count: 200 }).await;
+                });
+            }
+        }
 
         loop {
             tokio::select! {
@@ -214,48 +255,79 @@ impl Node {
                             }
                         }
                         Message::Block(block) => {
-                            if verify_block(&block, &ledger) {
-                                if let Ok(mut con) = consensus.lock() {
-                                    let out = con.on_message(ConsensusMessage::Proposal(block.clone()));
-                                    handle_consensus_output(out, &ledger, &mut network, &slash_pool, &mempool).await;
+                            let verify = match ledger.lock() {
+                                Ok(l) => l.verify_block(&block),
+                                Err(_) => Err("ledger lock poisoned".to_string()),
+                            };
+                            match verify {
+                                Ok(()) => {
+                                    let appended = append_finalized_block(&block, &ledger, &mempool);
+                                    if appended {
+                                        network.send(Message::Block(block)).await;
+                                    }
                                 }
-                            } else if let Ok(l) = ledger.lock() {
-                                if let Err(err) = l.verify_block(&block) {
+                                Err(err) => {
                                     eprintln!(
                                         "[knox-node] reject proposal h={} r={}: {}",
                                         block.header.height, block.header.round, err
                                     );
-                                }
-                            }
-                        }
-                        Message::Vote(vote) => {
-                            if let Ok(mut con) = consensus.lock() {
-                                let out = con.on_message(ConsensusMessage::Vote(vote));
-                                handle_consensus_output(out, &ledger, &mut network, &slash_pool, &mempool).await;
-                            }
-                        }
-                        Message::TimeoutVote(vote) => {
-                            if let Ok(mut con) = consensus.lock() {
-                                let out = con.on_message(ConsensusMessage::TimeoutVote(vote));
-                                handle_consensus_output(out, &ledger, &mut network, &slash_pool, &mempool).await;
-                            }
-                        }
-                        Message::TimeoutCertificate(tc) => {
-                            if let Ok(mut con) = consensus.lock() {
-                                let out = con.on_message(ConsensusMessage::TimeoutCertificate(tc));
-                                handle_consensus_output(out, &ledger, &mut network, &slash_pool, &mempool).await;
-                            }
-                        }
-                        Message::Slash(ev) => {
-                            if let Ok(mut con) = consensus.lock() {
-                                let valid = con.verify_slash_evidence(&ev);
-                                let out = con.on_message(ConsensusMessage::Slash(ev.clone()));
-                                handle_consensus_output(out, &ledger, &mut network, &slash_pool, &mempool).await;
-                                if valid {
-                                    if let Ok(mut pool) = slash_pool.lock() {
-                                        pool.push(ev);
+                                    if err.contains("missing parent") {
+                                        let (our_tip, has_genesis) = match ledger.lock() {
+                                            Ok(l) => (
+                                                l.height().unwrap_or(0),
+                                                l.get_block(0).unwrap_or(None).is_some(),
+                                            ),
+                                            Err(_) => (0, false),
+                                        };
+                                        let from = if has_genesis { our_tip.saturating_add(1) } else { 0 };
+                                        eprintln!("[knox-node] requesting sync from h={}", from);
+                                        network.send(Message::GetBlocks { from_height: from, max_count: 200 }).await;
                                     }
                                 }
+                            }
+                        }
+                        Message::GetBlocks { from_height, max_count } => {
+                            let blocks = if let Ok(l) = ledger.lock() {
+                                let mut out = Vec::new();
+                                let cap = (max_count as u64).min(200);
+                                for h in from_height..from_height.saturating_add(cap) {
+                                    match l.get_block(h) {
+                                        Ok(Some(b)) => out.push(b),
+                                        _ => break,
+                                    }
+                                }
+                                out
+                            } else { Vec::new() };
+                            if !blocks.is_empty() {
+                                eprintln!("[knox-node] serving {} blocks from h={}", blocks.len(), from_height);
+                                network.send(Message::Blocks(blocks)).await;
+                            }
+                        }
+                        Message::Blocks(blocks) => {
+                            let mut last_applied: Option<u64> = None;
+                            for block in &blocks {
+                                if let Ok(l) = ledger.lock() {
+                                    match l.append_block(block) {
+                                        Ok(()) => {
+                                            eprintln!("[knox-node] sync h={}", block.header.height);
+                                            last_applied = Some(block.header.height);
+                                        }
+                                        Err(e) if e.contains("already exists") => {}
+                                        Err(e) => {
+                                            eprintln!("[knox-node] sync stop h={}: {}", block.header.height, e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = last_applied;
+                        }
+                        Message::Vote(_) => {}
+                        Message::TimeoutVote(_) => {}
+                        Message::TimeoutCertificate(_) => {}
+                        Message::Slash(ev) => {
+                            if let Ok(mut pool) = slash_pool.lock() {
+                                pool.push(ev);
                             }
                         }
                         Message::Ping(nonce) => {
@@ -266,17 +338,6 @@ impl Node {
                 }
                 _ = ticker.tick() => {
                     let now = now_ms();
-                    let (tick_out, height, round, is_leader) = {
-                        let Ok(mut con) = consensus.lock() else {
-                            continue;
-                        };
-                        let out = con.on_tick(now);
-                        let height = con.height();
-                        let round = con.round();
-                        let is_leader = con.is_leader(height, round);
-                        (out, height, round, is_leader)
-                    };
-                    handle_consensus_output(tick_out, &ledger, &mut network, &slash_pool, &mempool).await;
                     if !mining_enabled {
                         continue;
                     }
@@ -293,9 +354,12 @@ impl Node {
                             continue;
                         }
                     }
-                    if is_leader {
-                        let (proposer_streak, mining_rules) = match ledger.lock() {
+                    {
+                        let (height, proposer_streak, mining_rules, prev_block) = match ledger.lock() {
                             Ok(l) => {
+                                let tip = l.height().unwrap_or(0);
+                                let has_genesis = l.get_block(0).unwrap_or(None).is_some();
+                                let height = if has_genesis { tip.saturating_add(1) } else { 0 };
                                 let streak = proposer_streak_for_height(&l, height, proposer_id);
                                 let rules = match l.mining_rules_for_height(height, now) {
                                     Ok(r) => r,
@@ -304,7 +368,8 @@ impl Node {
                                         continue;
                                     }
                                 };
-                                (streak, rules)
+                                let prev = if height > 0 { l.get_block(height.saturating_sub(1)).ok().flatten() } else { None };
+                                (height, streak, rules, prev)
                             }
                             Err(_) => continue,
                         };
@@ -323,9 +388,8 @@ impl Node {
                         let mut txs = take_mempool(&mempool, knox_types::MAX_BLOCK_TX);
                         let slashes = take_slashes(&slash_pool, MAX_SLASHES_PER_BLOCK);
                         eprintln!(
-                            "[knox-node] propose attempt h={} r={} txs={} slashes={}",
+                            "[knox-node] propose attempt h={} r=0 txs={} slashes={}",
                             height,
-                            round,
                             txs.len(),
                             slashes.len()
                         );
@@ -337,10 +401,6 @@ impl Node {
                             }
                         };
                         txs.insert(0, coinbase);
-                        let prev_block = ledger
-                            .lock()
-                            .ok()
-                            .and_then(|l| l.get_block(height.saturating_sub(1)).ok().flatten());
                         let prev = prev_block
                             .as_ref()
                             .map(|b| hash_header_for_link(&b.header))
@@ -366,7 +426,7 @@ impl Node {
                         let header = BlockHeader {
                             version: 1,
                             height,
-                            round,
+                            round: 0,
                             prev,
                             tx_root,
                             slash_root,
@@ -404,36 +464,37 @@ impl Node {
                             eprintln!("[knox-node] mining_runtime {}", backend_line);
                             last_backend_line = backend_line;
                         }
-                        let block = Block {
+                        let mut block = Block {
                             header,
                             txs,
                             slashes,
                             proposer_sig: sig,
                             lattice_proof,
                         };
-                        let (out, local_out, local_votes) = {
-                            let Ok(mut con) = consensus.lock() else {
-                                continue;
-                            };
-                            let out = con.try_propose(block.clone());
-                            let local_out = con.on_message(ConsensusMessage::Proposal(block.clone()));
-                            let mut votes = Vec::new();
-                            for msg in &local_out.messages {
-                                if let ConsensusMessage::Vote(vote) = msg {
-                                    votes.push(vote.clone());
+                        if !diamond_authenticators.is_empty() {
+                            match build_diamond_auth_bundle(
+                                &block,
+                                &diamond_authenticators,
+                                diamond_auth_quorum,
+                                &diamond_auth_endpoints,
+                            )
+                            .await
+                            {
+                                Ok(bundle) => {
+                                    block.proposer_sig = bundle;
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "[knox-node] diamond auth quorum unmet h={}: {}",
+                                        block.header.height, err
+                                    );
+                                    continue;
                                 }
                             }
-                            (out, local_out, votes)
-                        };
-                        handle_consensus_output(out, &ledger, &mut network, &slash_pool, &mempool).await;
-                        handle_consensus_output(local_out, &ledger, &mut network, &slash_pool, &mempool).await;
-                        for vote in local_votes {
-                            if let Ok(mut con) = consensus.lock() {
-                                let out = con.on_message(ConsensusMessage::Vote(vote));
-                                handle_consensus_output(out, &ledger, &mut network, &slash_pool, &mempool).await;
-                            }
                         }
-                        network.send(Message::Block(block)).await;
+                        if append_finalized_block(&block, &ledger, &mempool) {
+                            network.send(Message::Block(block)).await;
+                        }
                     }
                 }
             }
@@ -441,88 +502,171 @@ impl Node {
     }
 }
 
-async fn handle_consensus_output(
-    out: knox_consensus::ConsensusOutput,
-    ledger: &Arc<Mutex<Ledger>>,
-    network: &mut Network,
-    slash_pool: &Arc<Mutex<Vec<SlashEvidence>>>,
-    mempool: &Arc<Mutex<Vec<MempoolEntry>>>,
-) {
-    for msg in out.messages {
-        match msg {
-            ConsensusMessage::Proposal(block) => {
-                network.send(Message::Block(block)).await;
-            }
-            ConsensusMessage::Vote(vote) => {
-                network.send(Message::Vote(vote)).await;
-            }
-            ConsensusMessage::TimeoutVote(vote) => {
-                network.send(Message::TimeoutVote(vote)).await;
-            }
-            ConsensusMessage::TimeoutCertificate(tc) => {
-                network.send(Message::TimeoutCertificate(tc)).await;
-            }
-            ConsensusMessage::Slash(ev) => {
-                network.send(Message::Slash(ev.clone())).await;
-                if let Ok(mut pool) = slash_pool.lock() {
-                    pool.push(ev);
-                    if pool.len() > 10_000 {
-                        let drain = pool.len().saturating_sub(10_000);
-                        pool.drain(0..drain);
-                    }
-                }
-            }
-        }
+async fn build_diamond_auth_bundle(
+    block: &Block,
+    authenticators: &[LatticePublicKey],
+    quorum: usize,
+    endpoints: &[String],
+) -> Result<Vec<u8>, String> {
+    if endpoints.is_empty() {
+        return Err("no diamond auth endpoints configured".to_string());
     }
-    for block in out.finalized {
-        let height = block.header.height;
-        let result = match ledger.lock() {
-            Ok(l) => l.append_block(&block),
-            Err(_) => Err("ledger lock poisoned".to_string()),
-        };
-        match result {
-            Ok(()) => {
-                if height == 0 {
-                    eprintln!(
-                        "[knox-node] sealed genesis block (premine minted) txs={}",
-                        block.txs.len()
-                    );
-                } else {
-                    eprintln!(
-                        "[knox-node] sealed block {} txs={}",
-                        height,
-                        block.txs.len()
-                    );
-                }
-                // Mempool cleanup: remove confirmed transactions or any that conflict with the newly finalized block.
-                if let Ok(mut mp) = mempool.lock() {
-                    let mut spent_images = HashSet::new();
-                    for tx in &block.txs {
-                        for input in &tx.inputs {
-                            spent_images.insert(input.key_image);
-                        }
-                    }
-                    mp.retain(|entry| {
-                        for input in &entry.tx.inputs {
-                            if spent_images.contains(&input.key_image) {
-                                return false;
-                            }
-                        }
-                        true
-                    });
-                }
-            }
+    let mut matched = HashSet::new();
+    let mut sigs: Vec<Vec<u8>> = Vec::new();
+    let msg = hash_header_for_signing(&block.header);
+    let mut tried = 0usize;
+    for endpoint in endpoints.iter().take(MAX_DIAMOND_AUTH_ENDPOINTS) {
+        tried = tried.saturating_add(1);
+        let sig = match request_diamond_signature(endpoint, block).await {
+            Ok(sig) => sig,
             Err(err) => {
-                eprintln!("[knox-node] append block {} failed: {}", height, err);
+                eprintln!(
+                    "[knox-node] diamond auth endpoint {} failed: {}",
+                    endpoint, err
+                );
+                continue;
+            }
+        };
+        let mut matched_idx = None;
+        for (idx, pk) in authenticators.iter().enumerate() {
+            if matched.contains(&idx) {
+                continue;
+            }
+            if verify_consensus(pk, &msg.0, &sig) {
+                matched_idx = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = matched_idx {
+            matched.insert(idx);
+            sigs.push(sig);
+            if matched.len() >= quorum {
+                break;
             }
         }
     }
+    if matched.len() < quorum {
+        return Err(format!(
+            "matched {}/{} signatures across {} endpoint(s)",
+            matched.len(),
+            quorum,
+            tried
+        ));
+    }
+    eprintln!(
+        "[knox-node] diamond auth cert collected {}/{} for h={}",
+        matched.len(),
+        quorum,
+        block.header.height
+    );
+    let payload = bincode::encode_to_vec(&sigs, bincode::config::standard())
+        .map_err(|e| format!("diamond auth bundle encode failed: {e}"))?;
+    let mut out = Vec::with_capacity(b"knox-auth-v1".len() + payload.len());
+    out.extend_from_slice(b"knox-auth-v1");
+    out.extend_from_slice(&payload);
+    Ok(out)
 }
 
-fn verify_block(block: &Block, ledger: &Arc<Mutex<Ledger>>) -> bool {
-    match ledger.lock() {
-        Ok(l) => l.verify_block(block).is_ok(),
-        Err(_) => false,
+async fn request_diamond_signature(endpoint: &str, block: &Block) -> Result<Vec<u8>, String> {
+    let req = WalletRequest::SignDiamondCert(block.clone());
+    let resp = rpc_request_with_timeout(
+        endpoint,
+        req,
+        Duration::from_millis(DIAMOND_AUTH_RPC_TIMEOUT_MS),
+    )
+    .await?;
+    match resp {
+        WalletResponse::DiamondCert(Some(sig)) => Ok(sig),
+        WalletResponse::DiamondCert(None) => Err("authenticator rejected candidate".to_string()),
+        _ => Err("unexpected response".to_string()),
+    }
+}
+
+async fn rpc_request_with_timeout(
+    addr: &str,
+    req: WalletRequest,
+    timeout_dur: Duration,
+) -> Result<WalletResponse, String> {
+    let mut stream = tokio::time::timeout(timeout_dur, TcpStream::connect(addr))
+        .await
+        .map_err(|_| format!("connect timeout: {addr}"))?
+        .map_err(|e| format!("connect {addr} failed: {e}"))?;
+    let bytes = bincode::encode_to_vec(req, bincode::config::standard())
+        .map_err(|e| format!("encode request failed: {e}"))?;
+    let mut out = Vec::with_capacity(4 + bytes.len());
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&bytes);
+    tokio::time::timeout(timeout_dur, stream.write_all(&out))
+        .await
+        .map_err(|_| format!("write timeout: {addr}"))?
+        .map_err(|e| format!("write {addr} failed: {e}"))?;
+    let mut len_buf = [0u8; 4];
+    tokio::time::timeout(timeout_dur, stream.read_exact(&mut len_buf))
+        .await
+        .map_err(|_| format!("read len timeout: {addr}"))?
+        .map_err(|e| format!("read len {addr} failed: {e}"))?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len == 0 || len > MAX_RPC_BYTES {
+        return Err("rpc response too large".to_string());
+    }
+    let mut buf = vec![0u8; len];
+    tokio::time::timeout(timeout_dur, stream.read_exact(&mut buf))
+        .await
+        .map_err(|_| format!("read body timeout: {addr}"))?
+        .map_err(|e| format!("read body {addr} failed: {e}"))?;
+    let (resp, _): (WalletResponse, usize) =
+        bincode::decode_from_slice(&buf, bincode::config::standard().with_limit::<16777216>())
+            .map_err(|e| format!("decode response failed: {e}"))?;
+    Ok(resp)
+}
+
+fn append_finalized_block(
+    block: &Block,
+    ledger: &Arc<Mutex<Ledger>>,
+    mempool: &Arc<Mutex<Vec<MempoolEntry>>>,
+) -> bool {
+    let height = block.header.height;
+    let result = match ledger.lock() {
+        Ok(l) => l.append_block(block),
+        Err(_) => Err("ledger lock poisoned".to_string()),
+    };
+    match result {
+        Ok(()) => {
+            if height == 0 {
+                eprintln!(
+                    "[knox-node] sealed genesis block (premine minted) txs={}",
+                    block.txs.len()
+                );
+            } else {
+                eprintln!(
+                    "[knox-node] sealed block {} txs={}",
+                    height,
+                    block.txs.len()
+                );
+            }
+            if let Ok(mut mp) = mempool.lock() {
+                let mut spent_images = HashSet::new();
+                for tx in &block.txs {
+                    for input in &tx.inputs {
+                        spent_images.insert(input.key_image);
+                    }
+                }
+                mp.retain(|entry| {
+                    for input in &entry.tx.inputs {
+                        if spent_images.contains(&input.key_image) {
+                            return false;
+                        }
+                    }
+                    true
+                });
+            }
+            true
+        }
+        Err(err) if err.contains("already exists") => false,
+        Err(err) => {
+            eprintln!("[knox-node] append block {} failed: {}", height, err);
+            false
+        }
     }
 }
 
@@ -531,13 +675,20 @@ async fn run_rpc(
     ledger: Arc<Mutex<Ledger>>,
     mempool: Arc<Mutex<Vec<MempoolEntry>>>,
     network: NetworkSender,
+    rpc_secret: LatticeSecretKey,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind).await?;
+    if let Ok(addr) = listener.local_addr() {
+        eprintln!("[knox-node] rpc listening on {}", addr);
+    }
     let allow_remote_rpc = std::env::var("KNOX_NODE_RPC_ALLOW_REMOTE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let limiter = RateLimiter::default();
     let decoy_cache = DecoyCache::default();
+    // Per-height anti-equivocation guard for Diamond Auth signatures.
+    // A signer only signs one candidate hash per height while running.
+    let signed_heights: Arc<Mutex<HashMap<u64, Hash32>>> = Arc::new(Mutex::new(HashMap::new()));
     loop {
         let (mut stream, addr) = listener.accept().await?;
         let ledger = ledger.clone();
@@ -545,21 +696,32 @@ async fn run_rpc(
         let network = network.clone();
         let limiter = limiter.clone();
         let decoy_cache = decoy_cache.clone();
+        let rpc_secret = rpc_secret.clone();
         let allow_remote_rpc = allow_remote_rpc;
+        let signed_heights = signed_heights.clone();
         tokio::spawn(async move {
-            if !allow_remote_rpc && !addr.ip().is_loopback() {
-                return;
-            }
+            let is_remote = !addr.ip().is_loopback();
             let mut len_buf = [0u8; 4];
-            if stream.read_exact(&mut len_buf).await.is_err() {
+            if let Err(err) = stream.read_exact(&mut len_buf).await {
+                if is_remote {
+                    eprintln!("[knox-node] rpc read len failed from {addr}: {err}");
+                }
                 return;
             }
             let len = u32::from_le_bytes(len_buf) as usize;
             if len == 0 || len > MAX_RPC_BYTES {
+                if is_remote {
+                    eprintln!(
+                        "[knox-node] rpc reject oversize request from {addr}: len={len} max={MAX_RPC_BYTES}"
+                    );
+                }
                 return;
             }
             let mut buf = vec![0u8; len];
-            if stream.read_exact(&mut buf).await.is_err() {
+            if let Err(err) = stream.read_exact(&mut buf).await {
+                if is_remote {
+                    eprintln!("[knox-node] rpc read body failed from {addr}: {err}");
+                }
                 return;
             }
             let request = match bincode::decode_from_slice::<WalletRequest, _>(
@@ -567,8 +729,24 @@ async fn run_rpc(
                 bincode::config::standard().with_limit::<4194304>(),
             ) {
                 Ok((req, _)) => req,
-                Err(_) => return,
+                Err(err) => {
+                    if is_remote {
+                        eprintln!(
+                            "[knox-node] rpc decode failed from {addr}: len={len} err={err}"
+                        );
+                    }
+                    return;
+                }
             };
+            // Keep normal wallet RPC local-only unless explicitly enabled.
+            // Diamond auth signing still needs to be reachable by peer nodes.
+            if is_remote
+                && !allow_remote_rpc
+                && !matches!(&request, WalletRequest::SignDiamondCert(_))
+            {
+                eprintln!("[knox-node] rpc rejected remote request from {addr}");
+                return;
+            }
             let response = match request {
                 WalletRequest::GetTip => {
                     let height = match ledger.lock() {
@@ -723,6 +901,75 @@ async fn run_rpc(
                     };
                     WalletResponse::FibWall(wall)
                 }
+                WalletRequest::SignDiamondCert(block) => {
+                    if is_remote {
+                        eprintln!(
+                            "[knox-node] diamond sign rpc from {} h={} r={} txs={}",
+                            addr,
+                            block.header.height,
+                            block.header.round,
+                            block.txs.len()
+                        );
+                    }
+                    let signer_msg = hash_header_for_signing(&block.header);
+                    let verify = match ledger.lock() {
+                        Ok(l) => l.verify_block_for_diamond_auth(&block),
+                        Err(_) => Err("ledger lock poisoned".to_string()),
+                    };
+                    match verify {
+                        Ok(()) => {
+                            let lock_state = match signed_heights.lock() {
+                                Ok(mut signed) => {
+                                    // Best-effort pruning to cap memory growth.
+                                    let floor = block.header.height.saturating_sub(256);
+                                    signed.retain(|h, _| *h >= floor);
+                                    match signed.get(&block.header.height) {
+                                        Some(existing) if existing != &signer_msg => Some(false),
+                                        Some(_) => Some(true),
+                                        None => {
+                                            signed.insert(block.header.height, signer_msg.clone());
+                                            Some(true)
+                                        }
+                                    }
+                                }
+                                Err(_) => None,
+                            };
+                            match lock_state {
+                                Some(true) => {
+                                    let sig = sign_consensus(&rpc_secret, &signer_msg.0).ok();
+                                    if sig.is_some() {
+                                        eprintln!(
+                                            "[knox-node] diamond sign accepted h={} r={}",
+                                            block.header.height, block.header.round
+                                        );
+                                    }
+                                    WalletResponse::DiamondCert(sig)
+                                }
+                                Some(false) => {
+                                    eprintln!(
+                                        "[knox-node] diamond sign rejected h={} r={}: already signed different candidate at this height",
+                                        block.header.height, block.header.round
+                                    );
+                                    WalletResponse::DiamondCert(None)
+                                }
+                                None => {
+                                    eprintln!(
+                                        "[knox-node] diamond sign rejected h={} r={}: signer lock poisoned",
+                                        block.header.height, block.header.round
+                                    );
+                                    WalletResponse::DiamondCert(None)
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[knox-node] diamond sign rejected h={} r={}: {}",
+                                block.header.height, block.header.round, err
+                            );
+                            WalletResponse::DiamondCert(None)
+                        }
+                    }
+                }
             };
             let bytes = match bincode::encode_to_vec(response, bincode::config::standard()) {
                 Ok(v) => v,
@@ -731,7 +978,11 @@ async fn run_rpc(
             let mut out = Vec::with_capacity(4 + bytes.len());
             out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             out.extend_from_slice(&bytes);
-            let _ = stream.write_all(&out).await;
+            if let Err(err) = stream.write_all(&out).await {
+                if is_remote {
+                    eprintln!("[knox-node] rpc write response failed to {addr}: {err}");
+                }
+            }
         });
     }
 }

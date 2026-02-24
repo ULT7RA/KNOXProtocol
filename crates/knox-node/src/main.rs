@@ -4,10 +4,10 @@ use knox_crypto::{generate_keypair, hash_to_scalar, public_from_secret, PublicKe
 use knox_ledger::Ledger;
 use knox_lattice::{
     consensus_public_from_secret, consensus_public_key_id, consensus_secret_from_seed,
-    decode_consensus_public_key, encode_consensus_public_key, LatticePublicKey, MiningProfile,
+    decode_consensus_public_key, LatticePublicKey, MiningProfile,
 };
 use knox_p2p::NetworkConfig;
-use knox_types::{hash_bytes, Address};
+use knox_types::{hash_bytes, Address, Block};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -17,7 +17,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 
 const LATTICE_PUBKEY_BYTES: usize = knox_lattice::params::N * 2;
-const GENESIS_BYTES: &[u8] = include_bytes!("genesis.bin");
 
 fn main() {
     if std::env::var("KNOX_NODE_EXIT_IMMEDIATELY").is_ok() {
@@ -58,10 +57,13 @@ async fn async_main() {
     let bind = args.next().unwrap_or_else(|| "0.0.0.0:9735".to_string());
     let rpc_bind = args.next().unwrap_or_else(|| "127.0.0.1:9736".to_string());
     let peers_csv = args.next().unwrap_or_default();
-    let validators_path = args
-        .next()
-        .unwrap_or_else(|| format!("{}/validators.txt", data_dir));
-    let miner_addr_arg = args.next();
+    let fifth_arg = args.next();
+    let (_validators_path, miner_addr_arg) = match fifth_arg {
+        // Backward-compatible: if arg#5 is already an address, treat it as miner address.
+        Some(v) if v.starts_with("knox1") || v.starts_with("KNOX1") => (String::new(), Some(v)),
+        Some(v) => (v, args.next()),
+        None => (String::new(), None),
+    };
     if std::env::var("KNOX_PRINT_GENESIS_HASH").ok().as_deref() == Some("1") {
         match print_genesis_hash(&data_dir) {
             Ok(Some(h)) => {
@@ -86,7 +88,7 @@ async fn async_main() {
         }
     };
     if let Some(lock) = &lock {
-        if let Err(e) = enforce_mainnet_preflight(lock, &data_dir, &validators_path) {
+        if let Err(e) = enforce_mainnet_preflight(lock, &data_dir) {
             eprintln!("mainnet lock violation: {e}");
             std::process::exit(1);
         }
@@ -100,18 +102,25 @@ async fn async_main() {
     let consensus_secret = consensus_secret_from_seed(&keypair.0.0);
     let consensus_public = consensus_public_from_secret(&consensus_secret);
 
-    eprintln!("[knox-node] loading validators");
-    let validators = load_validators(&data_dir, &validators_path, consensus_public.clone())
-        .unwrap_or_else(|e| {
-            eprintln!("validators error: {e}");
-            std::process::exit(1);
-        });
-
     let peers = peers_csv
         .split(',')
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
+    let (diamond_authenticators, diamond_auth_quorum) =
+        load_diamond_authenticators().unwrap_or_else(|e| {
+            eprintln!("diamond authenticator config error: {e}");
+            std::process::exit(1);
+        });
+    let diamond_auth_endpoints = load_diamond_auth_endpoints();
+    if !diamond_authenticators.is_empty() {
+        eprintln!(
+            "[knox-node] diamond auth enabled authenticators={} quorum={} endpoints={}",
+            diamond_authenticators.len(),
+            diamond_auth_quorum,
+            diamond_auth_endpoints.len()
+        );
+    }
 
     let miner_address = match miner_addr_arg {
         Some(addr) => match parse_address(&addr) {
@@ -142,17 +151,31 @@ async fn async_main() {
             );
             std::process::exit(1);
         }
-        if let Err(e) = enforce_validators_hash(lock, &validators_path) {
-            eprintln!("mainnet lock violation: {e}");
-            std::process::exit(1);
-        }
         if let Err(e) = enforce_existing_genesis(lock, &data_dir) {
             eprintln!("mainnet lock violation: {e}");
             std::process::exit(1);
         }
     }
 
-    seed_genesis_if_empty(&data_dir, &validators.validators);
+    // Emit ledger tip stats so the desktop UI can pre-populate height and
+    // hardening without waiting for the first sealed block.
+    // Hardening is computed directly from the difficulty schedule (deterministic
+    // per height) rather than scanning blocks, so it is always correct regardless
+    // of whether the local ledger has synced all blocks yet.
+    {
+        if let Err(err) = seed_embedded_genesis(&data_dir) {
+            eprintln!("embedded genesis seed error: {err}");
+            std::process::exit(1);
+        }
+        let ledger_path = format!("{}/ledger", data_dir);
+        if let Ok(ledger) = Ledger::open(&ledger_path) {
+            let tip = ledger.height().unwrap_or(0);
+            let hardening: u64 = (0..=tip)
+                .map(|h| knox_lattice::difficulty_bits(h) as u64)
+                .sum();
+            eprintln!("[knox-node] ledger tip h={} hardening={}", tip, hardening);
+        }
+    }
 
     let cfg = NodeConfig {
         data_dir,
@@ -170,7 +193,7 @@ async fn async_main() {
             committee_size: 100,
             max_round_ms: 10_000,
         },
-        validators,
+        validators: ValidatorSet { validators: Vec::new() },
         consensus_keypair: Some((consensus_secret, consensus_public)),
         rpc_bind,
         miner_address: miner_address.clone(),
@@ -179,6 +202,9 @@ async fn async_main() {
         premine_address: miner_address,
         mining_enabled: mining_enabled(),
         mining_profile: MiningProfile::from_env(),
+        diamond_authenticators,
+        diamond_auth_quorum,
+        diamond_auth_endpoints,
     };
 
     eprintln!("[knox-node] starting node");
@@ -188,6 +214,26 @@ async fn async_main() {
             eprintln!("node init error: {err}");
         }
     }
+}
+
+fn seed_embedded_genesis(data_dir: &str) -> Result<(), String> {
+    const EMBEDDED_GENESIS: &[u8] = include_bytes!("genesis.bin");
+    if EMBEDDED_GENESIS.is_empty() {
+        return Ok(());
+    }
+    let ledger_path = format!("{}/ledger", data_dir);
+    let ledger = Ledger::open(&ledger_path).map_err(|e| e.to_string())?;
+    if ledger.get_block(0)?.is_some() {
+        return Ok(());
+    }
+    let (block, _): (Block, usize) =
+        bincode::decode_from_slice(EMBEDDED_GENESIS, bincode::config::standard())
+            .map_err(|e| format!("embedded genesis decode failed: {e}"))?;
+    ledger
+        .append_block(&block)
+        .map_err(|e| format!("embedded genesis append failed: {e}"))?;
+    eprintln!("[knox-node] seeded embedded genesis h=0");
+    Ok(())
 }
 
 fn derive_address_from_node_key(sk: &SecretKey) -> Address {
@@ -297,10 +343,62 @@ fn load_or_create_keypair(data_dir: &str) -> Result<(SecretKey, PublicKey), Stri
     Ok((sk, pk))
 }
 
+fn load_diamond_authenticators() -> Result<(Vec<LatticePublicKey>, usize), String> {
+    let raw = std::env::var("KNOX_DIAMOND_AUTH_PUBKEYS").unwrap_or_default();
+    let quorum = std::env::var("KNOX_DIAMOND_AUTH_QUORUM")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(2)
+        .max(1);
+    if raw.trim().is_empty() {
+        return Ok((Vec::new(), quorum));
+    }
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in raw.split(',') {
+        let hex = item.trim();
+        if hex.is_empty() {
+            continue;
+        }
+        let bytes = hex_decode(hex)?;
+        let pk = decode_consensus_public_key(&bytes)?;
+        let id = consensus_public_key_id(&pk);
+        if seen.insert(id) {
+            out.push(pk);
+        }
+    }
+    if !out.is_empty() && quorum > out.len() {
+        return Err(format!(
+            "KNOX_DIAMOND_AUTH_QUORUM={} exceeds configured authenticators {}",
+            quorum,
+            out.len()
+        ));
+    }
+    Ok((out, quorum))
+}
+
+fn load_diamond_auth_endpoints() -> Vec<String> {
+    let raw = std::env::var("KNOX_DIAMOND_AUTH_ENDPOINTS").unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in raw.split(',') {
+        let endpoint = item.trim().to_string();
+        if endpoint.is_empty() {
+            continue;
+        }
+        if seen.insert(endpoint.clone()) {
+            out.push(endpoint);
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 struct MainnetLock {
     premine_address: Address,
-    validators_hash_hex: String,
     genesis_hash_hex: Option<String>,
 }
 
@@ -312,16 +410,12 @@ fn load_mainnet_lock() -> Result<Option<MainnetLock>, String> {
         "KNOX_MAINNET_PREMINE_ADDRESS is required when KNOX_MAINNET_LOCK=1".to_string()
     })?;
     let premine_address = parse_address(&premine_str)?;
-    let validators_hash_hex = std::env::var("KNOX_MAINNET_VALIDATORS_HASH").map_err(|_| {
-        "KNOX_MAINNET_VALIDATORS_HASH is required when KNOX_MAINNET_LOCK=1".to_string()
-    })?;
     let genesis_hash_hex = std::env::var("KNOX_MAINNET_GENESIS_HASH")
         .ok()
         .map(|v| v.trim().to_ascii_lowercase())
         .filter(|v| !v.is_empty());
     Ok(Some(MainnetLock {
         premine_address,
-        validators_hash_hex: validators_hash_hex.trim().to_ascii_lowercase(),
         genesis_hash_hex,
     }))
 }
@@ -329,7 +423,6 @@ fn load_mainnet_lock() -> Result<Option<MainnetLock>, String> {
 fn enforce_mainnet_preflight(
     lock: &MainnetLock,
     data_dir: &str,
-    validators_path: &str,
 ) -> Result<(), String> {
     let _ = lock;
     for forbidden in [
@@ -384,24 +477,6 @@ fn enforce_mainnet_preflight(
             ));
         }
     }
-    if !Path::new(validators_path).exists() {
-        return Err(format!(
-            "missing required validators file: {validators_path}"
-        ));
-    }
-    Ok(())
-}
-
-fn enforce_validators_hash(lock: &MainnetLock, validators_path: &str) -> Result<(), String> {
-    let bytes = fs::read(validators_path).map_err(|e| e.to_string())?;
-    let digest = hash_bytes(&bytes);
-    let got = hex_encode(&digest.0);
-    if got != lock.validators_hash_hex {
-        return Err(format!(
-            "validators hash mismatch (expected {}, got {})",
-            lock.validators_hash_hex, got
-        ));
-    }
     Ok(())
 }
 
@@ -440,167 +515,6 @@ fn mining_enabled() -> bool {
     true
 }
 
-fn load_validators(
-    data_dir: &str,
-    path: &str,
-    local_pk: LatticePublicKey,
-) -> Result<ValidatorSet, String> {
-    if std::env::var("KNOX_NODE_SKIP_VALIDATORS").is_ok() {
-        eprintln!("[knox-node] validators skipped (env)");
-        return Ok(ValidatorSet {
-            validators: vec![local_pk],
-        });
-    }
-    let path_obj = Path::new(path);
-    let parent = path_obj.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(parent).map_err(|e| format!("validators parent create failed: {e}"))?;
-    let canonical_parent = normalize_path(parent).map_err(|e| {
-        format!(
-            "validators parent normalize failed ({}): {e}",
-            parent.display()
-        )
-    })?;
-    let canonical_data = normalize_path(Path::new(data_dir))
-        .map_err(|e| format!("data dir normalize failed ({}): {e}", data_dir))?;
-    let allow_any = std::env::var("KNOX_NODE_ALLOW_ANY_VALIDATORS_PATH")
-        .ok()
-        .as_deref()
-        == Some("1");
-    let canonical_validators = normalize_path(path_obj).map_err(|e| {
-        format!(
-            "validators path normalize failed ({}): {e}",
-            path_obj.display()
-        )
-    })?;
-    if !allow_any
-        && !path_within(&canonical_parent, &canonical_data)
-        && !path_within(&canonical_validators, &canonical_data)
-    {
-        return Err(format!(
-            "validators path must be inside node data dir (set KNOX_NODE_ALLOW_ANY_VALIDATORS_PATH=1 to override); parent={}, validators={}, data={}",
-            canonical_parent.display(),
-            canonical_validators.display(),
-            canonical_data.display()
-        ));
-    }
-    if Path::new(path).exists() {
-        let meta =
-            fs::symlink_metadata(path).map_err(|e| format!("validators metadata failed: {e}"))?;
-        if !meta.file_type().is_file() || meta.file_type().is_symlink() {
-            return Err("validators path must be a regular file".to_string());
-        }
-    }
-    if let Ok(text) = read_text_file(path) {
-        let mut vals = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let bytes = hex_decode(line)?;
-            let pk = decode_consensus_public_key(&bytes)?;
-            let id = consensus_public_key_id(&pk);
-            if seen.insert(id) {
-                vals.push(pk);
-            }
-        }
-        if vals.is_empty() {
-            vals.push(local_pk);
-        } else {
-            // When set, ensure the local node can participate as a validator
-            // (mine blocks) even if its key is not in the validators file.
-            let include_local = std::env::var("KNOX_NODE_INCLUDE_LOCAL_VALIDATOR")
-                .ok()
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if include_local {
-                let local_id = consensus_public_key_id(&local_pk);
-                if !seen.contains(&local_id) {
-                    vals.push(local_pk);
-                }
-            }
-        }
-        Ok(ValidatorSet { validators: vals })
-    } else {
-        let line = hex_encode(&encode_consensus_public_key(&local_pk));
-        fs::create_dir_all(Path::new(path).parent().unwrap_or(Path::new(".")))
-            .map_err(|e| format!("validators dir create failed: {e}"))?;
-        fs::write(path, format!("{}\n", line))
-            .map_err(|e| format!("validators write failed: {e}"))?;
-        Ok(ValidatorSet {
-            validators: vec![local_pk],
-        })
-    }
-}
-
-fn normalize_path(p: &Path) -> Result<std::path::PathBuf, String> {
-    match p.canonicalize() {
-        Ok(v) => Ok(v),
-        Err(_) => {
-            let joined = if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                std::env::current_dir().map_err(|e| e.to_string())?.join(p)
-            };
-            Ok(joined)
-        }
-    }
-}
-
-fn path_within(child: &Path, base: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        let c = child
-            .to_string_lossy()
-            .replace('/', "\\")
-            .to_ascii_lowercase();
-        let b = base
-            .to_string_lossy()
-            .replace('/', "\\")
-            .to_ascii_lowercase();
-        return c == b || c.starts_with(&(b + "\\"));
-    }
-    #[cfg(not(windows))]
-    {
-        child == base || child.starts_with(base)
-    }
-}
-
-fn seed_genesis_if_empty(data_dir: &str, validators: &[LatticePublicKey]) {
-    let ledger_path = format!("{}/ledger", data_dir);
-    let mut ledger = match Ledger::open(&ledger_path) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[knox-node] genesis seed: ledger open failed: {e}");
-            return;
-        }
-    };
-    match ledger.get_block(0) {
-        Ok(Some(_)) => return,
-        Ok(None) => {}
-        Err(e) => {
-            eprintln!("[knox-node] genesis seed: get_block failed: {e}");
-            return;
-        }
-    }
-    let (block, _): (knox_types::Block, usize) = match bincode::decode_from_slice(
-        GENESIS_BYTES,
-        bincode::config::standard().with_limit::<{ 32 * 1024 * 1024 }>(),
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[knox-node] genesis seed: decode failed: {e}");
-            return;
-        }
-    };
-    ledger.set_validators(validators.to_vec());
-    match ledger.append_block(&block) {
-        Ok(()) => eprintln!("[knox-node] genesis seeded from bundle (h=0)"),
-        Err(e) => eprintln!("[knox-node] genesis seed: append failed: {e}"),
-    }
-}
-
 fn print_genesis_hash(data_dir: &str) -> Result<Option<String>, String> {
     let ledger = Ledger::open(&format!("{}/ledger", data_dir)).map_err(|e| e.to_string())?;
     let block0 = match ledger.get_block(0)? {
@@ -611,11 +525,6 @@ fn print_genesis_hash(data_dir: &str) -> Result<Option<String>, String> {
         .map_err(|e| e.to_string())?;
     let digest = hash_bytes(&header_bytes);
     Ok(Some(hex_encode(&digest.0)))
-}
-
-fn read_text_file(path: &str) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|e| e.to_string())?;
-    decode_text(&bytes).ok_or_else(|| "unsupported text encoding".to_string())
 }
 
 fn decode_text(bytes: &[u8]) -> Option<String> {

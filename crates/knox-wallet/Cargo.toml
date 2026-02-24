@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "genesis_export"
 path = "src/bin/genesis_export.rs"
 
+[[bin]]
+name = "rpc_tip"
+path = "src/bin/rpc_tip.rs"
+
 [dependencies]
 bincode.workspace = true
 blake3.workspace = true

@@ -23,7 +23,7 @@ mining kernel — was designed and implemented specifically for KNOX.
 
 KNOX is the first Layer-1 blockchain in existence to run fully end-to-end lattice cryptography
 across every protocol layer: transaction signing, output commitments, range proofs, stealth
-addresses, block proof-of-work, consensus signatures, and the peer-to-peer session key
+addresses, block proof-of-work, consensus rule enforcement, and the peer-to-peer session key
 exchange. There is no other chain like it.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -31,8 +31,8 @@ exchange. There is no other chain like it.
 1. Executive Summary
 
 KNOX is a sovereign Layer-1 decentralized ledger designed as a permanent, quantum-resistant
-vault. It utilizes ULT7Rock Lattice-PoW to secure the chain, PulsarBFT for instant transaction
-finality, and Lattice-LSAG for zero-knowledge privacy. KNOX is built on the principle of
+vault. It utilizes ULT7Rock Lattice-PoW to secure the chain, deterministic validity rules for
+block admission/finality, and Lattice-LSAG for zero-knowledge privacy. KNOX is built on the principle of
 Forward-Immunity, where the ledger's security debt increases over time, making historical
 blocks exponentially harder to attack as the universe ages.
 
@@ -176,17 +176,21 @@ Post-Handshake Encryption:
     recover the session key because the hardness of the key exchange rests on the lattice
     Shortest Vector Problem, not on discrete logarithm or elliptic curve assumptions.
 
-6. PulsarBFT Consensus
+6. Open Mining Consensus (Lattice-PoW)
 
-KNOX provides Deterministic Finality.
+KNOX runs open mining: any node can propose a block by solving ULT7Rock Lattice-PoW.
 
-    Finality: A block is Safe once it receives a Quorum Certificate (QC) from 2/3+1 of the committee.
+    Open Participation: There is no fixed validator committee, no leader election, and no BFT voting rounds.
 
-    No Re-orgs: Once finalized, a block cannot be orphaned. This allows merchants to accept KNOX instantly without waiting for 6 confirmations.
+    Deterministic Admission Rules: A candidate block must pass the same checks on every node:
+    valid parent linkage, valid timestamp spacing, valid lattice proof-of-work target, and valid
+    transaction/coinbase accounting.
 
-    Leader Rotation: Deterministic round-robin: leader = (height + round) % committee_size. If a leader fails, TimeoutVotes trigger rotation within seconds.
+    Finality Model: Practical finality is chainwork-based. Nodes converge on the heaviest valid
+    chain under identical rule enforcement.
 
-    Slashing: If a validator signs two conflicting blocks at the same height/round, the network produces SlashEvidence from the two conflicting lattice-signed votes and permanently bans the validator.
+    Fork Safety: Conflicting blocks are resolved by deterministic chainwork selection plus strict
+    parent/timestamp/proof validation. Invalid branches are rejected network-wide.
 
 7. URK Ledger Model (Confidential UTXO)
 
@@ -259,7 +263,7 @@ mining, privacy-preserving KNOX node in under two minutes.
 The desktop wallet is composed of three integrated layers:
 
     knox-node: The full Layer-1 node — mempool, block production, P2P networking,
-    consensus participation — running locally on the user's machine.
+    open mining participation — running locally on the user's machine.
 
     knox-walletd: A wallet daemon exposing a JSON API over local TLS. All wallet operations
     (UTXO scanning, transaction building, address derivation) happen here, isolated from

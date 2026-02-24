@@ -1,5 +1,5 @@
 const { app, BrowserWindow, ipcMain, Menu } = require('electron');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -32,7 +32,7 @@ const MINING_CFG_PATH = path.join(WALLET_CFG_DIR, 'mining.toml');
 const CERT_PATH = path.join(CERT_DIR, 'walletd.crt');
 const KEY_PATH = path.join(CERT_DIR, 'walletd.key');
 
-const RPC_UPSTREAM = process.env.KNOX_PUBLIC_RPC_ADDR || '';
+const RPC_UPSTREAM = process.env.KNOX_PUBLIC_RPC_ADDR || '132.226.76.90:9736';
 const P2P_UPSTREAM = process.env.KNOX_PUBLIC_P2P_ADDR ||
   '132.226.76.90:9735,132.226.76.90:9745,' +
   '141.148.131.54:9735,141.148.131.54:9745,' +
@@ -43,12 +43,16 @@ const P2P_UPSTREAM = process.env.KNOX_PUBLIC_P2P_ADDR ||
 const WALLETD_BIND = process.env.KNOX_WALLETD_BIND || '127.0.0.1:9980';
 const LOCAL_NODE_P2P = process.env.KNOX_LOCAL_NODE_P2P || '0.0.0.0:19735';
 const LOCAL_NODE_RPC = process.env.KNOX_LOCAL_NODE_RPC || '127.0.0.1:19736';
-// Launch policy: when desktop node is running, walletd always talks to local node RPC.
-const USE_LOCAL_RPC_WHEN_NODE_RUNNING = true;
+// Desktop mining policy: walletd follows local node RPC while local node is running.
+// Set KNOX_DESKTOP_USE_LOCAL_RPC=0 to force walletd to stay on upstream RPC.
+const USE_LOCAL_RPC_WHEN_NODE_RUNNING = !/^(0|false|no)$/i.test(String(process.env.KNOX_DESKTOP_USE_LOCAL_RPC || '1'));
 const USE_VALIDATORS_FILE_FOR_DESKTOP_NODE = /^(1|true|yes)$/i.test(String(process.env.KNOX_DESKTOP_USE_VALIDATORS_FILE || '1'));
 const DESKTOP_INSECURE_DEV = /^(1|true|yes)$/i.test(String(process.env.KNOX_DESKTOP_INSECURE_DEV || '0'));
 const MAINNET_LOCKED = /^(1|true|yes)$/i.test(String(process.env.KNOX_MAINNET_LOCK || '0'));
+// Emergency override for remote-only wallet mode (disables local node start path).
+const FORCE_REMOTE_WALLET_MODE = /^(1|true|yes)$/i.test(String(process.env.KNOX_DESKTOP_FORCE_REMOTE_ONLY || '0'));
 const AUTOSTART_ON_OPEN = !/^(0|false|no)$/i.test(String(process.env.KNOX_DESKTOP_AUTOSTART || '1'));
+const AUTO_LEDGER_RESET_ENABLED = !/^(0|false|no)$/i.test(String(process.env.KNOX_DESKTOP_AUTO_LEDGER_RESET || '1'));
 const TOKEN = process.env.KNOX_WALLETD_TOKEN || crypto.randomBytes(24).toString('hex');
 
 function safeShortAddress(addr) {
@@ -107,6 +111,13 @@ let walletAutoSyncQueued = false;
 let walletAutoSyncFailCount = 0;
 let walletAutoSyncFallbackAtMs = 0;
 const walletBackupAtByReason = new Map();
+let autoLedgerResetInFlight = false;
+let autoLedgerResetCooldownUntilMs = 0;
+const autoLedgerResetState = {
+  firstAtMs: 0,
+  lastAtMs: 0,
+  hitCount: 0
+};
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
@@ -586,6 +597,14 @@ function parseRuntimeLine(key, line, win) {
       runtimeStats.node.lastProposeAtMs = Date.now();
       return;
     }
+    const ledgerTip = line.match(/\[knox-node\] ledger tip h=(\d+) hardening=(\d+)/);
+    if (ledgerTip) {
+      const h = Number(ledgerTip[1]);
+      const hard = Number(ledgerTip[2]);
+      if (h > 0) runtimeStats.node.lastSealedHeight = h;
+      if (hard > 0) runtimeStats.node.totalHardeningEstimate = hard;
+      return;
+    }
     const sealedGenesis = line.match(/sealed genesis block.*txs=(\d+)/i);
     if (sealedGenesis) {
       recordRuntimeBlock(0, Number(sealedGenesis[1] || 0));
@@ -601,6 +620,20 @@ function parseRuntimeLine(key, line, win) {
     const reject = line.match(/reject proposal.*?:\s*(.+)$/i);
     if (reject) {
       runtimeStats.node.lastReject = String(reject[1] || '').trim();
+      const missingParent = line.match(/reject proposal h=(\d+)\s+r=\d+:\s*missing parent block/i);
+      if (missingParent) {
+        const rejectHeight = Number(missingParent[1] || 0);
+        if (shouldAutoResetLedgerFromReject(rejectHeight)) {
+          appendLog(win, `[repair] stale-ledger pattern detected (local_h=${runtimeStats.node.lastSealedHeight || 0}, reject_h=${rejectHeight})`);
+          setTimeout(() => {
+            resetLocalLedgerAndRestart(win, `missing-parent@h${rejectHeight}`)
+              .then((res) => {
+                if (!res?.ok) appendLog(win, `[repair] auto reset failed: ${res?.error || 'unknown'}`);
+              })
+              .catch((err) => appendLog(win, `[repair] auto reset crashed: ${String(err?.message || err)}`));
+          }, 0);
+        }
+      }
       return;
     }
   }
@@ -630,6 +663,7 @@ function formatExitHint(code) {
 
 function spawnSvc(win, key, bin, args, envExtra = {}) {
   if (service[key]) return { ok: true, result: `${key} already running` };
+  if (key === 'node') clearStaleNodeRpcPortOwner(win);
   if (!fs.existsSync(bin)) {
     const msg = `Missing binary: ${bin}`;
     appendLog(win, `[error] ${key}: ${msg}`);
@@ -691,19 +725,61 @@ function spawnSvc(win, key, bin, args, envExtra = {}) {
   return { ok: true, result: `${key} started` };
 }
 
+function clearStaleNodeRpcPortOwner(win) {
+  if (process.platform !== 'win32') return;
+  const m = String(LOCAL_NODE_RPC || '').match(/:(\d+)$/);
+  if (!m) return;
+  const port = m[1];
+  let netstat = '';
+  try {
+    netstat = String(execSync(`netstat -ano -p tcp | findstr :${port}`, { encoding: 'utf8' }) || '');
+  } catch {
+    return;
+  }
+  const lines = netstat.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const parts = line.split(/\s+/);
+    if (parts.length < 5) continue;
+    const local = parts[1] || '';
+    const state = parts[3] || '';
+    const pidRaw = parts[4] || '';
+    if (!/LISTENING/i.test(state)) continue;
+    if (!local.endsWith(`:${port}`)) continue;
+    if (!/^\d+$/.test(pidRaw)) continue;
+    const pid = Number(pidRaw);
+    if (!Number.isFinite(pid) || pid <= 0) continue;
+    if (service.node && service.node.pid === pid) continue;
+
+    let taskInfo = '';
+    try {
+      taskInfo = String(execSync(`tasklist /FI "PID eq ${pid}" /FO CSV /NH`, { encoding: 'utf8' }) || '');
+    } catch {
+      taskInfo = '';
+    }
+    if (!/knox-node\.exe/i.test(taskInfo)) {
+      appendLog(win, `[warn] rpc ${LOCAL_NODE_RPC} in use by pid=${pid}; not killing non-node process`);
+      continue;
+    }
+    appendLog(win, `[setup] freeing stale knox-node pid=${pid} on rpc ${LOCAL_NODE_RPC}`);
+    try {
+      execSync(`taskkill /F /T /PID ${pid}`, { stdio: 'pipe' });
+    } catch (err) {
+      appendLog(win, `[warn] failed to kill stale pid=${pid}: ${String(err?.message || err)}`);
+    }
+  }
+}
+
 function stopSvc(key) {
   const p = service[key];
   if (!p) return { ok: true, result: `${key} not running` };
   try {
     if (process.platform === 'win32') {
-      // Force kill on Windows to ensure it fully exits
-      const binName = key === 'node' ? 'knox-node.exe' : 'knox-wallet.exe';
-      require('child_process').exec(`taskkill /F /T /PID ${p.pid}`, (err) => {
-        if (err) {
-          // Fallback if taskkill fails/PID not found
-          try { p.kill(); } catch (e) { }
-        }
-      });
+      // Use synchronous taskkill so restart paths don't race the old process.
+      try {
+        execSync(`taskkill /F /T /PID ${p.pid}`, { stdio: 'pipe' });
+      } catch {
+        try { p.kill(); } catch { }
+      }
     } else {
       p.kill();
     }
@@ -918,7 +994,10 @@ function startWalletdOnRpc(win, rpcAddr) {
   return spawnSvc(win, 'walletd', walletBin, [WALLET_PATH, rpcAddr, WALLETD_BIND], {
     KNOX_WALLETD_TOKEN: TOKEN,
     KNOX_WALLETD_TLS_CERT: CERT_PATH,
-    KNOX_WALLETD_TLS_KEY: KEY_PATH
+    KNOX_WALLETD_TLS_KEY: KEY_PATH,
+    // Give walletd->node RPC more headroom under mining load.
+    KNOX_RPC_CONNECT_TIMEOUT_MS: '8000',
+    KNOX_RPC_IO_TIMEOUT_MS: '20000'
   });
 }
 
@@ -1175,6 +1254,9 @@ function primeRuntimeNodeForStart(profile = null) {
   runtimeStats.node.fallbackActive = false;
   runtimeStats.node.lastBackendError = '';
   runtimeStats.node.recentBlocks = [];
+  autoLedgerResetState.firstAtMs = 0;
+  autoLedgerResetState.lastAtMs = 0;
+  autoLedgerResetState.hitCount = 0;
 }
 
 async function resolveMinerAddress() {
@@ -1243,6 +1325,83 @@ function nodeArgs(validatorsPath, minerAddr) {
 
 function waitMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function noteMissingParentReject(height) {
+  const now = Date.now();
+  if (!autoLedgerResetState.firstAtMs || now - autoLedgerResetState.firstAtMs > 120000) {
+    autoLedgerResetState.firstAtMs = now;
+    autoLedgerResetState.hitCount = 0;
+  }
+  autoLedgerResetState.lastAtMs = now;
+  autoLedgerResetState.hitCount += 1;
+  return autoLedgerResetState.hitCount;
+}
+
+function shouldAutoResetLedgerFromReject(height) {
+  if (!AUTO_LEDGER_RESET_ENABLED || autoLedgerResetInFlight) return false;
+  if (Date.now() < autoLedgerResetCooldownUntilMs) return false;
+  const localHeight = Number(runtimeStats.node.lastSealedHeight || 0);
+  const rejectHeight = Number(height || 0);
+  if (!Number.isFinite(localHeight) || !Number.isFinite(rejectHeight)) return false;
+  // Trigger only on clear stale-ledger symptoms: high local tip + repeated low-height parent misses.
+  if (localHeight < 128 || rejectHeight > 24) return false;
+  const hits = noteMissingParentReject(rejectHeight);
+  return hits >= 5;
+}
+
+async function resetLocalLedgerAndRestart(win, reason = 'auto-ledger-reset') {
+  if (autoLedgerResetInFlight) return { ok: false, error: 'auto ledger reset already running' };
+  autoLedgerResetInFlight = true;
+  autoLedgerResetCooldownUntilMs = Date.now() + 5 * 60 * 1000;
+  try {
+    const profile = miningProfileState || loadMiningConfig().profile;
+    const mine = nodeMineEnabled;
+    const minerAddress = await resolveMinerAddress();
+    if (!minerAddress.ok) return minerAddress;
+
+    appendLog(win, `[repair] detected stale local ledger (${reason}); rebuilding local node chain cache`);
+    stopSvc('walletd');
+    stopSvc('node');
+    await waitMs(350);
+
+    const ledgerPath = path.join(NODE_DATA_DIR, 'ledger');
+    try {
+      fs.rmSync(ledgerPath, { recursive: true, force: true });
+      appendLog(win, `[repair] removed local ledger: ${ledgerPath}`);
+    } catch (err) {
+      return { ok: false, error: `failed to remove local ledger: ${String(err?.message || err)}` };
+    }
+
+    const validatorsPath = ensureValidatorsFile(win);
+    const nodeBin = resolveBin('knox-node.exe');
+    primeRuntimeNodeForStart(profile);
+    const nodeStart = spawnSvc(
+      win,
+      'node',
+      nodeBin,
+      nodeArgs(validatorsPath, minerAddress.result),
+      nodeDesktopEnv(mine, profile)
+    );
+    if (!nodeStart.ok) return nodeStart;
+
+    const walletStart = startWalletdOnRpc(win, walletdRpcAddr());
+    if (!walletStart.ok) return walletStart;
+    if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.node && walletdRpcTarget !== LOCAL_NODE_RPC) {
+      stopSvc('walletd');
+      await waitMs(250);
+      const moved = startWalletdOnRpc(win, LOCAL_NODE_RPC);
+      if (!moved.ok) return moved;
+    }
+    queueWalletAutoSync(win, 'auto-ledger-reset');
+    autoLedgerResetState.firstAtMs = 0;
+    autoLedgerResetState.lastAtMs = 0;
+    autoLedgerResetState.hitCount = 0;
+    appendLog(win, '[repair] local ledger reset complete');
+    return { ok: true, result: 'local ledger reset complete' };
+  } finally {
+    autoLedgerResetInFlight = false;
+  }
 }
 
 function parseKnoxAddress(value) {
@@ -1331,6 +1490,28 @@ async function quickStart(win, profile = null) {
   if (quickStartBusy) return { ok: false, error: 'quick start already running' };
   quickStartBusy = true;
   try {
+    // Remote RPC mode: do not start a local node; keep GUI height bound to upstream VM chain.
+    const targetRpc = RPC_UPSTREAM || '132.226.76.90:9736';
+    if (FORCE_REMOTE_WALLET_MODE || (!USE_LOCAL_RPC_WHEN_NODE_RUNNING && !!targetRpc)) {
+      ensureDirs();
+      const tls = ensureTls();
+      if (!tls.ok) return tls;
+      const walletEnsure = await ensureWalletExists();
+      if (!walletEnsure.ok) return walletEnsure;
+      if (service.node) {
+        appendLog(win, '[startup] remote-rpc mode active; stopping local node');
+        stopSvc('node');
+        await waitMs(250);
+      }
+      const walletStart = startWalletdOnRpc(win, targetRpc);
+      if (!walletStart.ok) return walletStart;
+      await waitMs(800);
+      if (!service.walletd) return { ok: false, error: failedServiceStart('walletd') };
+      queueWalletAutoSync(win, 'quick-start-remote-rpc');
+      appendLog(win, `[startup] remote-rpc mode active; walletd bound to ${targetRpc}`);
+      return { ok: true, result: 'quick start complete (remote-rpc mode)' };
+    }
+
     ensureDirs();
     const validatorsPath = ensureValidatorsFile(win);
     const tls = ensureTls();
@@ -1358,7 +1539,7 @@ async function quickStart(win, profile = null) {
     if (!nodeStart.ok) return nodeStart;
     appendLog(
       win,
-      `[config] node mining=${'on'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'}`
+      `[config] node mining=${'on'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'} cpu_util=${effectiveProfile?.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile?.gpuUtil ?? 'auto'}`
     );
 
     const walletStart = startWalletdOnRpc(win, walletdRpcAddr());
@@ -1411,6 +1592,18 @@ function serviceState() {
   };
 }
 
+function computeChainHardening(tip) {
+  const BLOCKS_PER_YEAR = 701560;
+  const ANNUAL_ESCALATION = 0.08;
+  let total = 0;
+  for (let h = 0; h <= tip; h++) {
+    const year = h / BLOCKS_PER_YEAR;
+    const bits = Math.round(12.0 * Math.pow(1.0 + ANNUAL_ESCALATION, year));
+    total += Math.min(28, Math.max(10, bits));
+  }
+  return total;
+}
+
 function runtimeNetworkSnapshot() {
   const n = runtimeStats.node;
   const tip = Number.isFinite(Number(n.lastSealedHeight)) ? Number(n.lastSealedHeight) : 0;
@@ -1419,7 +1612,7 @@ function runtimeNetworkSnapshot() {
     : 0;
   return {
     tip_height: tip,
-    total_hardening: Number(n.totalHardeningEstimate || 0),
+    total_hardening: computeChainHardening(tip),
     active_miners_recent: minerCount,
     current_difficulty_bits: Number(n.currentDifficultyBits || 0),
     tip_proposer_streak: Number(n.currentStreak || 0),
@@ -1538,6 +1731,9 @@ function createWindow() {
 
   bindIpc('quick-start', 'quick-start', (_e, profile = null) => quickStart(win, profile));
   bindIpc('start-node', 'start-node', async (_e, mine = true, profile = null) => {
+    if (FORCE_REMOTE_WALLET_MODE) {
+      return { ok: false, error: 'local node is disabled in mainnet remote mode' };
+    }
     if (service.node) {
       nodeMineEnabled = !!mine;
       miningProfileState = profile || miningProfileState || loadMiningConfig().profile;
@@ -1564,7 +1760,7 @@ function createWindow() {
     miningProfileState = effectiveProfile;
     appendLog(
       win,
-      `[config] node mining=${mine ? 'on' : 'off'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'}`
+      `[config] node mining=${mine ? 'on' : 'off'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'} cpu_util=${effectiveProfile?.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile?.gpuUtil ?? 'auto'}`
     );
 
     if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.walletd && walletdRpcTarget !== LOCAL_NODE_RPC) {
@@ -1751,24 +1947,46 @@ function createWindow() {
     return walletdCall('/send', payload || {});
   });
   bindIpc('walletd-network', 'walletd-network', async () => {
-    if (service.node) {
+    // In explicit local-RPC mode, prefer runtime snapshot while mining.
+    if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.node) {
       return { ok: true, result: runtimeNetworkSnapshot() };
     }
-    let out = await walletdCall('/network', null, { timeoutMs: 8000 });
+    let out = await walletdCall('/network', null, { timeoutMs: 20000 });
     if (!out.ok) {
       appendLog(win, `[network] walletd /network failed: ${out.error || 'unknown'}`);
     }
-    if (out.ok) return out;
-    if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.node && walletdRpcTarget !== LOCAL_NODE_RPC) {
+    if (!out.ok && USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.node && walletdRpcTarget !== LOCAL_NODE_RPC) {
       appendLog(win, `[sync] /network failed on ${walletdRpcTarget || RPC_UPSTREAM}; retrying on local RPC ${LOCAL_NODE_RPC}`);
       stopSvc('walletd');
       const restarted = startWalletdOnRpc(win, LOCAL_NODE_RPC);
-      if (!restarted.ok) return out;
-      await waitMs(900);
-      out = await walletdCall('/network', null, { timeoutMs: 8000 });
-      if (!out.ok) {
-        appendLog(win, `[network] walletd /network retry failed: ${out.error || 'unknown'}`);
+      if (restarted.ok) {
+        await waitMs(900);
+        out = await walletdCall('/network', null, { timeoutMs: 20000 });
+        if (!out.ok) {
+          appendLog(win, `[network] walletd /network retry failed: ${out.error || 'unknown'}`);
+        }
       }
+    }
+    if (out.ok && out.result) {
+      // Merge live chain data with local runtime stats (miner count, streak).
+      const snap = runtimeNetworkSnapshot();
+      const realTip = Number(out.result.tip_height ?? 0);
+      return {
+        ...out,
+        result: {
+          ...out.result,
+          total_hardening: computeChainHardening(realTip),
+          active_miners_recent: Math.max(Number(out.result.active_miners_recent ?? 0), snap.active_miners_recent),
+          tip_proposer_streak: snap.tip_proposer_streak || out.result.tip_proposer_streak || 0,
+          recent_blocks: snap.recent_blocks && snap.recent_blocks.length > 0
+            ? snap.recent_blocks
+            : (out.result.recent_blocks || []),
+        }
+      };
+    }
+    // In explicit local-RPC mode, fall back to log-parsed snapshot if walletd is unreachable.
+    if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.node) {
+      return { ok: true, result: runtimeNetworkSnapshot() };
     }
     return out;
   });
@@ -1818,7 +2036,7 @@ function createWindow() {
     if (!restarted.ok) return restarted;
     appendLog(
       win,
-      `[config] live apply mining profile mode=${effectiveProfile.mode || 'hybrid'} backend=${effectiveProfile.backend || 'auto'} diff=${effectiveProfile.difficultyBits} seq=${effectiveProfile.seqSteps} mem=${effectiveProfile.memoryBytes}`
+      `[config] live apply mining profile mode=${effectiveProfile.mode || 'hybrid'} backend=${effectiveProfile.backend || 'auto'} diff=${effectiveProfile.difficultyBits} seq=${effectiveProfile.seqSteps} mem=${effectiveProfile.memoryBytes} cpu_util=${effectiveProfile.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile.gpuUtil ?? 'auto'}`
     );
     return { ok: true, result: 'applied live' };
   });

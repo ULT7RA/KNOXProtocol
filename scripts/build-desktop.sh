@@ -4,8 +4,30 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_DIR="$ROOT/apps/knox-wallet-desktop/bin"
 CERT_DIR="$BIN_DIR/certs"
+EMBEDDED_GENESIS="$ROOT/crates/knox-node/src/genesis.bin"
 mkdir -p "$BIN_DIR"
 mkdir -p "$CERT_DIR"
+
+SOURCE_GENESIS=""
+if [[ -n "${KNOX_GENESIS_BIN:-}" && -f "${KNOX_GENESIS_BIN}" ]]; then
+  SOURCE_GENESIS="${KNOX_GENESIS_BIN}"
+elif [[ -f "$ROOT/genesis.bin" ]]; then
+  SOURCE_GENESIS="$ROOT/genesis.bin"
+fi
+
+if [[ -n "$SOURCE_GENESIS" ]]; then
+  cp "$SOURCE_GENESIS" "$EMBEDDED_GENESIS"
+  if command -v sha256sum >/dev/null 2>&1; then
+    GEN_HASH="$(sha256sum "$EMBEDDED_GENESIS" | awk '{print $1}')"
+  else
+    GEN_HASH="n/a"
+  fi
+  GEN_BYTES="$(wc -c < "$EMBEDDED_GENESIS" | tr -d ' ')"
+  echo "Embedded genesis synced from $SOURCE_GENESIS (sha256=$GEN_HASH bytes=$GEN_BYTES)"
+elif [[ ! -f "$EMBEDDED_GENESIS" ]]; then
+  echo "ERROR: missing embedded genesis at $EMBEDDED_GENESIS and no source genesis provided"
+  exit 1
+fi
 
 if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
   export CARGO_TARGET_DIR="$ROOT/target-desktop"

@@ -622,7 +622,9 @@ export default function App() {
     const latestMiners = Number(latest.miners);
     const latestStreak = Number(latest.streak);
     return {
-      height: Number.isFinite(latest.height) ? latest.height : Number(net.tip_height ?? fallbackHeight ?? info.last_height ?? 0),
+      height: (Number.isFinite(latest.height) && latest.height > 0)
+        ? latest.height
+        : (runtimeHeight > 0 ? runtimeHeight : Number(net.tip_height ?? info.last_height ?? 0)),
       attempts: Number.isFinite(latest.attempts) ? latest.attempts : Number(net.attempts_per_sec ?? 0),
       difficulty: Number.isFinite(netDifficulty) && netDifficulty > 0
         ? netDifficulty
@@ -690,7 +692,8 @@ export default function App() {
 
   function miningProfileFromUi() {
     const util = Math.max(1, Math.round((sliders.cpuUtil + sliders.gpuUtil) / 2));
-    const difficultyBits = Math.max(1, Math.min(20, Math.round(12 - util / 10)));
+    // Higher utilization should increase work depth, not lower it.
+    const difficultyBits = Math.max(6, Math.min(20, Math.round(6 + util / 10)));
     const seqSteps = Math.max(16, Math.min(4096, sliders.cpuCores * 32));
     const memoryBytes = Math.max(
       4 * 1024 * 1024,

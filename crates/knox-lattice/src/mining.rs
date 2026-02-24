@@ -100,7 +100,7 @@ impl Default for MiningProfile {
             seq_steps: None,
             memory_bytes: None,
             cpu_util: 70,
-            gpu_util: 70,
+            gpu_util: 90,
             gpu_device_id: None,
             cuda_device_ordinal: None,
         }
@@ -124,7 +124,7 @@ impl MiningProfile {
             .unwrap_or(70)
             .clamp(1, 100);
         let gpu_util = parse_env_u8("KNOX_NODE_MINING_GPU_UTIL")
-            .unwrap_or(70)
+            .unwrap_or(90)
             .clamp(1, 100);
         let gpu_device_id = parse_env_u32("KNOX_NODE_GPU_DEVICE_ID");
         let cuda_device_ordinal = parse_env_u32("KNOX_NODE_CUDA_DEVICE_ORDINAL");
@@ -751,8 +751,11 @@ fn mine_block_proof_custom(
 }
 
 fn gpu_nonce_batch_size(profile: &MiningProfile) -> usize {
-    let util = (profile.gpu_util as usize).max(1);
-    util.saturating_mul(256).clamp(1024, 65_536)
+    let util = (profile.gpu_util as usize).clamp(1, 100);
+    // Keep enough in-flight work to saturate modern GPUs; low util still gets
+    // a floor to avoid launch overhead dominating.
+    let scaled = util.saturating_mul(2048);
+    scaled.clamp(8_192, 262_144)
 }
 
 fn opencl_chain_batch_size(profile: &MiningProfile) -> usize {
@@ -830,11 +833,17 @@ fn mine_block_proof_gpu_assisted(
             let mut b = CUDA_GLOBAL.get_or_init(|| std::sync::Mutex::new(None)).lock().unwrap();
             if b.is_none() || b.as_ref().unwrap().0 != ordinal {
                 eprintln!("[cuda] init ordinal={} batch={}", ordinal, batch_size);
-                if let Ok(src) = CudaNonceSource::new(ordinal, batch_size) {
+                if let Ok(src) = CudaNonceSource::new(ordinal) {
                     eprintln!("[cuda] init ok");
                     *b = Some((ordinal, batch_size, SendCudaSource(src)));
                 } else {
                     eprintln!("[cuda] init FAILED");
+                }
+            }
+            if let Some((_, cached_batch, _)) = b.as_mut() {
+                if *cached_batch != batch_size {
+                    eprintln!("[cuda] batch update {} -> {}", *cached_batch, batch_size);
+                    *cached_batch = batch_size;
                 }
             }
             if b.is_none() { return Err("gpu_backend_required".to_string()); }
@@ -879,7 +888,7 @@ fn mine_block_proof_gpu_assisted(
                 b.as_mut().unwrap().2.0.offload_mine(
                     &header_hash, &a_hat,
                     crate::poly::ntt_tw_fwd(), crate::poly::ntt_tw_inv(),
-                    nonce_base, steps as u32, difficulty_bits
+                    nonce_base, steps as u32, difficulty_bits, batch_size
                 )
             }?;
             if let Some(winning_nonce) = offload_res {
@@ -1582,11 +1591,14 @@ struct CudaNonceSource {
     twiddle_inv_ptr: CuDevicePtr,
     out_winning_nonce_ptr: CuDevicePtr,
     out_found_flag_ptr: CuDevicePtr,
-    batch_size: usize,
+    // Reused host-side staging buffers to avoid per-launch allocations.
+    host_a_32: Vec<u32>,
+    host_fw_32: Vec<u32>,
+    host_iv_32: Vec<u32>,
 }
 
 impl CudaNonceSource {
-    fn new(device_ordinal: u32, batch_size: usize) -> Result<Self, String> {
+    fn new(device_ordinal: u32) -> Result<Self, String> {
         #[cfg(windows)]
         let candidates = ["nvcuda.dll"];
         #[cfg(not(windows))]
@@ -1659,7 +1671,10 @@ impl CudaNonceSource {
         Ok(Self {
             _lib: lib, fns, context, module, kernel,
             header_hash_ptr, a_hat_ptr, twiddle_fwd_ptr, twiddle_inv_ptr,
-            out_winning_nonce_ptr, out_found_flag_ptr, batch_size
+            out_winning_nonce_ptr, out_found_flag_ptr,
+            host_a_32: vec![0u32; N],
+            host_fw_32: vec![0u32; N],
+            host_iv_32: vec![0u32; N],
         })
     }
 
@@ -1669,7 +1684,7 @@ impl CudaNonceSource {
 
     fn offload_mine(&mut self, header_hash: &[u8; 32], a_hat: &[u64; N],
                     twiddle_fwd: &[u64], twiddle_inv: &[u64],
-                    base_nonce: u64, steps: u32, difficulty_bits: u32) -> Result<Option<u64>, String> {
+                    base_nonce: u64, steps: u32, difficulty_bits: u32, batch_size: usize) -> Result<Option<u64>, String> {
 
         // Bind the CUDA context to whatever Tokio worker thread we're on.
         // cuCtxCreate only binds to the creating thread; without this call,
@@ -1677,26 +1692,23 @@ impl CudaNonceSource {
         // → driver reads garbage → 113 GB phantom allocation → crash.
         cuda_ok(unsafe { (self.fns.ctx_set_current)(self.context) }, "cuCtxSetCurrent")?;
 
-        // Cast u64 arrays to u32 for the kernel
-        let mut a_32 = vec![0u32; N];
-        let mut fw_32 = vec![0u32; N];
-        let mut iv_32 = vec![0u32; N];
+        // Cast u64 arrays to u32 into reusable staging buffers.
         for i in 0..N {
-            a_32[i] = a_hat[i] as u32;
-            fw_32[i] = twiddle_fwd[i] as u32;
-            iv_32[i] = twiddle_inv[i] as u32;
+            self.host_a_32[i] = a_hat[i] as u32;
+            self.host_fw_32[i] = twiddle_fwd[i] as u32;
+            self.host_iv_32[i] = twiddle_inv[i] as u32;
         }
 
         let zero_flag = [0u32];
 
         cuda_ok(unsafe { (self.fns.memcpy_htod)(self.header_hash_ptr, header_hash.as_ptr() as *const _, 32) }, "cuMemcpyHtoD_header")?;
-        cuda_ok(unsafe { (self.fns.memcpy_htod)(self.a_hat_ptr, a_32.as_ptr() as *const _, N * 4) }, "cuMemcpyHtoD_ahat")?;
-        cuda_ok(unsafe { (self.fns.memcpy_htod)(self.twiddle_fwd_ptr, fw_32.as_ptr() as *const _, N * 4) }, "cuMemcpyHtoD_fwd")?;
-        cuda_ok(unsafe { (self.fns.memcpy_htod)(self.twiddle_inv_ptr, iv_32.as_ptr() as *const _, N * 4) }, "cuMemcpyHtoD_inv")?;
+        cuda_ok(unsafe { (self.fns.memcpy_htod)(self.a_hat_ptr, self.host_a_32.as_ptr() as *const _, N * 4) }, "cuMemcpyHtoD_ahat")?;
+        cuda_ok(unsafe { (self.fns.memcpy_htod)(self.twiddle_fwd_ptr, self.host_fw_32.as_ptr() as *const _, N * 4) }, "cuMemcpyHtoD_fwd")?;
+        cuda_ok(unsafe { (self.fns.memcpy_htod)(self.twiddle_inv_ptr, self.host_iv_32.as_ptr() as *const _, N * 4) }, "cuMemcpyHtoD_inv")?;
         cuda_ok(unsafe { (self.fns.memcpy_htod)(self.out_found_flag_ptr, zero_flag.as_ptr() as *const _, 4) }, "cuMemcpyHtoD_flag")?;
 
         let block_x = 256u32;
-        let grid_x = ((self.batch_size as u32).saturating_add(block_x - 1)) / block_x;
+        let grid_x = ((batch_size as u32).saturating_add(block_x - 1)) / block_x;
 
         let mut p_header = self.header_hash_ptr;
         let mut p_ahat = self.a_hat_ptr;
@@ -1789,7 +1801,7 @@ __kernel void knox_apply_chain(__global const ulong *a_hat,
 }
 "#;
 
-// PTX is in knox_mining_kernel_ptx.rs (ULT7ROCK_PTX)
+// CUDA runtime loads the embedded fatbin at startup.
 
 pub fn mine_block_proof_with_profile(
     header: &BlockHeader,

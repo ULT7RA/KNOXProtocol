@@ -124,7 +124,8 @@ impl Ult7RockLattice {
 
     pub fn is_leader(&self, height: u64, round: u32) -> bool {
         if self.validators.validators.is_empty() {
-            return false;
+            // Open mining: every node can propose.
+            return true;
         }
         if let Some(idx) = self.validators.index_of(&self.public) {
             idx == self.leader_index(height, round)

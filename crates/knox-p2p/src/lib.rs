@@ -113,6 +113,8 @@ pub enum Message {
     TimeoutCertificate(TimeoutCertificate),
     Slash(SlashEvidence),
     Cover(Vec<u8>),
+    GetBlocks { from_height: u64, max_count: u32 },
+    Blocks(Vec<Block>),
 }
 
 #[derive(Clone, Debug, Encode, Decode)]
@@ -198,6 +200,7 @@ impl Network {
             )?;
         }
 
+        let active_peers_for_inbound = active_peers.clone();
         tokio::spawn({
             let peers = peers.clone();
             let limiter = limiter.clone();
@@ -217,8 +220,9 @@ impl Network {
                             let pub_key = local_lattice_public.clone();
                             let sec_key = local_lattice_secret.clone();
                             let pad_bytes = cfg.pad_bytes;
+                            let active_peers_inbound = active_peers_for_inbound.clone();
                             tokio::spawn(async move {
-                                let _ = handle_inbound(stream, addr.ip(), tx, limiter, replay, pub_key, sec_key, pad_bytes).await;
+                                let _ = handle_inbound(stream, addr.ip(), tx, limiter, replay, pub_key, sec_key, pad_bytes, active_peers_inbound).await;
                                 counts.remove(addr.ip());
                             });
                         }
@@ -314,6 +318,7 @@ async fn handle_inbound(
     local_lattice_public: Option<Vec<u8>>,
     local_lattice_secret: Option<Vec<u8>>,
     pad_bytes: usize,
+    active_peers: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
     let mut window_start = std::time::Instant::now();
     let mut count = 0u32;
@@ -390,6 +395,7 @@ async fn handle_inbound(
                                 sk.copy_from_slice(tag.as_bytes());
                                 session_key = Some(sk);
                                 handshaked = true;
+                                active_peers.fetch_add(1, Ordering::Relaxed);
                                 eprintln!("[p2p] Accepted handshake from {}", ip);
                             } else {
                                 break;
@@ -410,6 +416,9 @@ async fn handle_inbound(
             break;
         }
         count = count.saturating_add(1);
+    }
+    if handshaked {
+        active_peers.fetch_sub(1, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -438,7 +447,8 @@ async fn send_to_peers(
 
 fn relay_delay_ms(msg: Message, prng: &mut Prng) -> u64 {
     match msg {
-        Message::Ping(_) | Message::Pong(_) | Message::Handshake { .. } => 0,
+        Message::Ping(_) | Message::Pong(_) | Message::Handshake { .. }
+        | Message::GetBlocks { .. } | Message::Blocks(_) => 0,
         _ => {
             if P2P_RELAY_DELAY_MAX_MS <= P2P_RELAY_DELAY_MIN_MS {
                 return P2P_RELAY_DELAY_MIN_MS;

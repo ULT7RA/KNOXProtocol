@@ -79,6 +79,9 @@ fn main() {
             },
             mining_enabled: false,
             mining_profile: Default::default(),
+            diamond_authenticators: Vec::new(),
+            diamond_auth_quorum: 0,
+            diamond_auth_endpoints: Vec::new(),
         };
     }
 

@@ -249,6 +249,7 @@ pub enum WalletRequest {
     GetDecoys(u32),
     GetNetworkTelemetry,
     GetFibWall(u32),
+    SignDiamondCert(Block),
 }
 
 #[derive(Clone, Debug, Encode, Decode)]
@@ -260,6 +261,7 @@ pub enum WalletResponse {
     Decoys(Vec<RingMember>),
     NetworkTelemetry(NetworkTelemetry),
     FibWall(Vec<FibWallEntry>),
+    DiamondCert(Option<Vec<u8>>),
 }
 
 pub fn hash_bytes(data: &[u8]) -> Hash32 {

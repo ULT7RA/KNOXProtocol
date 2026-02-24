@@ -29,6 +29,8 @@ pub struct MiningRules {
 pub struct Ledger {
     db: Db,
     validators: Vec<LatticePublicKey>,
+    diamond_authenticators: Vec<LatticePublicKey>,
+    diamond_auth_quorum: usize,
 }
 
 impl Ledger {
@@ -37,11 +39,22 @@ impl Ledger {
         Ok(Self {
             db,
             validators: Vec::new(),
+            diamond_authenticators: Vec::new(),
+            diamond_auth_quorum: 0,
         })
     }
 
     pub fn set_validators(&mut self, validators: Vec<LatticePublicKey>) {
         self.validators = validators;
+    }
+
+    pub fn set_diamond_authenticators(
+        &mut self,
+        authenticators: Vec<LatticePublicKey>,
+        quorum: usize,
+    ) {
+        self.diamond_authenticators = authenticators;
+        self.diamond_auth_quorum = quorum;
     }
 
     pub fn append_block(&self, block: &Block) -> Result<(), String> {
@@ -110,6 +123,18 @@ impl Ledger {
     }
 
     pub fn verify_block(&self, block: &Block) -> Result<(), String> {
+        self.verify_block_internal(block, true)
+    }
+
+    pub fn verify_block_for_diamond_auth(&self, block: &Block) -> Result<(), String> {
+        self.verify_block_internal(block, false)
+    }
+
+    fn verify_block_internal(
+        &self,
+        block: &Block,
+        enforce_diamond_auth: bool,
+    ) -> Result<(), String> {
         if block.header.version != 1 {
             return Err("unsupported block version".to_string());
         }
@@ -134,9 +159,9 @@ impl Ledger {
             if let Some(qc) = &block.header.qc {
                 verify_quorum_certificate(qc, &self.validators, &self.slashed_list()?)?;
             }
-        } else {
-            return Err("validator set is empty".to_string());
         }
+        // If validators is empty, open mining mode: anyone can propose — no
+        // proposer/QC checks applied.
         if block.txs.is_empty() {
             return Err("empty block".to_string());
         }
@@ -205,6 +230,13 @@ impl Ledger {
             mining_rules.expected_difficulty_bits,
         ) {
             return Err("lattice proof invalid".to_string());
+        }
+        if enforce_diamond_auth && !self.diamond_authenticators.is_empty() {
+            verify_diamond_authenticator_cert(
+                block,
+                &self.diamond_authenticators,
+                self.diamond_auth_quorum.max(1),
+            )?;
         }
         let coinbase = &block.txs[0];
         if !coinbase.coinbase {
@@ -903,6 +935,47 @@ fn verify_quorum_certificate(
     if valid < quorum {
         return Err(format!(
             "quorum certificate has insufficient valid signatures: {valid}/{quorum}"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_diamond_authenticator_cert(
+    block: &Block,
+    authenticators: &[LatticePublicKey],
+    quorum: usize,
+) -> Result<(), String> {
+    const AUTH_BUNDLE_TAG: &[u8] = b"knox-auth-v1";
+    let sigs: Vec<Vec<u8>> = if block.proposer_sig.starts_with(AUTH_BUNDLE_TAG) {
+        let payload = &block.proposer_sig[AUTH_BUNDLE_TAG.len()..];
+        let (decoded, _): (Vec<Vec<u8>>, usize) =
+            bincode::decode_from_slice(payload, bincode::config::standard())
+                .map_err(|e| format!("auth bundle decode failed: {e}"))?;
+        decoded
+    } else {
+        vec![block.proposer_sig.clone()]
+    };
+    if sigs.is_empty() {
+        return Err("missing diamond authenticator signature(s)".to_string());
+    }
+    let msg = hash_header_for_signing(&block.header);
+    let mut matched = HashSet::new();
+    for sig in &sigs {
+        for (idx, pk) in authenticators.iter().enumerate() {
+            if matched.contains(&idx) {
+                continue;
+            }
+            if verify_consensus(pk, &msg.0, sig) {
+                matched.insert(idx);
+                break;
+            }
+        }
+    }
+    if matched.len() < quorum {
+        return Err(format!(
+            "diamond authenticator quorum not met: {}/{}",
+            matched.len(),
+            quorum
         ));
     }
     Ok(())
