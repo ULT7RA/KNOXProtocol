@@ -164,6 +164,8 @@ let walletAutoSyncInFlight = false;
 let walletAutoSyncQueued = false;
 let walletAutoSyncFailCount = 0;
 let walletAutoSyncFallbackAtMs = 0;
+let upstreamFailureStreak = 0;
+let miningSafetyTripped = false;
 const walletBackupAtByReason = new Map();
 let autoLedgerResetInFlight = false;
 let autoLedgerResetCooldownUntilMs = 0;
@@ -968,7 +970,8 @@ async function walletIndexedAddressesFromCli() {
 }
 
 function walletdCall(pathname, body, options = {}) {
-  const timeoutMs = Math.max(1000, Number(options.timeoutMs || 3500));
+  // Give walletd more headroom under load so transient RPC latency does not look like a disconnect.
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs || 10000));
   return new Promise((resolve) => {
     const [host, portStr] = WALLETD_BIND.split(':');
     const ca = readWalletdCa();
@@ -1601,6 +1604,32 @@ function failedServiceStart(name) {
   return `${name} failed: code=${info.code} signal=${info.signal}`;
 }
 
+async function forceMiningOffForSafety(win, reason = 'upstream connectivity lost') {
+  if (!service.node || !nodeMineEnabled) return { ok: true, result: 'mining already off' };
+  appendLog(win, `[safety] ${reason}; forcing mining OFF to prevent local forking`);
+  const validatorsPath = ensureValidatorsFile(win);
+  const nodeBin = resolveBin('knox-node.exe');
+  const minerAddress = await resolveMinerAddress();
+  if (!minerAddress.ok) return minerAddress;
+  const effectiveProfile = miningProfileState || loadMiningConfig().profile;
+  stopSvc('node');
+  await waitMs(500);
+  primeRuntimeNodeForStart(effectiveProfile);
+  const restarted = spawnSvc(
+    win,
+    'node',
+    nodeBin,
+    nodeArgs(validatorsPath, minerAddress.result),
+    nodeDesktopEnv(false, effectiveProfile)
+  );
+  if (restarted.ok) {
+    nodeMineEnabled = false;
+    miningSafetyTripped = true;
+    appendLog(win, '[safety] node restarted with mining OFF');
+  }
+  return restarted;
+}
+
 async function quickStart(win, profile = null) {
   if (quickStartBusy) return { ok: false, error: 'quick start already running' };
   quickStartBusy = true;
@@ -1634,12 +1663,14 @@ async function quickStart(win, profile = null) {
     const walletEnsure = await ensureWalletExists();
     if (!walletEnsure.ok) return walletEnsure;
 
+    let allowMiningBoot = true;
     const walletStart = await ensureWalletdUpstreamConnected(win, 25000);
     if (!walletStart.ok) {
       if (!ALLOW_DEGRADED_UPSTREAM_BOOT) return walletStart;
+      allowMiningBoot = false;
       appendLog(
         win,
-        `[startup] upstream RPC probe unavailable; continuing in degraded mode (${walletStart.error || 'unknown'})`
+        `[startup] upstream RPC probe unavailable; node will start with mining OFF (${walletStart.error || 'unknown'})`
       );
     }
 
@@ -1647,9 +1678,10 @@ async function quickStart(win, profile = null) {
     const tipReady = await waitForRemoteTipVisible(win, 1, 25000);
     if (!tipReady.ok) {
       if (!ALLOW_DEGRADED_UPSTREAM_BOOT) return tipReady;
+      allowMiningBoot = false;
       appendLog(
         win,
-        `[startup] remote tip gate timed out; continuing and relying on P2P sync (${tipReady.error || 'unknown'})`
+        `[startup] remote tip gate timed out; node will start with mining OFF (${tipReady.error || 'unknown'})`
       );
     }
 
@@ -1664,10 +1696,10 @@ async function quickStart(win, profile = null) {
       'node',
       nodeBin,
       nodeArgs(validatorsPath, minerAddress.result),
-      nodeDesktopEnv(true, effectiveProfile)
+      nodeDesktopEnv(allowMiningBoot, effectiveProfile)
     );
     appendLog(win, `[node] spawning with miner_address=${minerAddress.result === '__derive__' ? '(derived from node key)' : safeShortAddress(minerAddress.result)}`);
-    nodeMineEnabled = true;
+    nodeMineEnabled = !!allowMiningBoot;
     miningProfileState = effectiveProfile;
     if (!nodeStart.ok) return nodeStart;
     appendLog(
@@ -1873,14 +1905,16 @@ function createWindow() {
       };
     }
     const validatorsPath = ensureValidatorsFile(win);
-    if (mine) {
+    let requestedMine = !!mine;
+    if (requestedMine) {
       if (!service.walletd) {
         const walletStart = await ensureWalletdUpstreamConnected(win, 25000);
         if (!walletStart.ok) {
           if (!ALLOW_DEGRADED_UPSTREAM_BOOT) return walletStart;
+          requestedMine = false;
           appendLog(
             win,
-            `[startup] walletd upstream probe unavailable; starting node anyway (${walletStart.error || 'unknown'})`
+            `[startup] walletd upstream probe unavailable; forcing mining OFF (${walletStart.error || 'unknown'})`
           );
         }
         await waitMs(500);
@@ -1888,9 +1922,10 @@ function createWindow() {
       const tipReady = await waitForRemoteTipVisible(win, 1, 25000);
       if (!tipReady.ok) {
         if (!ALLOW_DEGRADED_UPSTREAM_BOOT) return tipReady;
+        requestedMine = false;
         appendLog(
           win,
-          `[startup] remote tip gate timed out; starting node anyway (${tipReady.error || 'unknown'})`
+          `[startup] remote tip gate timed out; forcing mining OFF (${tipReady.error || 'unknown'})`
         );
       }
     }
@@ -1904,14 +1939,14 @@ function createWindow() {
       'node',
       nodeBin,
       nodeArgs(validatorsPath, minerAddress.result),
-      nodeDesktopEnv(mine, effectiveProfile)
+      nodeDesktopEnv(requestedMine, effectiveProfile)
     );
     if (!started.ok) return started;
-    nodeMineEnabled = !!mine;
+    nodeMineEnabled = !!requestedMine;
     miningProfileState = effectiveProfile;
     appendLog(
       win,
-      `[config] node mining=${mine ? 'on' : 'off'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'} cpu_util=${effectiveProfile?.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile?.gpuUtil ?? 'auto'}`
+      `[config] node mining=${requestedMine ? 'on' : 'off'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'} cpu_util=${effectiveProfile?.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile?.gpuUtil ?? 'auto'}`
     );
 
     if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.walletd && walletdRpcTarget !== LOCAL_NODE_RPC) {
@@ -2106,6 +2141,15 @@ function createWindow() {
     let out = await walletdCall('/network', null, { timeoutMs: 20000 });
     if (!out.ok) {
       appendLog(win, `[network] walletd /network failed: ${out.error || 'unknown'}`);
+      upstreamFailureStreak += 1;
+      if (service.node && nodeMineEnabled && upstreamFailureStreak >= 2) {
+        await forceMiningOffForSafety(win, `upstream RPC unhealthy (${upstreamFailureStreak} consecutive failures)`);
+      }
+    } else {
+      if (upstreamFailureStreak > 0) {
+        appendLog(win, `[network] upstream RPC recovered after ${upstreamFailureStreak} failure(s)`);
+      }
+      upstreamFailureStreak = 0;
     }
     if (!out.ok && USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.node && walletdRpcTarget !== LOCAL_NODE_RPC) {
       appendLog(win, `[sync] /network failed on ${walletdRpcTarget || RPC_UPSTREAM}; retrying on local RPC ${LOCAL_NODE_RPC}`);

@@ -134,7 +134,10 @@ async fn async_main() {
     };
     if !rpc_bind.starts_with("127.0.0.1:") && rpc_bind != "-" {
         let allow_remote = std::env::var("KNOX_NODE_RPC_ALLOW_REMOTE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true")
+            })
             .unwrap_or(false);
         if !allow_remote {
             eprintln!(
@@ -503,11 +506,13 @@ fn enforce_existing_genesis(lock: &MainnetLock, data_dir: &str) -> Result<(), St
 
 fn mining_enabled() -> bool {
     if let Ok(val) = std::env::var("KNOX_NODE_NO_MINE") {
+        let val = val.trim();
         if val == "1" || val.eq_ignore_ascii_case("true") {
             return false;
         }
     }
     if let Ok(val) = std::env::var("KNOX_NODE_MINING") {
+        let val = val.trim();
         if val == "0" || val.eq_ignore_ascii_case("false") {
             return false;
         }

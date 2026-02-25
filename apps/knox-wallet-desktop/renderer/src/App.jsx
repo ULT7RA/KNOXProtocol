@@ -974,7 +974,7 @@ export default function App() {
           ))}
         </nav>
 
-        <div className="version">Inquiries: KNOXULT7Rock@proton.me<br />KNOX Wallet v1.1.9</div>
+        <div className="version">Inquiries: KNOXULT7Rock@proton.me<br />KNOX Wallet v1.2.2</div>
       </aside>
 
       <ErrorBoundary>

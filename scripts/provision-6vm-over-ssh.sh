@@ -17,6 +17,7 @@ MAINNET_ENV="${MAINNET_ENV:-launch-mainnet/mainnet.env}"
 BIN_URL="${KNOX_NODE_BIN_URL:-https://objectstorage.us-phoenix-1.oraclecloud.com/p/zwNH-5xPHIzNxuLA0pBtcVmC7G4Xe4AkReoLNzKnfawM-nPfwHFHMzxWifLDbQ6r/n/axiq79viclak/b/KNOXAUTO/o/knox-node}"
 BIN_SHA256="${KNOX_NODE_BIN_SHA256:-fe8b57efbe6feb4822c4db6984d905e3db203665e1dc0386e298b81ad5976146}"
 BIN_LOCAL="${KNOX_NODE_BIN_LOCAL:-}"
+ENABLE_DIAMOND_AUTH="${KNOX_ENABLE_DIAMOND_AUTH:-0}"
 # Comma-separated 1..12 node ids to expose RPC publicly (example: "9,10").
 PUBLIC_RPC_NODES="${KNOX_PUBLIC_RPC_NODES:-}"
 # Comma-separated 1..12 node ids to disable mining on (default empty = mine everywhere).
@@ -98,13 +99,17 @@ GENESIS_HASH="$(get_env_var KNOX_MAINNET_GENESIS_HASH)"
 DIAMOND_AUTH_PUBKEYS="$(get_env_var KNOX_DIAMOND_AUTH_PUBKEYS)"
 DIAMOND_AUTH_QUORUM="$(get_env_var KNOX_DIAMOND_AUTH_QUORUM)"
 DIAMOND_AUTH_ENDPOINTS="$(get_env_var KNOX_DIAMOND_AUTH_ENDPOINTS)"
+DIAMOND_AUTH_ACTIVE=0
 
 [[ -n "$PSK_SERVICE" ]] || fail "KNOX_P2P_PSK_SERVICE missing in $MAINNET_ENV"
 [[ -n "$PSK_ACCOUNT" ]] || fail "KNOX_P2P_PSK_ACCOUNT missing in $MAINNET_ENV"
 [[ -n "$PREMINE_ADDR" ]] || fail "KNOX_MAINNET_PREMINE_ADDRESS missing in $MAINNET_ENV"
-[[ -n "$DIAMOND_AUTH_PUBKEYS" ]] || fail "KNOX_DIAMOND_AUTH_PUBKEYS missing in $MAINNET_ENV"
-[[ -n "$DIAMOND_AUTH_QUORUM" ]] || fail "KNOX_DIAMOND_AUTH_QUORUM missing in $MAINNET_ENV"
-[[ -n "$DIAMOND_AUTH_ENDPOINTS" ]] || fail "KNOX_DIAMOND_AUTH_ENDPOINTS missing in $MAINNET_ENV"
+if [[ "$ENABLE_DIAMOND_AUTH" == "1" ]]; then
+  [[ -n "$DIAMOND_AUTH_PUBKEYS" ]] || fail "KNOX_DIAMOND_AUTH_PUBKEYS missing in $MAINNET_ENV"
+  [[ -n "$DIAMOND_AUTH_QUORUM" ]] || fail "KNOX_DIAMOND_AUTH_QUORUM missing in $MAINNET_ENV"
+  [[ -n "$DIAMOND_AUTH_ENDPOINTS" ]] || fail "KNOX_DIAMOND_AUTH_ENDPOINTS missing in $MAINNET_ENV"
+  DIAMOND_AUTH_ACTIVE=1
+fi
 declare -a ENDPOINTS
 for n in $(seq 1 12); do
   vm=$(( (n - 1) / 2 + 1 ))
@@ -167,18 +172,6 @@ for vm in $(seq 1 6); do
   no_mine1=0
   no_mine2=0
 
-  # Mirror cloud-init defaults: nodes 9..12 are Diamond Authenticator RPC nodes.
-  if [[ "$n1" -ge 9 ]]; then
-    bind1="0.0.0.0:${rpc1}"
-    remote1=1
-    no_mine1=1
-  fi
-  if [[ "$n2" -ge 9 ]]; then
-    bind2="0.0.0.0:${rpc2}"
-    remote2=1
-    no_mine2=1
-  fi
-
   if node_in_csv "$PUBLIC_RPC_NODES" "$n1"; then
     bind1="0.0.0.0:${rpc1}"
     remote1=1
@@ -189,20 +182,22 @@ for vm in $(seq 1 6); do
     remote2=1
     public2=1
   fi
-  # Diamond auth endpoints must be reachable cluster-wide even when not public.
-  if endpoint_in_csv "$DIAMOND_AUTH_ENDPOINTS" "${PRIV_IPS[$((vm - 1))]}:${rpc1}" \
-    || endpoint_in_csv "$DIAMOND_AUTH_ENDPOINTS" "${PUB_IPS[$((vm - 1))]}:${rpc1}"; then
-    bind1="0.0.0.0:${rpc1}"
-    remote1=1
-    auth1=1
-    no_mine1=1
-  fi
-  if endpoint_in_csv "$DIAMOND_AUTH_ENDPOINTS" "${PRIV_IPS[$((vm - 1))]}:${rpc2}" \
-    || endpoint_in_csv "$DIAMOND_AUTH_ENDPOINTS" "${PUB_IPS[$((vm - 1))]}:${rpc2}"; then
-    bind2="0.0.0.0:${rpc2}"
-    remote2=1
-    auth2=1
-    no_mine2=1
+  if [[ "$DIAMOND_AUTH_ACTIVE" == "1" ]]; then
+    # Diamond auth endpoints must be reachable cluster-wide even when not public.
+    if endpoint_in_csv "$DIAMOND_AUTH_ENDPOINTS" "${PRIV_IPS[$((vm - 1))]}:${rpc1}" \
+      || endpoint_in_csv "$DIAMOND_AUTH_ENDPOINTS" "${PUB_IPS[$((vm - 1))]}:${rpc1}"; then
+      bind1="0.0.0.0:${rpc1}"
+      remote1=1
+      auth1=1
+      no_mine1=1
+    fi
+    if endpoint_in_csv "$DIAMOND_AUTH_ENDPOINTS" "${PRIV_IPS[$((vm - 1))]}:${rpc2}" \
+      || endpoint_in_csv "$DIAMOND_AUTH_ENDPOINTS" "${PUB_IPS[$((vm - 1))]}:${rpc2}"; then
+      bind2="0.0.0.0:${rpc2}"
+      remote2=1
+      auth2=1
+      no_mine2=1
+    fi
   fi
   if node_in_csv "$NO_MINE_NODES" "$n1"; then
     no_mine1=1
@@ -228,10 +223,14 @@ KNOX_NODE_RPC_ALLOW_REMOTE=$remote1
 KNOX_MAINNET_LOCK=1
 KNOX_MAINNET_PREMINE_ADDRESS=$PREMINE_ADDR
 KNOX_MAINNET_GENESIS_HASH=$GENESIS_HASH
-KNOX_DIAMOND_AUTH_PUBKEYS=$DIAMOND_AUTH_PUBKEYS
-KNOX_DIAMOND_AUTH_QUORUM=$DIAMOND_AUTH_QUORUM
-KNOX_DIAMOND_AUTH_ENDPOINTS=$DIAMOND_AUTH_ENDPOINTS
 EOF
+  if [[ "$DIAMOND_AUTH_ACTIVE" == "1" ]]; then
+    {
+      echo "KNOX_DIAMOND_AUTH_PUBKEYS=$DIAMOND_AUTH_PUBKEYS"
+      echo "KNOX_DIAMOND_AUTH_QUORUM=$DIAMOND_AUTH_QUORUM"
+      echo "KNOX_DIAMOND_AUTH_ENDPOINTS=$DIAMOND_AUTH_ENDPOINTS"
+    } >> "$vm_dir/knox-node-a.env"
+  fi
   if [[ "$no_mine1" -eq 1 ]]; then
     echo "KNOX_NODE_NO_MINE=1" >> "$vm_dir/knox-node-a.env"
   fi
@@ -241,10 +240,14 @@ KNOX_NODE_RPC_ALLOW_REMOTE=$remote2
 KNOX_MAINNET_LOCK=1
 KNOX_MAINNET_PREMINE_ADDRESS=$PREMINE_ADDR
 KNOX_MAINNET_GENESIS_HASH=$GENESIS_HASH
-KNOX_DIAMOND_AUTH_PUBKEYS=$DIAMOND_AUTH_PUBKEYS
-KNOX_DIAMOND_AUTH_QUORUM=$DIAMOND_AUTH_QUORUM
-KNOX_DIAMOND_AUTH_ENDPOINTS=$DIAMOND_AUTH_ENDPOINTS
 EOF
+  if [[ "$DIAMOND_AUTH_ACTIVE" == "1" ]]; then
+    {
+      echo "KNOX_DIAMOND_AUTH_PUBKEYS=$DIAMOND_AUTH_PUBKEYS"
+      echo "KNOX_DIAMOND_AUTH_QUORUM=$DIAMOND_AUTH_QUORUM"
+      echo "KNOX_DIAMOND_AUTH_ENDPOINTS=$DIAMOND_AUTH_ENDPOINTS"
+    } >> "$vm_dir/knox-node-b.env"
+  fi
   if [[ "$no_mine2" -eq 1 ]]; then
     echo "KNOX_NODE_NO_MINE=1" >> "$vm_dir/knox-node-b.env"
   fi
@@ -277,6 +280,9 @@ install -m 0640 /home/$SSH_USER/knox-bootstrap/knox-node-a.env /etc/default/knox
 install -m 0640 /home/$SSH_USER/knox-bootstrap/knox-node-b.env /etc/default/knox-node-b
 install -m 0644 /home/$SSH_USER/knox-bootstrap/knox-node-a.service /etc/systemd/system/knox-node-a.service
 install -m 0644 /home/$SSH_USER/knox-bootstrap/knox-node-b.service /etc/systemd/system/knox-node-b.service
+# Defensive newline normalization for Windows-authored scripts/files.
+sed -i "s/\r$//" /etc/default/knox-node-a /etc/default/knox-node-b
+sed -i "s/\r$//" /etc/systemd/system/knox-node-a.service /etc/systemd/system/knox-node-b.service
 install -m 0600 /home/$SSH_USER/knox-bootstrap/node$n1.key /var/lib/knox/node$n1/node.key
 install -m 0600 /home/$SSH_USER/knox-bootstrap/node$n2.key /var/lib/knox/node$n2/node.key
 chown -R knox:knox /var/lib/knox

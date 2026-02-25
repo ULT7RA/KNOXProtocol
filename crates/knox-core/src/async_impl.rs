@@ -202,9 +202,15 @@ impl Node {
         let min_peers_for_mining = std::env::var("KNOX_MIN_PEERS_FOR_MINING")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1);
+            .unwrap_or(1);
+        let fork_guard_pause_ms = std::env::var("KNOX_FORK_GUARD_PAUSE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(knox_types::TARGET_BLOCK_TIME_MS.saturating_mul(2))
+            .max(5_000);
         let mut last_peer_gate_log_ms = 0u64;
+        let mut fork_guard_pause_until_ms = 0u64;
+        let mut last_fork_guard_log_ms = 0u64;
         let mut last_backend_line = String::new();
 
         // If ledger is empty (no genesis yet), proactively request from h=0
@@ -271,7 +277,13 @@ impl Node {
                                         "[knox-node] reject proposal h={} r={}: {}",
                                         block.header.height, block.header.round, err
                                     );
-                                    if err.contains("missing parent") {
+                                    if err.contains("missing parent") || err.contains("prev hash mismatch") {
+                                        // Seal guard: if we detect a parent mismatch, pause local mining
+                                        // and aggressively request a range that includes the candidate parent.
+                                        let guard_until = now_ms().saturating_add(fork_guard_pause_ms);
+                                        if guard_until > fork_guard_pause_until_ms {
+                                            fork_guard_pause_until_ms = guard_until;
+                                        }
                                         let (our_tip, has_genesis) = match ledger.lock() {
                                             Ok(l) => (
                                                 l.height().unwrap_or(0),
@@ -279,8 +291,16 @@ impl Node {
                                             ),
                                             Err(_) => (0, false),
                                         };
-                                        let from = if has_genesis { our_tip.saturating_add(1) } else { 0 };
-                                        eprintln!("[knox-node] requesting sync from h={}", from);
+                                        let from = if has_genesis {
+                                            // Pull slightly before tip to recover from short forks.
+                                            our_tip.saturating_sub(2)
+                                        } else {
+                                            0
+                                        };
+                                        eprintln!(
+                                            "[knox-node] fork guard active ({} ms) — requesting sync from h={}",
+                                            fork_guard_pause_ms, from
+                                        );
                                         network.send(Message::GetBlocks { from_height: from, max_count: 200 }).await;
                                     }
                                 }
@@ -353,6 +373,16 @@ impl Node {
                             }
                             continue;
                         }
+                    }
+                    if now < fork_guard_pause_until_ms {
+                        if now.saturating_sub(last_fork_guard_log_ms) > 10_000 {
+                            eprintln!(
+                                "[knox-node] mining paused by fork guard for {} ms",
+                                fork_guard_pause_until_ms.saturating_sub(now)
+                            );
+                            last_fork_guard_log_ms = now;
+                        }
+                        continue;
                     }
                     {
                         let (height, proposer_streak, mining_rules, prev_block) = match ledger.lock() {
