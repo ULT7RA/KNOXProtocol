@@ -857,6 +857,24 @@ function stopSvc(key) {
   return { ok: true, result: `${key} stopped` };
 }
 
+let shutdownInProgress = false;
+function shutdownLocalServices() {
+  if (shutdownInProgress) return;
+  shutdownInProgress = true;
+  stopSvc('node');
+  stopSvc('walletd');
+  if (process.platform === 'win32') {
+    // Belt-and-suspenders cleanup so closing the wallet cannot leave local mining behind.
+    for (const image of ['knox-node.exe', 'knox-wallet.exe']) {
+      try {
+        execSync(`taskkill /F /T /IM ${image}`, { stdio: 'pipe' });
+      } catch {
+        // Ignore "not found" and continue.
+      }
+    }
+  }
+}
+
 function runCli(args, options = {}) {
   const timeoutMs = options.timeoutMs || 10000;
   return new Promise((resolve) => {
@@ -2274,22 +2292,20 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
-  stopSvc('node');
-  stopSvc('walletd');
+  shutdownLocalServices();
   if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('before-quit', () => {
-  stopSvc('node');
-  stopSvc('walletd');
+  shutdownLocalServices();
+});
+
+app.on('will-quit', () => {
+  shutdownLocalServices();
 });
 
 process.on('exit', () => {
-  // Last resort synchronous attempt
-  try {
-    if (service.node) service.node.kill();
-    if (service.walletd) service.walletd.kill();
-  } catch (e) { }
+  shutdownLocalServices();
 });
 
 process.on('uncaughtException', (err) => {

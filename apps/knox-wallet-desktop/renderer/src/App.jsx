@@ -446,11 +446,12 @@ export default function App() {
   useEffect(() => {
     const net = netQ.data;
     if (!net?.ok || !net.result) return;
+    const runtimeNode = runtimeQ.data?.result?.node || {};
     const n = net.result;
     const tipHeight = Number(n.tip_height ?? n.height ?? n.last_height ?? 0);
     const miners = Number(n.active_miners_recent ?? n.active_miners ?? n.miners ?? 0);
     const difficulty = Number(n.current_difficulty_bits ?? n.difficulty_bits ?? n.difficulty ?? 0);
-    const streak = Number(n.tip_proposer_streak ?? n.current_streak ?? n.streak ?? 0);
+    const streak = Number(runtimeNode.running ? (runtimeNode.currentStreak || 0) : 0);
     const nextStreak = Number(n.next_streak_if_same_proposer ?? 0);
     const bonus = Number(n.streak_bonus_ppm ?? n.bonus ?? 0);
     const hardening = Number(n.total_hardening ?? n.hardening ?? 0);
@@ -472,9 +473,9 @@ export default function App() {
       attempts,
       difficulty,
       hardening,
-      reward: Number(n.reward_now ?? n.reward ?? nextStreak ?? 0),
+      reward: Number(runtimeNode.running ? (runtimeNode.sealedCount || 0) : 0),
       streak,
-      bonus,
+      bonus: 0,
       miners,
       surge: surgeActive,
       source: 'network'
@@ -491,7 +492,7 @@ export default function App() {
         }))
       );
     }
-  }, [netQ.data]);
+  }, [netQ.data, runtimeQ.data]);
 
   useEffect(() => {
     const runtimeNode = runtimeQ.data?.result?.node;
@@ -505,14 +506,16 @@ export default function App() {
     if (!Number.isFinite(sealedHeight)) return;
     if (lastRuntimeHeightRef.current === sealedHeight) return;
     lastRuntimeHeightRef.current = sealedHeight;
+    const netTip = Number(netQ.data?.result?.tip_height ?? netQ.data?.result?.height ?? 0);
+    const displayHeight = Number.isFinite(netTip) && netTip > 0 ? netTip : sealedHeight;
 
     const sample = {
       at: Date.now(),
-      height: sealedHeight,
+      height: displayHeight,
       attempts: Number(runtimeNode.running ? estAttempts : 0),
       difficulty: Number(runtimeNode.currentDifficultyBits || 0),
       hardening: Number(runtimeNode.totalHardeningEstimate || 0),
-      reward: 0,
+      reward: Number(runtimeNode.running ? (runtimeNode.sealedCount || 0) : 0),
       streak: Number(runtimeNode.currentStreak || 0),
       bonus: 0,
       miners: Number(runtimeMinerCount(runtimeNode)),
@@ -532,7 +535,7 @@ export default function App() {
         }))
       );
     }
-  }, [runtimeQ.data, sliders.cpuCores, sliders.cpuUtil, sliders.gpuUtil, sliders.vram]);
+  }, [runtimeQ.data, netQ.data, sliders.cpuCores, sliders.cpuUtil, sliders.gpuUtil, sliders.vram]);
 
   const status = serviceQ.data?.result || {};
   const runtime = runtimeQ.data?.result || status.runtime || {};
@@ -607,24 +610,31 @@ export default function App() {
   const telemetry = useMemo(() => {
     const net = netQ.data?.result || {};
     const latest = samples[samples.length - 1] || {};
+    const netHeight = Number(net.tip_height ?? net.height ?? net.last_height ?? info.last_height ?? 0);
     const netDifficulty = Number(net.current_difficulty_bits);
     const netHardening = Number(net.total_hardening);
     const netMiners = Number(net.active_miners_recent);
-    const netStreak = Number(net.tip_proposer_streak);
     const runtimeHeight = Number(runtimeNode.lastSealedHeight || 0);
     const runtimeDifficulty = Number(runtimeNode.currentDifficultyBits || 0);
     const runtimeHardening = Number(runtimeNode.totalHardeningEstimate || 0);
     const runtimeStreak = Number(runtimeNode.currentStreak || 0);
+    const runtimeReward = Number(runtimeNode.sealedCount || 0);
     const runtimeMiners = runtimeMinerCount(runtimeNode);
     const fallbackHeight = Number.isFinite(runtimeHeight) ? runtimeHeight : 0;
     const latestDifficulty = Number(latest.difficulty);
     const latestHardening = Number(latest.hardening);
     const latestMiners = Number(latest.miners);
     const latestStreak = Number(latest.streak);
+    const latestHeight = Number(latest.height);
+    const stableHeight = Number.isFinite(netHeight) && netHeight > 0
+      ? netHeight
+      : Math.max(
+          0,
+          Number.isFinite(latestHeight) ? latestHeight : 0,
+          Number.isFinite(runtimeHeight) ? runtimeHeight : 0
+        );
     return {
-      height: (Number.isFinite(latest.height) && latest.height > 0)
-        ? latest.height
-        : (runtimeHeight > 0 ? runtimeHeight : Number(net.tip_height ?? info.last_height ?? 0)),
+      height: stableHeight,
       attempts: Number.isFinite(latest.attempts) ? latest.attempts : Number(net.attempts_per_sec ?? 0),
       difficulty: Number.isFinite(netDifficulty) && netDifficulty > 0
         ? netDifficulty
@@ -632,7 +642,7 @@ export default function App() {
       hardening: Number.isFinite(netHardening) && netHardening > 0
         ? netHardening
         : (Number.isFinite(latestHardening) && latestHardening > 0 ? latestHardening : runtimeHardening),
-      reward: Number.isFinite(latest.reward) ? latest.reward : Number(net.reward_now ?? 0),
+      reward: !runtimeNode.running ? 0 : runtimeReward,
       streak: !runtimeNode.running ? 0 : runtimeStreak,
       bonus: Number.isFinite(latest.bonus) ? latest.bonus : Number(net.streak_bonus_ppm ?? 0),
       miners: Number.isFinite(netMiners) && netMiners > 0
@@ -648,6 +658,7 @@ export default function App() {
     runtimeNode.currentDifficultyBits,
     runtimeNode.totalHardeningEstimate,
     runtimeNode.currentStreak,
+    runtimeNode.sealedCount,
     runtimeNode.running
   ]);
 
@@ -974,7 +985,14 @@ export default function App() {
           ))}
         </nav>
 
-        <div className="version">Inquiries: KNOXULT7Rock@proton.me<br />KNOX Wallet v1.2.2</div>
+        <div className="version">
+          <div className="version-tagline">inquiries</div>
+          <div className="version-tagline">bugs</div>
+          <div className="version-tagline">suggestions</div>
+          <div className="version-tagline">feedback</div>
+          <div className="version-email">KNOXULT7Rock@proton.me</div>
+          <div className="version-build">KNOX Wallet v1.2.6</div>
+        </div>
       </aside>
 
       <ErrorBoundary>
