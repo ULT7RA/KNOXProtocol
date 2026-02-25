@@ -4,6 +4,7 @@ use knox_wallet::{
     create_wallet_from_node_key, create_wallet_from_node_key_bytes, fibonacci_wall,
     list_wallet_addresses, load_wallet, mark_submitted_transaction, network_telemetry,
     recent_blocks, save_wallet, submit_transaction, sync_wallet, wallet_balance, WalletState,
+    upstream_tip,
 };
 use rustls_pemfile::{certs, private_key};
 use serde::{Deserialize, Serialize};
@@ -489,6 +490,28 @@ where
                 Ok(Err(e)) => respond_error(&mut stream, 500, &e).await,
                 Err(e) => {
                     respond_error(&mut stream, 500, &format!("network task failed: {e}")).await
+                }
+            }
+        }
+        ("GET", "/upstream-tip") => {
+            let rpc_addr = {
+                let state = state.lock().await;
+                state.rpc_addr.clone()
+            };
+            match tokio::task::spawn_blocking(move || upstream_tip(&rpc_addr)).await {
+                Ok(Ok(tip_height)) => {
+                    respond_ok(
+                        &mut stream,
+                        serde_json::json!({
+                            "tip_height": tip_height
+                        }),
+                    )
+                    .await;
+                }
+                Ok(Err(e)) => respond_error(&mut stream, 500, &e).await,
+                Err(e) => {
+                    respond_error(&mut stream, 500, &format!("upstream-tip task failed: {e}"))
+                        .await
                 }
             }
         }

@@ -911,6 +911,10 @@ pub fn submit_transaction(rpc_addr: &str, tx: &Transaction) -> Result<bool, Stri
     Ok(response)
 }
 
+pub fn upstream_tip(rpc_addr: &str) -> Result<u64, String> {
+    rpc_get_tip(rpc_addr)
+}
+
 pub fn network_telemetry(rpc_addr: &str) -> Result<knox_types::NetworkTelemetry, String> {
     match rpc_get_network_telemetry(rpc_addr) {
         Ok(t) => Ok(t),

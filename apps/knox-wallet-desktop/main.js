@@ -32,7 +32,22 @@ const MINING_CFG_PATH = path.join(WALLET_CFG_DIR, 'mining.toml');
 const CERT_PATH = path.join(CERT_DIR, 'walletd.crt');
 const KEY_PATH = path.join(CERT_DIR, 'walletd.key');
 
-const RPC_UPSTREAM = process.env.KNOX_PUBLIC_RPC_ADDR || '132.226.76.90:9736';
+function normalizeRpcEndpoint(raw, fallback = '132.226.76.90:9736') {
+  const src = String(raw || '').trim().replace(/^["']+|["']+$/g, '');
+  const candidates = src
+    .split(/[,\s]+/)
+    .map((s) => s.trim().replace(/^["']+|["']+$/g, ''))
+    .filter(Boolean);
+  for (const c of candidates) {
+    const m = c.match(/^(.+):(\d{2,5})$/);
+    if (!m) continue;
+    const port = Number(m[2]);
+    if (Number.isFinite(port) && port >= 1 && port <= 65535) return `${m[1]}:${port}`;
+  }
+  return fallback;
+}
+
+const RPC_UPSTREAM = normalizeRpcEndpoint(process.env.KNOX_PUBLIC_RPC_ADDR, '132.226.76.90:9736');
 const P2P_UPSTREAM = process.env.KNOX_PUBLIC_P2P_ADDR ||
   '132.226.76.90:9735,132.226.76.90:9745,' +
   '141.148.131.54:9735,141.148.131.54:9745,' +
@@ -40,17 +55,56 @@ const P2P_UPSTREAM = process.env.KNOX_PUBLIC_P2P_ADDR ||
   '132.226.119.131:9735,132.226.119.131:9745,' +
   '161.153.44.116:9735,161.153.44.116:9745,' +
   '129.153.196.159:9735,129.153.196.159:9745';
+
+function rpcCandidateList() {
+  const out = [];
+  const seen = new Set();
+  const push = (ep) => {
+    const n = normalizeRpcEndpoint(ep, '');
+    if (!n || seen.has(n)) return;
+    seen.add(n);
+    out.push(n);
+  };
+  // Primary explicit endpoint first.
+  push(process.env.KNOX_PUBLIC_RPC_ADDR || RPC_UPSTREAM);
+  // Allow comma-separated overrides in env.
+  String(process.env.KNOX_PUBLIC_RPC_ADDR || '')
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .forEach(push);
+  // Derive candidate RPC endpoints from P2P seed hosts.
+  const hosts = new Set();
+  String(P2P_UPSTREAM || '')
+    .split(/[,\s]+/)
+    .map((s) => s.trim().replace(/^["']+|["']+$/g, ''))
+    .filter(Boolean)
+    .forEach((ep) => {
+      const m = ep.match(/^(.+):(\d{2,5})$/);
+      if (m) hosts.add(m[1]);
+    });
+  for (const h of hosts) {
+    push(`${h}:9736`);
+    push(`${h}:9746`);
+  }
+  if (!out.length) out.push('132.226.76.90:9736');
+  return out;
+}
 const WALLETD_BIND = process.env.KNOX_WALLETD_BIND || '127.0.0.1:9980';
 const LOCAL_NODE_P2P = process.env.KNOX_LOCAL_NODE_P2P || '0.0.0.0:19735';
 const LOCAL_NODE_RPC = process.env.KNOX_LOCAL_NODE_RPC || '127.0.0.1:19736';
-// Desktop mining policy: walletd follows local node RPC while local node is running.
-// Set KNOX_DESKTOP_USE_LOCAL_RPC=0 to force walletd to stay on upstream RPC.
-const USE_LOCAL_RPC_WHEN_NODE_RUNNING = !/^(0|false|no)$/i.test(String(process.env.KNOX_DESKTOP_USE_LOCAL_RPC || '1'));
+// Launch policy: walletd must stay on upstream RPC so GUI always tracks network chain (never local-only tip).
+// Keep this hard-locked off for production launch behavior.
+const USE_LOCAL_RPC_WHEN_NODE_RUNNING = false;
 const USE_VALIDATORS_FILE_FOR_DESKTOP_NODE = /^(1|true|yes)$/i.test(String(process.env.KNOX_DESKTOP_USE_VALIDATORS_FILE || '1'));
 const DESKTOP_INSECURE_DEV = /^(1|true|yes)$/i.test(String(process.env.KNOX_DESKTOP_INSECURE_DEV || '0'));
 const MAINNET_LOCKED = /^(1|true|yes)$/i.test(String(process.env.KNOX_MAINNET_LOCK || '0'));
 // Emergency override for remote-only wallet mode (disables local node start path).
 const FORCE_REMOTE_WALLET_MODE = /^(1|true|yes)$/i.test(String(process.env.KNOX_DESKTOP_FORCE_REMOTE_ONLY || '0'));
+// If upstream probes are flaky, allow node startup and let P2P catch up instead of hard-failing UX.
+const ALLOW_DEGRADED_UPSTREAM_BOOT = !/^(0|false|no)$/i.test(
+  String(process.env.KNOX_ALLOW_DEGRADED_UPSTREAM_BOOT || '1')
+);
 const AUTOSTART_ON_OPEN = !/^(0|false|no)$/i.test(String(process.env.KNOX_DESKTOP_AUTOSTART || '1'));
 const AUTO_LEDGER_RESET_ENABLED = !/^(0|false|no)$/i.test(String(process.env.KNOX_DESKTOP_AUTO_LEDGER_RESET || '1'));
 const TOKEN = process.env.KNOX_WALLETD_TOKEN || crypto.randomBytes(24).toString('hex');
@@ -991,7 +1045,11 @@ function walletSyncRpcAddr() {
 
 function startWalletdOnRpc(win, rpcAddr) {
   const walletBin = resolveBin('knox-wallet.exe');
-  return spawnSvc(win, 'walletd', walletBin, [WALLET_PATH, rpcAddr, WALLETD_BIND], {
+  const normalizedRpc = normalizeRpcEndpoint(rpcAddr, '132.226.76.90:9736');
+  if (String(rpcAddr || '').trim() !== normalizedRpc) {
+    appendLog(win, `[config] normalized wallet RPC target "${String(rpcAddr || '').trim()}" -> "${normalizedRpc}"`);
+  }
+  return spawnSvc(win, 'walletd', walletBin, [WALLET_PATH, normalizedRpc, WALLETD_BIND], {
     KNOX_WALLETD_TOKEN: TOKEN,
     KNOX_WALLETD_TLS_CERT: CERT_PATH,
     KNOX_WALLETD_TLS_KEY: KEY_PATH,
@@ -999,6 +1057,63 @@ function startWalletdOnRpc(win, rpcAddr) {
     KNOX_RPC_CONNECT_TIMEOUT_MS: '8000',
     KNOX_RPC_IO_TIMEOUT_MS: '20000'
   });
+}
+
+async function waitForRemoteTipVisible(win, minTip = 1, timeoutMs = 25000) {
+  const deadline = Date.now() + Math.max(3000, Number(timeoutMs) || 25000);
+  let lastErr = '';
+  while (Date.now() < deadline) {
+    const probe = await walletdCall('/upstream-tip', null, { timeoutMs: 6000 });
+    if (probe.ok && probe.result) {
+      const tip = Number(probe.result.tip_height ?? 0);
+      if (Number.isFinite(tip) && tip >= minTip) {
+        appendLog(win, `[sync] upstream tip visible h=${tip}; mining gate opened`);
+        return { ok: true, result: tip };
+      }
+      lastErr = `tip=${tip}`;
+    } else {
+      lastErr = String(probe.error || 'upstream tip unavailable');
+    }
+    await waitMs(1000);
+  }
+  return { ok: false, error: `upstream tip not visible before timeout (${lastErr || 'unknown'})` };
+}
+
+async function ensureWalletdUpstreamConnected(win, probeTimeoutMs = 25000) {
+  const candidates = rpcCandidateList();
+  let lastErr = 'no rpc candidates';
+  for (const ep of candidates) {
+    if (service.walletd) {
+      stopSvc('walletd');
+      await waitMs(250);
+    }
+    const started = startWalletdOnRpc(win, ep);
+    if (!started.ok) {
+      lastErr = String(started.error || `failed to start walletd on ${ep}`);
+      continue;
+    }
+    await waitMs(800);
+    if (!service.walletd) {
+      lastErr = failedServiceStart('walletd');
+      continue;
+    }
+    let connected = false;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const probe = await walletdCall('/upstream-tip', null, { timeoutMs: probeTimeoutMs });
+      if (probe.ok) {
+        connected = true;
+        break;
+      }
+      lastErr = String(probe.error || `probe failed on ${ep}`);
+      appendLog(win, `[sync] walletd upstream probe failed on ${ep} (attempt ${attempt}/3): ${lastErr}`);
+      await waitMs(1200);
+    }
+    if (connected) {
+      appendLog(win, `[sync] walletd upstream connected via ${ep}`);
+      return { ok: true, result: ep };
+    }
+  }
+  return { ok: false, error: `no reachable upstream RPC endpoint (${lastErr})` };
 }
 
 function clampInt(v, min, max, fallback) {
@@ -1490,9 +1605,8 @@ async function quickStart(win, profile = null) {
   if (quickStartBusy) return { ok: false, error: 'quick start already running' };
   quickStartBusy = true;
   try {
-    // Remote RPC mode: do not start a local node; keep GUI height bound to upstream VM chain.
-    const targetRpc = RPC_UPSTREAM || '132.226.76.90:9736';
-    if (FORCE_REMOTE_WALLET_MODE || (!USE_LOCAL_RPC_WHEN_NODE_RUNNING && !!targetRpc)) {
+    // Forced remote mode: do not start a local node; keep GUI height bound to upstream VM chain.
+    if (FORCE_REMOTE_WALLET_MODE) {
       ensureDirs();
       const tls = ensureTls();
       if (!tls.ok) return tls;
@@ -1503,12 +1617,12 @@ async function quickStart(win, profile = null) {
         stopSvc('node');
         await waitMs(250);
       }
-      const walletStart = startWalletdOnRpc(win, targetRpc);
+      const walletStart = await ensureWalletdUpstreamConnected(win, 25000);
       if (!walletStart.ok) return walletStart;
       await waitMs(800);
       if (!service.walletd) return { ok: false, error: failedServiceStart('walletd') };
       queueWalletAutoSync(win, 'quick-start-remote-rpc');
-      appendLog(win, `[startup] remote-rpc mode active; walletd bound to ${targetRpc}`);
+      appendLog(win, `[startup] remote-rpc mode active; walletd bound to ${walletdRpcTarget || RPC_UPSTREAM}`);
       return { ok: true, result: 'quick start complete (remote-rpc mode)' };
     }
 
@@ -1519,6 +1633,25 @@ async function quickStart(win, profile = null) {
 
     const walletEnsure = await ensureWalletExists();
     if (!walletEnsure.ok) return walletEnsure;
+
+    const walletStart = await ensureWalletdUpstreamConnected(win, 25000);
+    if (!walletStart.ok) {
+      if (!ALLOW_DEGRADED_UPSTREAM_BOOT) return walletStart;
+      appendLog(
+        win,
+        `[startup] upstream RPC probe unavailable; continuing in degraded mode (${walletStart.error || 'unknown'})`
+      );
+    }
+
+    // Launch gate: do not mine until we can see remote chain tip.
+    const tipReady = await waitForRemoteTipVisible(win, 1, 25000);
+    if (!tipReady.ok) {
+      if (!ALLOW_DEGRADED_UPSTREAM_BOOT) return tipReady;
+      appendLog(
+        win,
+        `[startup] remote tip gate timed out; continuing and relying on P2P sync (${tipReady.error || 'unknown'})`
+      );
+    }
 
     const minerAddress = await resolveMinerAddress();
     if (!minerAddress.ok) return minerAddress;
@@ -1541,9 +1674,6 @@ async function quickStart(win, profile = null) {
       win,
       `[config] node mining=${'on'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'} cpu_util=${effectiveProfile?.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile?.gpuUtil ?? 'auto'}`
     );
-
-    const walletStart = startWalletdOnRpc(win, walletdRpcAddr());
-    if (!walletStart.ok) return walletStart;
     if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.node && walletdRpcTarget !== LOCAL_NODE_RPC) {
       appendLog(win, `[sync] moving wallet daemon to local RPC: ${LOCAL_NODE_RPC}`);
       stopSvc('walletd');
@@ -1743,6 +1873,27 @@ function createWindow() {
       };
     }
     const validatorsPath = ensureValidatorsFile(win);
+    if (mine) {
+      if (!service.walletd) {
+        const walletStart = await ensureWalletdUpstreamConnected(win, 25000);
+        if (!walletStart.ok) {
+          if (!ALLOW_DEGRADED_UPSTREAM_BOOT) return walletStart;
+          appendLog(
+            win,
+            `[startup] walletd upstream probe unavailable; starting node anyway (${walletStart.error || 'unknown'})`
+          );
+        }
+        await waitMs(500);
+      }
+      const tipReady = await waitForRemoteTipVisible(win, 1, 25000);
+      if (!tipReady.ok) {
+        if (!ALLOW_DEGRADED_UPSTREAM_BOOT) return tipReady;
+        appendLog(
+          win,
+          `[startup] remote tip gate timed out; starting node anyway (${tipReady.error || 'unknown'})`
+        );
+      }
+    }
     const nodeBin = resolveBin('knox-node.exe');
     const minerAddress = await resolveMinerAddress();
     if (!minerAddress.ok) return minerAddress;
@@ -1777,7 +1928,7 @@ function createWindow() {
     if (!walletEnsure.ok) return walletEnsure;
     const tls = ensureTls();
     if (!tls.ok) return tls;
-    const started = startWalletdOnRpc(win, walletdRpcAddr());
+    const started = await ensureWalletdUpstreamConnected(win, 25000);
     if (started.ok) queueWalletAutoSync(win, 'walletd-start');
     return started;
   });
@@ -1790,7 +1941,8 @@ function createWindow() {
     const walletExists = fs.existsSync(WALLET_PATH);
     const walletSize = walletExists ? Number(fs.statSync(WALLET_PATH).size || 0) : 0;
     if (walletExists && walletSize > 0 && !force) {
-      return { ok: false, error: `wallet already exists at ${WALLET_PATH}; refusing to overwrite` };
+      // Startup creates/imports a wallet automatically; treat create as idempotent unless force=true.
+      return { ok: true, result: 'wallet already exists' };
     }
     const backup = backupWalletSnapshot(win, force ? 'wallet-create-force' : 'wallet-create');
     if (!backup.ok) return backup;
@@ -2053,6 +2205,7 @@ app.whenReady().then(async () => {
   runtimeStats.node.configuredBackend = String(loaded.profile?.backend || 'auto');
   runtimeStats.node.availableBackends = detectMiningBackends().availableBackends;
   appendLog(mainWindow, '[app] main process ready');
+  appendLog(mainWindow, `[startup] rpc_upstream=${RPC_UPSTREAM}`);
   createWindow();
   if (AUTOSTART_ON_OPEN) {
     setTimeout(async () => {
