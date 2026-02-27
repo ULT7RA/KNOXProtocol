@@ -7,7 +7,7 @@ Technical Legacy: Dedicated to Rockasaurus Rex
 URK  = ULT7Rock KNOX
 URKL = ULT7Rock KNOX Lattice
 
-Status: Mainnet-Ready | Version: 1.1.9 – ULT7Rock
+Status: Mainnet-Ready | Version: 1.3.0 – ULT7Rock
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ORIGIN STATEMENT
@@ -15,8 +15,7 @@ ORIGIN STATEMENT
 
 KNOX is an original protocol. It was designed and built from the ground up, in a clean room,
 with zero code copied, forked, or derived from any existing cryptocurrency, blockchain project,
-or open-source library beyond standard cryptographic primitives (Argon2, BLAKE3,
-ChaCha20-Poly1305). KNOX is not a fork of Bitcoin, Monero, Ethereum, or any other chain.
+or open-source library beyond standard cryptographic primitives (BLAKE3, ChaCha20-Poly1305). KNOX is not a fork of Bitcoin, Monero, Ethereum, or any other chain.
 Every cryptographic construction — the ring signature scheme, the commitment scheme, the
 range proofs, the stealth address system, the P2P handshake, the consensus engine, and the
 mining kernel — was designed and implemented specifically for KNOX.
@@ -64,19 +63,79 @@ KNOX implements a Computational Security Debt. Every 10,000 blocks, the CLH_DIME
 
     Verification Cost: Forward-Immunity only hardens the mining layer. Transaction verification remains constant-time regardless of chain age. A light client in year 20 verifies a transaction identically to year 1.
 
-3. High-Performance GPU Mining (ULT7Rock Kernel)
+3. VeloxReaper — World's First Anti-ASIC Pure-Lattice DAG PoW
 
-The KNOX miner is not a generic hashing tool; it is a specialized CUDA-accelerated lattice solver.
+KNOX is the first blockchain in existence to secure its proof-of-work entirely within the
+lattice domain. VeloxReaper contains zero classical hash primitives — no SHA-256, no
+BLAKE3, no Keccak, no Argon2 — anywhere in its core. Every operation lives in the
+polynomial ring Rq = Zq[X]/(X^1024 + 1).
 
-    Shared Memory NTT: Operates using a Radix-2 Cooley-Tukey forward transform and a Gentleman-Sande inverse transform.
+3.1 Why VeloxReaper Kills ASICs
 
-    Occupancy: The kernel is capped at 32 registers to ensure maximum thread occupancy on the Streaming Multiprocessor (SM).
+ASIC resistance in existing coins (RandomX, Ethash) relies on exotic instruction sets or
+classical memory-hard KDFs. These are all classical constructions and can eventually be
+out-engineered. VeloxReaper's resistance is structural and permanent:
 
-    Memory Bottlenecking: By keeping the 1024-coefficient polynomial in L1/Shared SRAM (~6KB per CTA), KNOX bypasses the slow GDDR6X global memory latency that plagues other PoW coins.
+    DRAM Thrashing by Design: Mining requires traversing a DAG with a mainnet floor of
+    512 MB (32,768 nodes × 16 KB each). 512 MB is too large to fit in any CPU L3 cache
+    (typically 8–96 MB) or GPU L2 cache, forcing genuine random DRAM reads on every
+    machine class — consumer, server, and datacenter alike.
 
-    Portability: The kernel runs on any CUDA-capable GPU with compute capability >= 7.0, from consumer GTX 1650s to datacenter H100s.
+    Lattice-Native Addressing: Read addresses are derived via a Z-scalar sponge using
+    polynomial coefficients packed as c0 + c1·Q + c2·Q² + c3·Q³, giving an unbiased
+    full-range index with no modular bias. Every address depends on the previous node's
+    polynomial state — no parallelism without recomputing the chain.
 
-    Proof Pipeline: Seed → BLAKE3 expand → CBD sampling → Forward NTT → Proof-of-Time chain → Inverse NTT → Serialize → Final BLAKE3 commitment → Difficulty check.
+    SIS Hardness: The final difficulty check is a Short Integer Solution (SIS) norm bound
+    ‖A_pub·v (mod Q)‖_∞ < ε. No ASIC can precompute a lookup table for SIS — the
+    problem is conjectured hard for both classical and quantum adversaries.
+
+3.2 Construction
+
+Phase 1 — LXOF State Init:
+    An NTT-based Lattice XOF (LXOF) absorbs the block header and expands it into a
+    genesis node, 16 round keys, and a round tweak — all in Rq. No hash function is called.
+
+Phase 2 — DAG Fill:
+    Each node M[i] is derived from two parents via a bilinear mix in NTT domain:
+        U_k = a_k·b_k + key_k·a_k + b_k  (computed with 3 fwd + 1 inv NTT per slot)
+    The result is passed through the τ-scrambler (mapping coefficients to {−1, 0, +1})
+    and mixed with the round tweak. Parent indices are determined by the Z-scalar sponge,
+    guaranteeing that every node depends on a pseudo-random ancestor across the full DAG.
+
+Phase 3 — Bandwidth Grinder:
+    A second pass performs m/4 random reads across the filled DAG, folding each read into
+    a polynomial accumulator F. This phase cannot be parallelized without holding the
+    entire 512 MB DAG in fast memory simultaneously.
+
+Phase 4 — SIS Extraction:
+    The τ-scrambler is applied to F, producing a ternary short vector
+    v ∈ {−1, 0, +1}^(K×N) with ‖v‖_∞ = 1. The SIS norm ‖A_pub·v (mod Q)‖_∞
+    is computed and checked against the difficulty bound ε = (Q/2) >> difficulty_bits.
+    Light clients verify in O(K·N·log N) time without rebuilding the DAG.
+
+3.3 DAG Growth Schedule
+
+VeloxReaper's memory requirement grows at 4% per year in 64 MB smooth increments,
+preventing sudden network-wide RAM shocks:
+
+    Year  0 →  512 MB    Year 18 → 1.0 GB
+    Year 10 →  759 MB    Year 36 → 2.0 GB
+    Year 54 →  4.0 GB    Year 90 → 16.0 GB (cap)
+
+3.4 GPU Mining (ULT7Rock Kernel)
+
+The sequential NTT chain feeding VeloxReaper is CUDA-accelerated:
+
+    Shared Memory NTT: Radix-2 Cooley-Tukey forward transform and Gentleman-Sande
+    inverse transform operating in L1/Shared SRAM (~6 KB per CTA).
+
+    Occupancy: Kernel capped at 32 registers for maximum SM thread occupancy.
+
+    Portability: Runs on any CUDA-capable GPU with compute capability >= 7.0.
+
+    Proof Pipeline: Seed → LXOF expand → CBD sampling → Forward NTT chain →
+    VeloxReaper DAG fill → Bandwidth grinder → SIS norm check → Difficulty gate.
 
 4. Privacy and Metadata Immunity
 
@@ -277,8 +336,9 @@ The wallet daemon is a trust boundary — the UI layer is treated as untrusted b
 
 10.2 Key Management and Encryption
 
-Wallet files are encrypted with Argon2id key derivation and XChaCha20-Poly1305 authenticated
-encryption — the same cryptographic discipline applied to the chain itself. View keys and
+Wallet files are encrypted with a memory-hard password-based key derivation function and
+XChaCha20-Poly1305 authenticated encryption — the same cryptographic discipline applied
+to the chain itself. View keys and
 spend keys are separated: a recipient can share their view key for auditing without exposing
 any spend authority. Multiple stealth addresses can be derived from a single wallet file,
 each producing a fresh unlinkable one-time address for every transaction received.
@@ -315,4 +375,4 @@ The wallet exists because KNOX was built to be used, not just theorized.
 
 11. Conclusion
 
-KNOX is a mathematical fortress. It is the first protocol to combine Post-Quantum Ring Signatures, Confidential Transactions, Lattice Stealth Addresses, and Forward-Immunity Hardening into a single, cohesive Layer-1. The "Unpredictable Excitement" of the Surge, the "Loyalty Incentive" of the Streak, and the "Total Privacy" of Lattice-LSAG create a protocol designed to be a permanent digital asset that survives the quantum age.
+KNOX is a mathematical fortress. It is the first protocol to combine Post-Quantum Ring Signatures, Confidential Transactions, Lattice Stealth Addresses, Forward-Immunity Hardening, and VeloxReaper — the world's first pure-lattice anti-ASIC DAG proof-of-work — into a single, cohesive Layer-1. The "Unpredictable Excitement" of the Surge, the "Loyalty Incentive" of the Streak, and the "Total Privacy" of Lattice-LSAG create a protocol designed to be a permanent digital asset that survives the quantum age. No classical hash function touches the mining core. No ASIC can dominate it. No quantum computer can break it.
