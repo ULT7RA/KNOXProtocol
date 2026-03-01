@@ -1,3 +1,5 @@
+> **MAINTENANCE IN PROGRESS** — Actively fixing bugs and deploying updates. Network may be intermittent. Stand by.
+
 # KNOX Protocol
 
 **The world's first fully end-to-end lattice-based privacy blockchain.**
@@ -109,12 +111,11 @@ KNOX_NODE_NO_MINE=1 cargo run -p knox-node -- ./data 0.0.0.0:9735 0.0.0.0:9736 1
 | Crate | Role |
 |---|---|
 | `knox-types` | Wire types and protocol constants |
-| `knox-crypto` | Curve25519 classical layer (secondary wire format) |
 | `knox-lattice` | ULT7Rock lattice core: ring sigs, commitments, range proofs, stealth, PoW, surge |
-| `knox-storage` | ChaCha20Poly1305-encrypted flat-file key-value store |
+| `knox-storage` | Encrypted flat-file key-value store |
 | `knox-consensus` | PulsarBFT consensus engine |
 | `knox-ledger` | Block and UTXO validation and storage |
-| `knox-p2p` | Lattice two-round KEM handshake, XChaCha20 session encryption, cover traffic |
+| `knox-p2p` | Lattice two-round KEM handshake, authenticated encrypted transport, cover traffic |
 | `knox-core` | Node runtime: mempool, RPC server, block production |
 | `knox-node` | Node binary |
 | `knox-wallet` | Wallet library: UTXO scanning, transaction building |
