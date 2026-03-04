@@ -69,3 +69,16 @@ Purpose: keep a durable, minimal runbook of known-good commands/build strings so
   - Verifying whether deploy + lane lock actually stuck, without dumping huge logs.
 - Notes:
   - If command hangs, run one VM at a time with direct `ssh -i ~/.ssh/knox_oracle ubuntu@<ip> ...` checks.
+
+### [2026-03-04 00:00 UTC] Tip-0 bootstrap fix for duplicate genesis in sync batch
+- Command(s):
+  - Patch `crates/knox-ledger/src/lib.rs::append_block` to detect already-stored height first.
+  - If stored block hash matches incoming hash: return `block height X already exists`.
+  - If stored block hash differs: return conflict error and stop.
+- Success signal:
+  - Local logs stop repeating `sync stop h=0: unexpected block height: got 0, expected 1`.
+  - Sync can continue past genesis when peers send `Blocks` batches that begin with height 0.
+- Use when:
+  - Node is stuck at tip 0 and requests alternate `h=1`/`h=0` while genesis already exists locally.
+- Notes:
+  - Root cause: duplicate genesis in a `Blocks` response triggered `unexpected block height` and broke batch processing before block 1 was applied.

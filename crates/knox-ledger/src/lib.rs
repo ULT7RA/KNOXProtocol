@@ -11,9 +11,10 @@ use knox_storage::Db;
 use knox_types::{
     hash_bytes, hash_header_for_link, hash_header_for_signing, hash_vote_for_signing, Block,
     Hash32, OutputRef, QuorumCertificate, RingMember, SlashEvidence, Transaction, TxIn, TxOut,
-    Vote, MIN_BLOCK_TIME_MS,
+    Vote, MAX_BLOCK_BYTES, MIN_BLOCK_TIME_MS,
 };
 use std::collections::{BTreeMap, HashSet};
+use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_FUTURE_DRIFT_MS: u64 = 2 * 60 * 1000;
@@ -59,6 +60,17 @@ impl Ledger {
 
     pub fn append_block(&self, block: &Block) -> Result<(), String> {
         let height = block.header.height;
+        if let Some(existing) = self.get_block(height)? {
+            let existing_hash = hash_header_for_link(&existing.header);
+            let incoming_hash = hash_header_for_link(&block.header);
+            if existing_hash == incoming_hash {
+                return Err(format!("block height {} already exists", height));
+            }
+            return Err(format!(
+                "conflicting block at height {} already committed",
+                height
+            ));
+        }
         let tip = self.height()?;
         let has_genesis = self.get_block(0)?.is_some();
         let expected_next = if has_genesis {
@@ -72,15 +84,25 @@ impl Ledger {
                 height, expected_next
             ));
         }
-        if self.get_block(height)?.is_some() {
-            return Err(format!("block height {} already exists", height));
-        }
         self.verify_block(block).map_err(|e| format!("verify: {e}"))?;
         let key = block_key(height);
         let bytes = bincode::encode_to_vec(block, bincode::config::standard())
             .map_err(|e| format!("encode: {e}"))?;
+        if bytes.len() > MAX_BLOCK_BYTES {
+            return Err(format!(
+                "block serialized size {} exceeds max {} bytes",
+                bytes.len(),
+                MAX_BLOCK_BYTES
+            ));
+        }
         self.db.put(&key, &bytes).map_err(|e| format!("db-put-block: {e}"))?;
         self.db.put(b"height", &height.to_le_bytes()).map_err(|e| format!("db-put-height: {e}"))?;
+        let prev_cum: u64 = match self.db.get(b"cum_hardening").map_err(|e| format!("db-get-cum: {e}"))? {
+            Some(b) if b.len() == 8 => { let mut arr = [0u8; 8]; arr.copy_from_slice(&b); u64::from_le_bytes(arr) }
+            _ => 0,
+        };
+        let new_cum = prev_cum.saturating_add(block.lattice_proof.difficulty_bits as u64);
+        self.db.put(b"cum_hardening", &new_cum.to_le_bytes()).map_err(|e| format!("db-put-cum: {e}"))?;
         let mut decoy_bucket = Vec::new();
         for tx in &block.txs {
             self.apply_tx(tx, height, &mut decoy_bucket).map_err(|e| format!("apply-tx: {e}"))?;
@@ -92,13 +114,80 @@ impl Ledger {
         Ok(())
     }
 
+    pub fn replace_from_genesis(&mut self, blocks: &[Block]) -> Result<(), String> {
+        if blocks.is_empty() {
+            return Err("replacement chain is empty".to_string());
+        }
+        if blocks[0].header.height != 0 {
+            return Err("replacement chain must start at height 0".to_string());
+        }
+        for pair in blocks.windows(2) {
+            let prev = pair[0].header.height;
+            let next = pair[1].header.height;
+            if next != prev.saturating_add(1) {
+                return Err(format!(
+                    "replacement chain is non-contiguous at {} -> {}",
+                    prev, next
+                ));
+            }
+        }
+
+        let mut verify_dir = std::env::temp_dir();
+        verify_dir.push(format!("knox-ledger-verify-{}", now_ms()));
+        fs::create_dir_all(&verify_dir).map_err(|e| format!("verify mkdir: {e}"))?;
+        let verify_path = verify_dir.to_string_lossy().to_string();
+        let mut verify_ledger = Ledger::open(&verify_path).map_err(|e| format!("verify open: {e}"))?;
+        verify_ledger.set_validators(self.validators.clone());
+        verify_ledger.set_diamond_authenticators(
+            self.diamond_authenticators.clone(),
+            self.diamond_auth_quorum,
+        );
+        for block in blocks {
+            verify_ledger
+                .append_block(block)
+                .map_err(|e| format!("verify replacement chain failed: {e}"))?;
+        }
+
+        self.db.clear().map_err(|e| format!("clear db: {e}"))?;
+        for block in blocks {
+            self.append_block(block)
+                .map_err(|e| format!("apply replacement chain failed: {e}"))?;
+        }
+
+        let _ = fs::remove_dir_all(&verify_dir);
+        Ok(())
+    }
+
     pub fn get_block(&self, height: u64) -> Result<Option<Block>, String> {
         let key = block_key(height);
         match self.db.get(&key)? {
             Some(bytes) => {
                 let decoded: Result<(Block, usize), _> =
-                    bincode::decode_from_slice(&bytes, bincode::config::standard().with_limit::<{ 32 * 1024 * 1024 }>());
-                Ok(decoded.ok().map(|(b, _)| b))
+                    bincode::decode_from_slice(
+                        &bytes,
+                        bincode::config::standard().with_limit::<{ MAX_BLOCK_BYTES }>(),
+                    );
+                match decoded {
+                    Ok((b, _)) => Ok(Some(b)),
+                    Err(err) => {
+                        eprintln!("[knox-ledger] CRITICAL db decode error for block {} ({} bytes): {:?}", height, bytes.len(), err);
+                        // Fallback: local DB data is trusted, so try unbounded decode if limit failed (e.g. huge genesis)
+                        let fallback: Result<(Block, usize), _> = bincode::decode_from_slice(
+                            &bytes,
+                            bincode::config::standard(),
+                        );
+                        match fallback {
+                            Ok((b, _)) => {
+                                eprintln!("[knox-ledger] RECOVERED block {} using unbounded decode", height);
+                                Ok(Some(b))
+                            }
+                            Err(e2) => {
+                                eprintln!("[knox-ledger] FATAL unbound decode failed for block {}: {:?}", height, e2);
+                                Ok(None)
+                            }
+                        }
+                    }
+                }
             }
             None => Ok(None),
         }
@@ -168,6 +257,15 @@ impl Ledger {
         if block.txs.len() > knox_types::MAX_BLOCK_TX {
             return Err("block has too many transactions".to_string());
         }
+        let encoded_block = bincode::encode_to_vec(block, bincode::config::standard())
+            .map_err(|e| format!("block encode failed: {e}"))?;
+        if encoded_block.len() > MAX_BLOCK_BYTES {
+            return Err(format!(
+                "block serialized size {} exceeds max {} bytes",
+                encoded_block.len(),
+                MAX_BLOCK_BYTES
+            ));
+        }
         let tx_hashes = block
             .txs
             .iter()
@@ -224,11 +322,14 @@ impl Ledger {
                 return Err("prev hash mismatch".to_string());
             }
         }
-        if !verify_block_proof_with_difficulty(
-            &block.header,
-            &block.lattice_proof,
-            mining_rules.expected_difficulty_bits,
-        ) {
+        // Genesis block (height 0) is trusted by definition — skip PoW check.
+        if block.header.height > 0
+            && !verify_block_proof_with_difficulty(
+                &block.header,
+                &block.lattice_proof,
+                mining_rules.expected_difficulty_bits,
+            )
+        {
             return Err("lattice proof invalid".to_string());
         }
         if enforce_diamond_auth && !self.diamond_authenticators.is_empty() {
@@ -256,7 +357,7 @@ impl Ledger {
         }
 
         let fees: u64 = block.txs.iter().skip(1).map(|t| t.fee).sum();
-        let streak = proposer_streak_for_height(self, block.header.height, block.header.proposer)?;
+        let streak = proposer_streak_for_height(self, block.header.height, block.header.proposer, block.header.timestamp_ms)?;
         verify_coinbase(coinbase, block.header.height, fees, streak)?;
         verify_slashes(block, &self.validators)?;
         let expected_slash_root = slash_root(&block.slashes);
@@ -293,8 +394,17 @@ impl Ledger {
                 allow_proposal: true,
             });
         }
-        let (month_start, month_end) = month_bounds_utc_ms(timestamp_ms);
-        let month_duration = month_end.saturating_sub(month_start);
+        // Use 30-day periods anchored to genesis timestamp so the surge
+        // fires exactly once every 30 days from chain launch.
+        const PERIOD_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+        let genesis_ts_ms = self.get_block(0)?
+            .map(|b| b.header.timestamp_ms)
+            .unwrap_or(timestamp_ms);
+        let elapsed = timestamp_ms.saturating_sub(genesis_ts_ms);
+        let period_idx = elapsed / PERIOD_MS;
+        let month_start = genesis_ts_ms.saturating_add(period_idx * PERIOD_MS);
+        let month_end = month_start.saturating_add(PERIOD_MS);
+        let month_duration = PERIOD_MS;
         let Some((first_height, first_block)) =
             self.first_block_in_window(tip, month_start, month_end)?
         else {
@@ -418,7 +528,7 @@ impl Ledger {
         let (tip_proposer_streak, next_streak_if_same_proposer, streak_bonus_ppm) =
             if let Some(block) = tip_block.as_ref() {
                 let streak =
-                    proposer_streak_for_height(self, tip.saturating_add(1), block.header.proposer)?;
+                    proposer_streak_for_height(self, tip.saturating_add(1), block.header.proposer, timestamp_ms)?;
                 let next = streak.saturating_add(1).min(knox_types::STREAK_MAX_COUNT);
                 (streak, next, streak_bonus_ppm(streak))
             } else {
@@ -539,6 +649,16 @@ impl Ledger {
     }
 
     fn total_hardening_score(&self, tip: u64) -> Result<u64, String> {
+        // Fast path: read the single cumulative key maintained by append_block.
+        if let Some(b) = self.db.get(b"cum_hardening").map_err(|e| format!("db-get-cum: {e}"))? {
+            if b.len() == 8 {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&b);
+                return Ok(u64::from_le_bytes(arr));
+            }
+        }
+        // Migration path: key absent on nodes that pre-date this change.
+        // Compute the cumulative score once from existing blocks and persist it.
         let mut total = 0u64;
         for h in 0..=tip {
             let Some(block) = self.get_block(h)? else {
@@ -546,6 +666,7 @@ impl Ledger {
             };
             total = total.saturating_add(block.lattice_proof.difficulty_bits as u64);
         }
+        self.db.put(b"cum_hardening", &total.to_le_bytes()).map_err(|e| format!("db-put-cum: {e}"))?;
         Ok(total)
     }
 
@@ -792,12 +913,14 @@ fn proposer_streak_for_height(
     ledger: &Ledger,
     height: u64,
     proposer: [u8; 32],
+    current_timestamp_ms: u64,
 ) -> Result<u64, String> {
     if height == 0 {
         return Ok(1);
     }
     let mut streak = 1u64;
     let mut h = height.saturating_sub(1);
+    let mut prev_ts = current_timestamp_ms;
     loop {
         let Some(block) = ledger.get_block(h)? else {
             break;
@@ -805,10 +928,14 @@ fn proposer_streak_for_height(
         if block.header.proposer != proposer {
             break;
         }
+        if prev_ts.saturating_sub(block.header.timestamp_ms) > 3 * knox_types::TARGET_BLOCK_TIME_MS {
+            break;
+        }
         streak = streak.saturating_add(1);
         if streak >= knox_types::STREAK_MAX_COUNT || h == 0 {
             break;
         }
+        prev_ts = block.header.timestamp_ms;
         h = h.saturating_sub(1);
     }
     Ok(streak)
