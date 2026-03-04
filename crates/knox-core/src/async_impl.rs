@@ -1,5 +1,5 @@
 use knox_consensus::{ConsensusConfig, ValidatorSet};
-use knox_crypto::os_random_bytes;
+use getrandom::getrandom;
 use knox_lattice::{
     consensus_public_key_id, consensus_secret_from_seed, sign_consensus,
     coinbase_split, encode_coinbase_payload, encrypt_amount_with_level,
@@ -34,6 +34,47 @@ const MAX_DECOY_CANDIDATES: usize = 200_000;
 const DECOY_CACHE_TTL_MS: u64 = 10_000;
 const DIAMOND_AUTH_RPC_TIMEOUT_MS: u64 = 10_000;
 const MAX_DIAMOND_AUTH_ENDPOINTS: usize = 32;
+const DEFAULT_SYNC_BLOCKS_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+fn sync_blocks_response_max_bytes() -> usize {
+    std::env::var("KNOX_SYNC_BLOCKS_RESPONSE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(256 * 1024, 64 * 1024 * 1024))
+        .unwrap_or(DEFAULT_SYNC_BLOCKS_RESPONSE_MAX_BYTES)
+}
+
+#[derive(Clone)]
+struct LocalPrng {
+    seed: [u8; 32],
+    counter: u64,
+}
+
+impl LocalPrng {
+    fn new(seed: [u8; 32]) -> Self {
+        Self { seed, counter: 0 }
+    }
+
+    fn fill_bytes(&mut self, out: &mut [u8]) {
+        let mut written = 0usize;
+        while written < out.len() {
+            let mut h = blake3::Hasher::new();
+            h.update(b"knox-core-prng-v1");
+            h.update(&self.seed);
+            h.update(&self.counter.to_le_bytes());
+            let block = h.finalize();
+            self.counter = self.counter.saturating_add(1);
+            let bytes = block.as_bytes();
+            let take = (out.len() - written).min(bytes.len());
+            out[written..written + take].copy_from_slice(&bytes[..take]);
+            written += take;
+        }
+    }
+}
+
+fn fill_os_random(buf: &mut [u8]) -> Result<(), String> {
+    getrandom(buf).map_err(|e| format!("os randomness unavailable: {e}"))
+}
 
 #[derive(Clone, Default)]
 struct RateLimiter {
@@ -110,7 +151,7 @@ impl Node {
             Some(pair) => pair,
             None => {
                 let mut seed = [0u8; 32];
-                os_random_bytes(&mut seed)?;
+                fill_os_random(&mut seed)?;
                 let secret = consensus_secret_from_seed(&seed);
                 let public = knox_lattice::consensus_public_from_secret(&secret);
                 (secret, public)
@@ -203,6 +244,10 @@ impl Node {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(1);
+        let min_local_height_for_mining = std::env::var("KNOX_MIN_LOCAL_HEIGHT_FOR_MINING")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         let fork_guard_pause_ms = std::env::var("KNOX_FORK_GUARD_PAUSE_MS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -212,6 +257,26 @@ impl Node {
         let mut fork_guard_pause_until_ms = 0u64;
         let mut last_fork_guard_log_ms = 0u64;
         let mut last_backend_line = String::new();
+        let sync_retry_ms = std::env::var("KNOX_SYNC_RETRY_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(5_000)
+            .max(1_000);
+        let sync_stall_ms = std::env::var("KNOX_SYNC_STALL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(15_000)
+            .max(sync_retry_ms);
+        let mut last_sync_request_ms = 0u64;
+        let mut last_sync_progress_ms = now_ms();
+        let mut last_sync_progress_height = ledger
+            .lock()
+            .ok()
+            .and_then(|l| l.height().ok())
+            .unwrap_or(0);
+        let mut bootstrap_genesis_stall_count: u32 = 0;
+        let mut last_blocks_response_ms = now_ms();
+        let mut genesis_mismatch_hits: u32 = 0;
 
         // If ledger is empty (no genesis yet), proactively request from h=0
         // after peers have had time to connect.
@@ -269,6 +334,10 @@ impl Node {
                                 Ok(()) => {
                                     let appended = append_finalized_block(&block, &ledger, &mempool);
                                     if appended {
+                                        if block.header.height > last_sync_progress_height {
+                                            last_sync_progress_height = block.header.height;
+                                            last_sync_progress_ms = now_ms();
+                                        }
                                         network.send(Message::Block(block)).await;
                                     }
                                 }
@@ -293,7 +362,7 @@ impl Node {
                                         };
                                         let from = if has_genesis {
                                             // Pull slightly before tip to recover from short forks.
-                                            our_tip.saturating_sub(2)
+                                            std::cmp::max(1, our_tip.saturating_sub(2))
                                         } else {
                                             0
                                         };
@@ -309,10 +378,28 @@ impl Node {
                         Message::GetBlocks { from_height, max_count } => {
                             let blocks = if let Ok(l) = ledger.lock() {
                                 let mut out = Vec::new();
+                                let max_bytes = sync_blocks_response_max_bytes();
+                                let mut used_bytes = 0usize;
                                 let cap = (max_count as u64).min(200);
                                 for h in from_height..from_height.saturating_add(cap) {
                                     match l.get_block(h) {
-                                        Ok(Some(b)) => out.push(b),
+                                        Ok(Some(b)) => {
+                                            let block_bytes = bincode::encode_to_vec(
+                                                &b,
+                                                bincode::config::standard(),
+                                            )
+                                            .map(|v| v.len())
+                                            .unwrap_or(0);
+                                            let next_bytes = used_bytes.saturating_add(block_bytes);
+                                            if !out.is_empty() && next_bytes > max_bytes {
+                                                break;
+                                            }
+                                            out.push(b);
+                                            used_bytes = next_bytes;
+                                            if used_bytes >= max_bytes {
+                                                break;
+                                            }
+                                        }
                                         _ => break,
                                     }
                                 }
@@ -324,17 +411,54 @@ impl Node {
                             }
                         }
                         Message::Blocks(blocks) => {
+                            if !blocks.is_empty() {
+                                last_blocks_response_ms = now_ms();
+                            }
                             let mut last_applied: Option<u64> = None;
                             for block in &blocks {
                                 if let Ok(l) = ledger.lock() {
                                     match l.append_block(block) {
                                         Ok(()) => {
                                             eprintln!("[knox-node] sync h={}", block.header.height);
+                                            if block.header.height > last_sync_progress_height {
+                                                last_sync_progress_height = block.header.height;
+                                                last_sync_progress_ms = now_ms();
+                                            }
                                             last_applied = Some(block.header.height);
+                                            genesis_mismatch_hits = 0;
                                         }
                                         Err(e) if e.contains("already exists") => {}
                                         Err(e) => {
+                                            if e.contains("unexpected block height") {
+                                                // `Blocks` responses are gossiped to all peers, so we can receive
+                                                // out-of-window batches intended for someone else (e.g. h=59 while
+                                                // we're still expecting h=1). Skip these and keep waiting for our
+                                                // requested range instead of poisoning bootstrap progress.
+                                                let local_tip = ledger
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|l| l.height().ok())
+                                                    .unwrap_or(0);
+                                                eprintln!(
+                                                    "[knox-node] sync skip h={} (local_tip={}, reason=out-of-order batch)",
+                                                    block.header.height, local_tip
+                                                );
+                                                continue;
+                                            }
                                             eprintln!("[knox-node] sync stop h={}: {}", block.header.height, e);
+                                            let low_height = block.header.height <= 1;
+                                            let likely_mismatch =
+                                                e.contains("prev hash mismatch")
+                                                    || e.contains("missing parent")
+                                                    || e.to_lowercase().contains("genesis");
+                                            if low_height && likely_mismatch {
+                                                genesis_mismatch_hits = genesis_mismatch_hits.saturating_add(1);
+                                                if genesis_mismatch_hits >= 3 {
+                                                    eprintln!(
+                                                        "[knox-node] sync blocked at low height; likely genesis mismatch between local embedded genesis and peer network"
+                                                    );
+                                                }
+                                            }
                                             break;
                                         }
                                     }
@@ -358,16 +482,100 @@ impl Node {
                 }
                 _ = ticker.tick() => {
                     let now = now_ms();
+                    let active_peers = network.active_peer_count();
+                    if active_peers > 0 && now.saturating_sub(last_sync_request_ms) >= sync_retry_ms {
+                        let (tip, has_genesis) = match ledger.lock() {
+                            Ok(l) => (
+                                l.height().unwrap_or(0),
+                                l.get_block(0).unwrap_or(None).is_some(),
+                            ),
+                            Err(_) => (0, false),
+                        };
+                        let bootstrap_has_genesis = has_genesis && tip == 0;
+                        let stalled = has_genesis
+                            && tip <= last_sync_progress_height
+                            && now.saturating_sub(last_sync_progress_ms) >= sync_stall_ms;
+                        if !has_genesis || bootstrap_has_genesis || stalled {
+                            let no_block_response_ms = now.saturating_sub(last_blocks_response_ms);
+                            let dual_probe = bootstrap_has_genesis
+                                && bootstrap_genesis_stall_count >= 3
+                                && no_block_response_ms >= sync_stall_ms;
+                            let from = if !has_genesis {
+                                0
+                            } else if bootstrap_has_genesis {
+                                // Prefer h=1 during normal bootstrap. If this repeats while tip stays at 0,
+                                // fall back to h=0 so peers can resend genesis + first blocks.
+                                if bootstrap_genesis_stall_count >= 3 { 0 } else { 1 }
+                            } else {
+                                std::cmp::max(1, tip.saturating_sub(2))
+                            };
+                            let reason = if !has_genesis {
+                                "bootstrap-no-genesis"
+                            } else if bootstrap_has_genesis {
+                                if from == 0 {
+                                    "bootstrap-has-genesis-fallback0"
+                                } else {
+                                    "bootstrap-has-genesis"
+                                }
+                            } else {
+                                "stalled"
+                            };
+                            eprintln!(
+                                "[knox-node] sync request from h={} (tip={}, peers={}, reason={})",
+                                from, tip, active_peers, reason
+                            );
+                            network
+                                .send(Message::GetBlocks {
+                                    from_height: from,
+                                    max_count: 200,
+                                })
+                                .await;
+                            if dual_probe {
+                                eprintln!(
+                                    "[knox-node] sync probe from h=0 (tip=0, peers={}, reason=bootstrap-dual-probe)",
+                                    active_peers
+                                );
+                                network
+                                    .send(Message::GetBlocks {
+                                        from_height: 0,
+                                        max_count: 200,
+                                    })
+                                    .await;
+                            }
+                            last_sync_request_ms = now;
+                            if bootstrap_has_genesis {
+                                bootstrap_genesis_stall_count =
+                                    bootstrap_genesis_stall_count.saturating_add(1);
+                            } else if tip > 0 {
+                                bootstrap_genesis_stall_count = 0;
+                            }
+                        }
+                    }
                     if !mining_enabled {
                         continue;
                     }
                     if min_peers_for_mining > 0 {
-                        let active_peers = network.active_peer_count();
                         if active_peers < min_peers_for_mining {
                             if now.saturating_sub(last_peer_gate_log_ms) > 10_000 {
                                 eprintln!(
                                     "[knox-node] mining paused: active peers {} below required {}",
                                     active_peers, min_peers_for_mining
+                                );
+                                last_peer_gate_log_ms = now;
+                            }
+                            continue;
+                        }
+                    }
+                    if min_local_height_for_mining > 0 {
+                        let local_tip = match ledger.lock() {
+                            Ok(l) => l.height().unwrap_or(0),
+                            Err(_) => 0,
+                        };
+                        if local_tip < min_local_height_for_mining {
+                            if now.saturating_sub(last_peer_gate_log_ms) > 10_000 {
+                                eprintln!(
+                                    "[knox-node] mining paused: local tip {} below required startup height {}",
+                                    local_tip, min_local_height_for_mining
                                 );
                                 last_peer_gate_log_ms = now;
                             }
@@ -385,12 +593,13 @@ impl Node {
                         continue;
                     }
                     {
+                        let ts_now = now_ms();
                         let (height, proposer_streak, mining_rules, prev_block) = match ledger.lock() {
                             Ok(l) => {
                                 let tip = l.height().unwrap_or(0);
                                 let has_genesis = l.get_block(0).unwrap_or(None).is_some();
                                 let height = if has_genesis { tip.saturating_add(1) } else { 0 };
-                                let streak = proposer_streak_for_height(&l, height, proposer_id);
+                                let streak = proposer_streak_for_height(&l, height, proposer_id, ts_now);
                                 let rules = match l.mining_rules_for_height(height, now) {
                                     Ok(r) => r,
                                     Err(err) => {
@@ -442,7 +651,6 @@ impl Node {
                         let tx_root = merkle_root(&tx_hashes);
                         let slash_root = slash_root(&slashes);
                         let state_root = knox_types::compute_state_root(height, prev, tx_root, slash_root);
-                        let ts_now = now_ms();
                         if let Some(parent) = prev_block.as_ref() {
                             let min_next = parent
                                 .header
@@ -871,10 +1079,10 @@ async fn run_rpc(
                             WalletResponse::Decoys(Vec::new())
                         } else {
                             let mut seed = [0u8; 32];
-                            if knox_crypto::os_random_bytes(&mut seed).is_err() {
+                            if fill_os_random(&mut seed).is_err() {
                                 WalletResponse::Decoys(Vec::new())
                             } else {
-                                let mut prng = knox_crypto::Prng::new(seed);
+                                let mut prng = LocalPrng::new(seed);
                                 let mut candidates = Vec::new();
                                 if let Ok(ledger) = ledger.lock() {
                                     let tip = ledger.height().unwrap_or(0);
@@ -1079,7 +1287,7 @@ fn decoy_weight(age_blocks: u64) -> u32 {
 fn weighted_sample_decoys(
     candidates: &[(knox_types::RingMember, u32)],
     count: usize,
-    prng: &mut knox_crypto::Prng,
+    prng: &mut LocalPrng,
 ) -> Vec<knox_types::RingMember> {
     if candidates.is_empty() || count == 0 {
         return Vec::new();
@@ -1101,7 +1309,7 @@ fn weighted_sample_decoys(
         .collect()
 }
 
-fn random_unit_f64(prng: &mut knox_crypto::Prng) -> f64 {
+fn random_unit_f64(prng: &mut LocalPrng) -> f64 {
     let mut bytes = [0u8; 8];
     prng.fill_bytes(&mut bytes);
     let v = u64::from_le_bytes(bytes);
@@ -1137,14 +1345,14 @@ mod tests {
         for i in 0..64u8 {
             candidates.push((dummy_member(i), 5));
         }
-        let mut prng = knox_crypto::Prng::new([3u8; 32]);
+        let mut prng = LocalPrng::new([3u8; 32]);
         let out = weighted_sample_decoys(&candidates, 31, &mut prng);
         assert_eq!(out.len(), 31);
     }
 
     #[test]
     fn weighted_sampler_handles_empty() {
-        let mut prng = knox_crypto::Prng::new([1u8; 32]);
+        let mut prng = LocalPrng::new([1u8; 32]);
         let out = weighted_sample_decoys(&[], 8, &mut prng);
         assert!(out.is_empty());
     }
@@ -1301,48 +1509,75 @@ fn build_coinbase(
     let fees: u64 = txs.iter().map(|t| t.fee).sum();
     let split = coinbase_split(height, fees, streak);
 
-    let mut outputs = Vec::new();
-    let mut amounts = Vec::new();
-    let mut push_output = |addr: &Address, amount: u64| -> Result<(), String> {
-        let out = coinbase_output(height, addr, amount)?;
-        outputs.push(out);
-        amounts.push(amount);
-        Ok(())
-    };
-
-    push_output(miner, split.miner)?;
+    let mut recipients: Vec<(&Address, u64)> = Vec::new();
+    recipients.push((miner, split.miner));
     if split.treasury > 0 {
-        push_output(treasury, split.treasury)?;
+        recipients.push((treasury, split.treasury));
     }
     if split.dev > 0 {
-        push_output(dev, split.dev)?;
+        recipients.push((dev, split.dev));
     }
     if split.premine > 0 {
-        push_output(premine, split.premine)?;
+        recipients.push((premine, split.premine));
     }
 
     let commitment_key = LatticeCommitmentKey::derive();
     let private_outputs = private_coinbase_outputs(&commitment_key, split)?;
-    if private_outputs.len() != outputs.len() || private_outputs.len() != amounts.len() {
+    if private_outputs.len() != recipients.len() {
         return Err("coinbase lattice output count mismatch".to_string());
     }
 
+    let mut outputs = Vec::with_capacity(recipients.len());
+    let mut amounts = Vec::with_capacity(recipients.len());
     let mut lattice_outputs = Vec::with_capacity(outputs.len());
     let mut openings = Vec::with_capacity(outputs.len());
-    for i in 0..outputs.len() {
-        let tx_out = &mut outputs[i];
-        let private = &private_outputs[i];
-        let stealth_address = lattice_public_from_serialized(&tx_out.lattice_spend_pub)?;
+    let enc_level = tx_hardening_level(height);
+    for (idx, (recipient, amount)) in recipients.iter().enumerate() {
+        let private = &private_outputs[idx];
+        if private.amount != *amount {
+            return Err("coinbase lattice amount mismatch".to_string());
+        }
+
+        let recipient_pub = lattice_public_from_serialized(&recipient.lattice_spend_pub)?;
+        let eph_secret = knox_lattice::Poly::random_short_checked()?;
+        let stealth = knox_lattice::stealth::send_to_stealth_with_ephemeral(
+            &recipient_pub,
+            &recipient_pub,
+            &eph_secret,
+        );
+        let shared_bytes = lattice_shared_seed(&stealth.one_time_public, &stealth.ephemeral_public);
+        let blind = blind_bytes_from_opening(&private.opening);
+        let (enc_amount, enc_blind) =
+            encrypt_amount_with_level(&shared_bytes, *amount, &blind, enc_level);
+
         let lattice_out = LatticeOutput {
-            stealth_address,
-            ephemeral_public: lattice_public_from_bytes(b"knox-coinbase-ephemeral", &tx_out.tx_pub),
+            stealth_address: stealth.one_time_public.clone(),
+            ephemeral_public: stealth.ephemeral_public.clone(),
             commitment: private.commitment.clone(),
             range_proof: private.range_proof.clone(),
-            enc_amount: tx_out.enc_amount,
-            enc_blind: tx_out.enc_blind,
-            enc_level: tx_out.enc_level,
+            enc_amount,
+            enc_blind,
+            enc_level,
         };
-        tx_out.commitment = lattice_commitment_digest(&lattice_out.commitment);
+        let tx_out = knox_types::TxOut {
+            one_time_pub: compatibility_pubkey_tag(
+                b"knox-wallet-one-time-v2",
+                &stealth.one_time_public.p.to_bytes(),
+            ),
+            tx_pub: compatibility_pubkey_tag(
+                b"knox-wallet-ephemeral-v2",
+                &stealth.ephemeral_public.p.to_bytes(),
+            ),
+            commitment: lattice_commitment_digest(&lattice_out.commitment),
+            lattice_spend_pub: stealth.one_time_public.p.to_bytes(),
+            enc_amount,
+            enc_blind,
+            enc_level,
+            memo: [0u8; 32],
+            range_proof: lattice_range_placeholder(&lattice_out.range_proof),
+        };
+        outputs.push(tx_out);
+        amounts.push(*amount);
         lattice_outputs.push(lattice_out);
         openings.push(private.opening.clone());
     }
@@ -1365,119 +1600,53 @@ fn build_coinbase(
     })
 }
 
-fn coinbase_output(height: u64, addr: &Address, amount: u64) -> Result<knox_types::TxOut, String> {
-    let (r, r_pub) = random_scalar_and_pub()?;
-    let view_pub = knox_crypto::PublicKey(addr.view);
-    let spend_pub = knox_crypto::PublicKey(addr.spend);
-    let one_time_pub = knox_crypto::derive_one_time_pub(&view_pub, &spend_pub, &r)?;
-    let recipient_lattice_pub = lattice_public_from_serialized(&addr.lattice_spend_pub)?;
-
-    let blind = random_scalar_bytes()?;
-    let commit = knox_crypto::pedersen_commit(amount, &scalar_from_bytes(&blind));
-    let proof = knox_crypto::prove_range(amount, scalar_from_bytes(&blind))?;
-    let shared = shared_secret_sender(&r, &view_pub)?;
-    let shared_bytes = shared.compress().to_bytes();
-    let one_time_lattice_pub = lattice_output_public_from_shared(
-        &recipient_lattice_pub,
-        &shared_bytes,
-        &one_time_pub.0,
-        &r_pub.0,
-    );
-    let enc_level = tx_hardening_level(height);
-    let (enc_amount, enc_blind) =
-        encrypt_amount_with_level(&shared_bytes, amount, &blind, enc_level);
-
-    Ok(knox_types::TxOut {
-        one_time_pub: one_time_pub.0,
-        tx_pub: r_pub.0,
-        commitment: commit.to_bytes(),
-        lattice_spend_pub: one_time_lattice_pub.p.to_bytes(),
-        enc_amount,
-        enc_blind,
-        enc_level,
-        memo: [0u8; 32],
-        range_proof: to_range_types(&proof),
-    })
-}
-
-fn random_scalar_and_pub(
-) -> Result<(curve25519_dalek::scalar::Scalar, knox_crypto::PublicKey), String> {
-    let mut seed = [0u8; 32];
-    knox_crypto::os_random_bytes(&mut seed)?;
-    let scalar = curve25519_dalek::scalar::Scalar::from_bytes_mod_order(seed);
-    let point = scalar * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
-    Ok((scalar, knox_crypto::PublicKey(point.compress().to_bytes())))
-}
-
-fn random_scalar_bytes() -> Result<[u8; 32], String> {
-    let mut bytes = [0u8; 32];
-    knox_crypto::os_random_bytes(&mut bytes)?;
-    Ok(bytes)
-}
-
-fn lattice_public_from_bytes(domain: &[u8], bytes: &[u8]) -> LatticePublicKey {
-    LatticePublicKey {
-        p: knox_lattice::Poly::from_hash(domain, bytes),
-    }
-}
-
 fn lattice_public_from_serialized(bytes: &[u8]) -> Result<LatticePublicKey, String> {
     let poly = knox_lattice::Poly::from_bytes(bytes)
         .map_err(|_| "invalid lattice public key bytes".to_string())?;
     Ok(LatticePublicKey { p: poly })
 }
 
-fn lattice_tweak_from_shared(
-    shared_secret: &[u8; 32],
-    one_time_pub: &[u8; 32],
-    tx_pub: &[u8; 32],
-) -> knox_lattice::Poly {
-    let mut data = Vec::with_capacity(32 + 32 + 32);
-    data.extend_from_slice(shared_secret);
-    data.extend_from_slice(one_time_pub);
-    data.extend_from_slice(tx_pub);
-    knox_lattice::Poly::sample_short(b"knox-wallet-lattice-output-tweak-v1", &data)
-}
-
-fn lattice_output_public_from_shared(
-    base_public: &LatticePublicKey,
-    shared_secret: &[u8; 32],
-    one_time_pub: &[u8; 32],
-    tx_pub: &[u8; 32],
-) -> LatticePublicKey {
-    let tweak = lattice_tweak_from_shared(shared_secret, one_time_pub, tx_pub);
-    let tweak_public = knox_lattice::ring_sig::public_from_secret(&knox_lattice::LatticeSecretKey {
-        s: tweak,
-    });
-    LatticePublicKey {
-        p: base_public.p.add(&tweak_public.p),
-    }
-}
-
 fn lattice_commitment_digest(commitment: &LatticeCommitment) -> [u8; 32] {
     hash_bytes(&commitment.to_bytes()).0
 }
 
-fn scalar_from_bytes(bytes: &[u8; 32]) -> curve25519_dalek::scalar::Scalar {
-    curve25519_dalek::scalar::Scalar::from_bytes_mod_order(*bytes)
+fn lattice_shared_seed(
+    one_time_public: &LatticePublicKey,
+    ephemeral_public: &LatticePublicKey,
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"knox-lattice-shared-seed-v2");
+    h.update(&one_time_public.p.to_bytes());
+    h.update(&ephemeral_public.p.to_bytes());
+    *h.finalize().as_bytes()
 }
 
-fn shared_secret_sender(
-    r: &curve25519_dalek::scalar::Scalar,
-    view_pub: &knox_crypto::PublicKey,
-) -> Result<curve25519_dalek::ristretto::RistrettoPoint, String> {
-    let view_point = curve25519_dalek::ristretto::CompressedRistretto(view_pub.0)
-        .decompress()
-        .ok_or_else(|| "invalid view public key".to_string())?;
-    Ok(r * view_point)
+fn compatibility_pubkey_tag(domain: &[u8], payload: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(domain);
+    h.update(payload);
+    *h.finalize().as_bytes()
 }
 
-fn proposer_streak_for_height(ledger: &Ledger, height: u64, proposer: [u8; 32]) -> u64 {
+fn blind_bytes_from_opening(opening: &knox_lattice::CommitmentOpening) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let r_bytes = opening.randomness.to_bytes();
+    out.copy_from_slice(&blake3::hash(&r_bytes).as_bytes()[..32]);
+    out
+}
+
+fn proposer_streak_for_height(
+    ledger: &Ledger,
+    height: u64,
+    proposer: [u8; 32],
+    current_timestamp_ms: u64,
+) -> u64 {
     if height == 0 {
         return 1;
     }
     let mut streak = 1u64;
     let mut h = height.saturating_sub(1);
+    let mut prev_ts = current_timestamp_ms;
     loop {
         let Some(block) = ledger.get_block(h).ok().flatten() else {
             break;
@@ -1485,29 +1654,47 @@ fn proposer_streak_for_height(ledger: &Ledger, height: u64, proposer: [u8; 32]) 
         if block.header.proposer != proposer {
             break;
         }
+        if prev_ts.saturating_sub(block.header.timestamp_ms) > 3 * knox_types::TARGET_BLOCK_TIME_MS {
+            break;
+        }
         streak = streak.saturating_add(1);
         if streak >= knox_types::STREAK_MAX_COUNT || h == 0 {
             break;
         }
+        prev_ts = block.header.timestamp_ms;
         h = h.saturating_sub(1);
     }
     streak
 }
 
-fn to_range_types(proof: &knox_crypto::RangeProof) -> knox_types::RangeProof {
+fn lattice_range_placeholder(proof: &knox_lattice::LatticeRangeProof) -> knox_types::RangeProof {
+    let encoded = bincode::encode_to_vec(proof, bincode::config::standard()).unwrap_or_default();
+    let derive = |tag: &[u8]| -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(b"knox-range-compat-v2");
+        h.update(tag);
+        h.update(&encoded);
+        *h.finalize().as_bytes()
+    };
+    let mut l_vec = Vec::new();
+    let mut r_vec = Vec::new();
+    for idx in 0..4u8 {
+        l_vec.push(derive(&[b'l', idx]));
+        r_vec.push(derive(&[b'r', idx]));
+    }
     knox_types::RangeProof {
-        a: proof.a,
-        s: proof.s,
-        t1: proof.t1,
-        t2: proof.t2,
-        tau_x: proof.tau_x,
-        mu: proof.mu,
-        t_hat: proof.t_hat,
+        a: derive(b"a"),
+        s: derive(b"s"),
+        t1: derive(b"t1"),
+        t2: derive(b"t2"),
+        tau_x: derive(b"tau_x"),
+        mu: derive(b"mu"),
+        t_hat: derive(b"t_hat"),
         ip_proof: knox_types::InnerProductProof {
-            l_vec: proof.ip_proof.l_vec.clone(),
-            r_vec: proof.ip_proof.r_vec.clone(),
-            a: proof.ip_proof.a,
-            b: proof.ip_proof.b,
+            l_vec,
+            r_vec,
+            a: derive(b"ipa"),
+            b: derive(b"ipb"),
         },
     }
 }

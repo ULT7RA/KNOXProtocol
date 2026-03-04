@@ -82,3 +82,15 @@ Purpose: keep a durable, minimal runbook of known-good commands/build strings so
   - Node is stuck at tip 0 and requests alternate `h=1`/`h=0` while genesis already exists locally.
 - Notes:
   - Root cause: duplicate genesis in a `Blocks` response triggered `unexpected block height` and broke batch processing before block 1 was applied.
+
+### [2026-03-04 00:00 UTC] Ignore out-of-order gossiped `Blocks` batches during bootstrap
+- Command(s):
+  - Patch `crates/knox-core/src/async_impl.rs` in `Message::Blocks` handling:
+    - if append fails with `unexpected block height`, log `sync skip ... out-of-order batch` and continue.
+- Success signal:
+  - Logs show `sync skip h=<high>` instead of repeated `sync stop h=<high>: unexpected block height ...`.
+  - Node keeps waiting for valid contiguous range (`h=1` at tip 0) instead of stalling on unrelated peer batches.
+- Use when:
+  - `Blocks` are broadcast network-wide and local node receives ranges requested by other peers (e.g., `h=59`) during bootstrap.
+- Notes:
+  - This de-noises sync; it does not fix consensus/proof mismatches (e.g., `verify: lattice proof invalid`).
