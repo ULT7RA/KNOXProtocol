@@ -1,6 +1,4 @@
 use blake3::Hasher;
-use chacha20poly1305::aead::{Aead, Payload};
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use getrandom::getrandom;
 use std::fs;
 use std::fs::OpenOptions;
@@ -10,7 +8,18 @@ use subtle::ConstantTimeEq;
 
 const DB_MAGIC_V1: &[u8; 4] = b"PCDB";
 const DB_MAGIC_V2: &[u8; 4] = b"PCD2";
+const DB_MAGIC_V3: &[u8; 4] = b"PCD3";
 const KEY_FILE: &str = "db.key";
+
+fn sync_writes_enabled() -> bool {
+    matches!(
+        std::env::var("KNOX_DB_SYNC_WRITES")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes")
+    )
+}
 
 pub struct Db {
     root: PathBuf,
@@ -42,7 +51,9 @@ impl Db {
                 .open(&key_path)
                 .map_err(|e| e.to_string())?;
             file.write_all(&key).map_err(|e| e.to_string())?;
-            file.flush().map_err(|e| e.to_string())?;
+            if sync_writes_enabled() {
+                file.flush().map_err(|e| e.to_string())?;
+            }
             harden_file_permissions(&key_path);
             key
         };
@@ -58,19 +69,20 @@ impl Db {
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
         if buf.len() >= 4 + 24 + 16 && &buf[..4] == DB_MAGIC_V2 {
+            return Err(
+                "db record uses retired xchacha format; wipe ledger and resync with current binaries"
+                    .to_string(),
+            );
+        }
+        if buf.len() >= 4 + 24 + 16 && &buf[..4] == DB_MAGIC_V3 {
             let nonce = &buf[4..28];
             let cipher = &buf[28..];
             let plain = decrypt_record(&self.key, key, nonce, cipher)?;
             return Ok(Some(plain));
         }
         if buf.len() >= 4 + 32 && &buf[..4] == DB_MAGIC_V1 {
-            let allow_legacy = std::env::var("KNOX_DB_ALLOW_LEGACY_V1")
-                .ok()
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if !allow_legacy {
-                return Err("legacy db record format disabled; set KNOX_DB_ALLOW_LEGACY_V1=1 for one-time migration".to_string());
-            }
+            // Legacy v1 records can still exist on long-lived nodes. Read + migrate
+            // in-place so older block ranges remain servable during rolling upgrades.
             let mac = &buf[4..36];
             let value = &buf[36..];
             let expected = keyed_hash_legacy(&self.key, value);
@@ -94,11 +106,29 @@ impl Db {
         let mut nonce = [0u8; 24];
         getrandom(&mut nonce).map_err(|e| e.to_string())?;
         let cipher = encrypt_record(&self.key, key, &nonce, value)?;
-        file.write_all(DB_MAGIC_V2).map_err(|e| e.to_string())?;
+        file.write_all(DB_MAGIC_V3).map_err(|e| e.to_string())?;
         file.write_all(&nonce).map_err(|e| e.to_string())?;
         file.write_all(&cipher).map_err(|e| e.to_string())?;
-        file.flush().map_err(|e| e.to_string())?;
+        if sync_writes_enabled() {
+            file.flush().map_err(|e| e.to_string())?;
+        }
         fs::rename(tmp, path).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn clear(&self) -> Result<(), String> {
+        for entry in fs::read_dir(&self.root).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if path.file_name().and_then(|n| n.to_str()) == Some(KEY_FILE) {
+                continue;
+            }
+            if path.is_dir() {
+                fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
+            } else {
+                fs::remove_file(&path).map_err(|e| e.to_string())?;
+            }
+        }
         Ok(())
     }
 
@@ -132,16 +162,16 @@ fn encrypt_record(
     nonce: &[u8; 24],
     value: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let cipher = XChaCha20Poly1305::new(key.into());
-    cipher
-        .encrypt(
-            XNonce::from_slice(nonce),
-            Payload {
-                msg: value,
-                aad: record_key,
-            },
-        )
-        .map_err(|_| "db encrypt failed".to_string())
+    let keystream = stream_bytes(key, nonce, record_key, value.len());
+    let mut ciphertext = vec![0u8; value.len()];
+    for (idx, byte) in value.iter().enumerate() {
+        ciphertext[idx] = *byte ^ keystream[idx];
+    }
+    let tag = auth_tag(key, nonce, record_key, &ciphertext);
+    let mut out = Vec::with_capacity(16 + ciphertext.len());
+    out.extend_from_slice(&tag);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
 }
 
 fn decrypt_record(
@@ -153,17 +183,49 @@ fn decrypt_record(
     if nonce.len() != 24 {
         return Err("db nonce length invalid".to_string());
     }
+    if cipher.len() < 16 {
+        return Err("db ciphertext too short".to_string());
+    }
     let mut nonce_arr = [0u8; 24];
     nonce_arr.copy_from_slice(nonce);
-    let aead = XChaCha20Poly1305::new(key.into());
-    aead.decrypt(
-        XNonce::from_slice(&nonce_arr),
-        Payload {
-            msg: cipher,
-            aad: record_key,
-        },
-    )
-    .map_err(|_| "db decrypt failed".to_string())
+    let expected = auth_tag(key, &nonce_arr, record_key, &cipher[16..]);
+    let mut found = [0u8; 16];
+    found.copy_from_slice(&cipher[..16]);
+    if expected.ct_eq(&found).unwrap_u8() == 0 {
+        return Err("db decrypt failed".to_string());
+    }
+    let keystream = stream_bytes(key, &nonce_arr, record_key, cipher.len().saturating_sub(16));
+    let mut plain = vec![0u8; cipher.len().saturating_sub(16)];
+    for (idx, byte) in cipher[16..].iter().enumerate() {
+        plain[idx] = *byte ^ keystream[idx];
+    }
+    Ok(plain)
+}
+
+fn stream_bytes(key: &[u8; 32], nonce: &[u8; 24], aad: &[u8], len: usize) -> Vec<u8> {
+    let mut hasher = Hasher::new_keyed(key);
+    hasher.update(b"knox-lattice-stream-v1");
+    hasher.update(nonce);
+    hasher.update(&(aad.len() as u32).to_le_bytes());
+    hasher.update(aad);
+    let mut reader = hasher.finalize_xof();
+    let mut out = vec![0u8; len];
+    reader.fill(&mut out);
+    out
+}
+
+fn auth_tag(key: &[u8; 32], nonce: &[u8; 24], aad: &[u8], cipher: &[u8]) -> [u8; 16] {
+    let mut hasher = Hasher::new_keyed(key);
+    hasher.update(b"knox-lattice-auth-v1");
+    hasher.update(nonce);
+    hasher.update(&(aad.len() as u32).to_le_bytes());
+    hasher.update(aad);
+    hasher.update(&(cipher.len() as u32).to_le_bytes());
+    hasher.update(cipher);
+    let digest = hasher.finalize();
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&digest.as_bytes()[..16]);
+    tag
 }
 
 fn harden_file_permissions(path: &PathBuf) {

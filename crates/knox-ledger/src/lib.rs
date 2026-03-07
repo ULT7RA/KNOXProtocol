@@ -1,8 +1,9 @@
 use knox_lattice::{
     consensus_public_key_id, verify_consensus, LatticePublicKey,
     coinbase_split, decode_coinbase_payload, decode_lattice_tx_extra, difficulty_bits,
+    explain_block_proof_failure_with_difficulty,
     month_bounds_utc_ms, surge_difficulty_bits, surge_phase, surge_start_ms,
-    verify_block_proof_with_difficulty, verify_opening as verify_lattice_opening,
+    verify_opening as verify_lattice_opening,
     verify_range_u64 as verify_lattice_range, verify_transaction as verify_lattice_transaction,
     CommitmentOpening, LatticeCommitmentKey, LatticeInput, LatticeOutput, SurgePhase, SURGE_BLOCK_CAP,
     SURGE_DURATION_MS,
@@ -34,6 +35,25 @@ pub struct Ledger {
     diamond_auth_quorum: usize,
 }
 
+#[derive(Debug, Default)]
+pub struct SyncApplyBatchResult {
+    pub applied_count: usize,
+    pub progressed_count: usize,
+    pub already_exists_count: usize,
+    pub skipped_out_of_order: usize,
+    pub stop_height: Option<u64>,
+    pub stop_error: Option<String>,
+    pub last_applied_height: Option<u64>,
+    pub last_progress_height: Option<u64>,
+}
+
+enum AppendBlockOutcome {
+    Applied,
+    AlreadyExistsAdvanced,
+    AlreadyExistsStale,
+    OutOfOrder,
+}
+
 impl Ledger {
     pub fn open(path: &str) -> Result<Self, String> {
         let db = Db::open(path)?;
@@ -59,59 +79,104 @@ impl Ledger {
     }
 
     pub fn append_block(&self, block: &Block) -> Result<(), String> {
-        let height = block.header.height;
-        if let Some(existing) = self.get_block(height)? {
-            let existing_hash = hash_header_for_link(&existing.header);
-            let incoming_hash = hash_header_for_link(&block.header);
-            if existing_hash == incoming_hash {
-                return Err(format!("block height {} already exists", height));
-            }
-            return Err(format!(
-                "conflicting block at height {} already committed",
-                height
-            ));
-        }
         let tip = self.height()?;
         let has_genesis = self.get_block(0)?.is_some();
-        let expected_next = if has_genesis {
+        let mut expected_next = if has_genesis {
             tip.saturating_add(1)
         } else {
             0
         };
-        if height != expected_next {
-            return Err(format!(
+        let mut cum_hardening = self.cumulative_hardening()?;
+        match self.append_block_with_meta(block, &mut expected_next, &mut cum_hardening)? {
+            AppendBlockOutcome::Applied => {
+                let height = block.header.height;
+                self.persist_chain_meta(height, cum_hardening)?;
+                Ok(())
+            }
+            AppendBlockOutcome::AlreadyExistsAdvanced | AppendBlockOutcome::AlreadyExistsStale => {
+                Err(format!("block height {} already exists", block.header.height))
+            }
+            AppendBlockOutcome::OutOfOrder => Err(format!(
                 "unexpected block height: got {}, expected {}",
-                height, expected_next
-            ));
+                block.header.height, expected_next
+            )),
         }
-        self.verify_block(block).map_err(|e| format!("verify: {e}"))?;
-        let key = block_key(height);
-        let bytes = bincode::encode_to_vec(block, bincode::config::standard())
-            .map_err(|e| format!("encode: {e}"))?;
-        if bytes.len() > MAX_BLOCK_BYTES {
-            return Err(format!(
-                "block serialized size {} exceeds max {} bytes",
-                bytes.len(),
-                MAX_BLOCK_BYTES
-            ));
+    }
+
+    pub fn append_sync_batch(&self, blocks: &[Block]) -> SyncApplyBatchResult {
+        let mut result = SyncApplyBatchResult::default();
+        if blocks.is_empty() {
+            return result;
         }
-        self.db.put(&key, &bytes).map_err(|e| format!("db-put-block: {e}"))?;
-        self.db.put(b"height", &height.to_le_bytes()).map_err(|e| format!("db-put-height: {e}"))?;
-        let prev_cum: u64 = match self.db.get(b"cum_hardening").map_err(|e| format!("db-get-cum: {e}"))? {
-            Some(b) if b.len() == 8 => { let mut arr = [0u8; 8]; arr.copy_from_slice(&b); u64::from_le_bytes(arr) }
-            _ => 0,
+
+        let tip = match self.height() {
+            Ok(tip) => tip,
+            Err(err) => {
+                result.stop_error = Some(err);
+                result.stop_height = blocks.first().map(|b| b.header.height);
+                return result;
+            }
         };
-        let new_cum = prev_cum.saturating_add(block.lattice_proof.difficulty_bits as u64);
-        self.db.put(b"cum_hardening", &new_cum.to_le_bytes()).map_err(|e| format!("db-put-cum: {e}"))?;
-        let mut decoy_bucket = Vec::new();
-        for tx in &block.txs {
-            self.apply_tx(tx, height, &mut decoy_bucket).map_err(|e| format!("apply-tx: {e}"))?;
+        let has_genesis = match self.get_block(0) {
+            Ok(block) => block.is_some(),
+            Err(err) => {
+                result.stop_error = Some(err);
+                result.stop_height = blocks.first().map(|b| b.header.height);
+                return result;
+            }
+        };
+        let mut expected_next = if has_genesis {
+            tip.saturating_add(1)
+        } else {
+            0
+        };
+        let mut cum_hardening = match self.cumulative_hardening() {
+            Ok(value) => value,
+            Err(err) => {
+                result.stop_error = Some(err);
+                result.stop_height = blocks.first().map(|b| b.header.height);
+                return result;
+            }
+        };
+
+        for block in blocks {
+            match self.append_block_with_meta(block, &mut expected_next, &mut cum_hardening) {
+                Ok(AppendBlockOutcome::Applied) => {
+                    result.applied_count = result.applied_count.saturating_add(1);
+                    result.progressed_count = result.progressed_count.saturating_add(1);
+                    result.last_applied_height = Some(block.header.height);
+                    result.last_progress_height = Some(block.header.height);
+                }
+                Ok(AppendBlockOutcome::AlreadyExistsAdvanced) => {
+                    result.progressed_count = result.progressed_count.saturating_add(1);
+                    result.already_exists_count =
+                        result.already_exists_count.saturating_add(1);
+                    result.last_progress_height = Some(block.header.height);
+                }
+                Ok(AppendBlockOutcome::AlreadyExistsStale) => {
+                    result.already_exists_count =
+                        result.already_exists_count.saturating_add(1);
+                }
+                Ok(AppendBlockOutcome::OutOfOrder) => {
+                    result.skipped_out_of_order =
+                        result.skipped_out_of_order.saturating_add(1);
+                }
+                Err(err) => {
+                    result.stop_height = Some(block.header.height);
+                    result.stop_error = Some(err);
+                    break;
+                }
+            }
         }
-        self.store_decoy_bucket(height, &decoy_bucket).map_err(|e| format!("decoy-bucket: {e}"))?;
-        for ev in &block.slashes {
-            self.record_slash(ev.vote_a.voter)?;
+
+        if let Some(last_height) = result.last_progress_height {
+            if let Err(err) = self.persist_chain_meta(last_height, cum_hardening) {
+                result.stop_height = Some(last_height);
+                result.stop_error = Some(format!("persist-meta: {err}"));
+            }
         }
-        Ok(())
+
+        result
     }
 
     pub fn replace_from_genesis(&mut self, blocks: &[Block]) -> Result<(), String> {
@@ -158,31 +223,139 @@ impl Ledger {
         Ok(())
     }
 
-    pub fn get_block(&self, height: u64) -> Result<Option<Block>, String> {
+    pub fn clear_chain(&self) -> Result<(), String> {
+        self.db.clear().map_err(|e| format!("clear db: {e}"))?;
+        Ok(())
+    }
+
+    fn append_block_with_meta(
+        &self,
+        block: &Block,
+        expected_next: &mut u64,
+        cum_hardening: &mut u64,
+    ) -> Result<AppendBlockOutcome, String> {
+        let height = block.header.height;
+        if let Some(existing) = self.get_block(height)? {
+            let existing_hash = hash_header_for_link(&existing.header);
+            let incoming_hash = hash_header_for_link(&block.header);
+            if existing_hash == incoming_hash {
+                if height == *expected_next {
+                    *cum_hardening =
+                        cum_hardening.saturating_add(block.lattice_proof.difficulty_bits as u64);
+                    *expected_next = expected_next.saturating_add(1);
+                    return Ok(AppendBlockOutcome::AlreadyExistsAdvanced);
+                }
+                return Ok(AppendBlockOutcome::AlreadyExistsStale);
+            }
+            return Err(format!(
+                "conflicting block at height {} already committed",
+                height
+            ));
+        }
+        if height != *expected_next {
+            return Ok(AppendBlockOutcome::OutOfOrder);
+        }
+        self.verify_block_for_sync(block)
+            .map_err(|e| format!("verify: {e}"))?;
         let key = block_key(height);
-        match self.db.get(&key)? {
+        let bytes = bincode::encode_to_vec(block, bincode::config::standard())
+            .map_err(|e| format!("encode: {e}"))?;
+        if bytes.len() > MAX_BLOCK_BYTES {
+            return Err(format!(
+                "block serialized size {} exceeds max {} bytes",
+                bytes.len(),
+                MAX_BLOCK_BYTES
+            ));
+        }
+        self.db
+            .put(&key, &bytes)
+            .map_err(|e| format!("db-put-block: {e}"))?;
+        let mut decoy_bucket = Vec::new();
+        for tx in &block.txs {
+            self.apply_tx(tx, height, &mut decoy_bucket)
+                .map_err(|e| format!("apply-tx: {e}"))?;
+        }
+        self.store_decoy_bucket(height, &decoy_bucket)
+            .map_err(|e| format!("decoy-bucket: {e}"))?;
+        for ev in &block.slashes {
+            self.record_slash(ev.vote_a.voter)?;
+        }
+        *cum_hardening = cum_hardening.saturating_add(block.lattice_proof.difficulty_bits as u64);
+        *expected_next = expected_next.saturating_add(1);
+        Ok(AppendBlockOutcome::Applied)
+    }
+
+    fn cumulative_hardening(&self) -> Result<u64, String> {
+        match self
+            .db
+            .get(b"cum_hardening")
+            .map_err(|e| format!("db-get-cum: {e}"))?
+        {
+            Some(b) if b.len() == 8 => {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&b);
+                Ok(u64::from_le_bytes(arr))
+            }
+            _ => Ok(0),
+        }
+    }
+
+    fn persist_chain_meta(&self, height: u64, cum_hardening: u64) -> Result<(), String> {
+        self.db
+            .put(b"height", &height.to_le_bytes())
+            .map_err(|e| format!("db-put-height: {e}"))?;
+        self.db
+            .put(b"cum_hardening", &cum_hardening.to_le_bytes())
+            .map_err(|e| format!("db-put-cum: {e}"))?;
+        Ok(())
+    }
+
+    pub fn get_block(&self, height: u64) -> Result<Option<Block>, String> {
+        Ok(self.get_block_with_size(height)?.map(|(b, _)| b))
+    }
+
+    pub fn get_block_with_size(&self, height: u64) -> Result<Option<(Block, usize)>, String> {
+        let key = block_key(height);
+        let raw = match self.db.get(&key) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!(
+                    "[knox-ledger] get_block failed at h={}: {}",
+                    height, err
+                );
+                return Err(err);
+            }
+        };
+        match raw {
             Some(bytes) => {
-                let decoded: Result<(Block, usize), _> =
-                    bincode::decode_from_slice(
-                        &bytes,
-                        bincode::config::standard().with_limit::<{ MAX_BLOCK_BYTES }>(),
-                    );
+                let encoded_len = bytes.len();
+                let decoded: Result<(Block, usize), _> = bincode::decode_from_slice(
+                    &bytes,
+                    bincode::config::standard().with_limit::<{ MAX_BLOCK_BYTES }>(),
+                );
                 match decoded {
-                    Ok((b, _)) => Ok(Some(b)),
+                    Ok((b, _)) => Ok(Some((b, encoded_len))),
                     Err(err) => {
-                        eprintln!("[knox-ledger] CRITICAL db decode error for block {} ({} bytes): {:?}", height, bytes.len(), err);
-                        // Fallback: local DB data is trusted, so try unbounded decode if limit failed (e.g. huge genesis)
-                        let fallback: Result<(Block, usize), _> = bincode::decode_from_slice(
-                            &bytes,
-                            bincode::config::standard(),
+                        eprintln!(
+                            "[knox-ledger] CRITICAL db decode error for block {} ({} bytes): {:?}",
+                            height, encoded_len, err
                         );
+                        // Fallback: local DB data is trusted, so try unbounded decode if limit failed (e.g. huge genesis)
+                        let fallback: Result<(Block, usize), _> =
+                            bincode::decode_from_slice(&bytes, bincode::config::standard());
                         match fallback {
                             Ok((b, _)) => {
-                                eprintln!("[knox-ledger] RECOVERED block {} using unbounded decode", height);
-                                Ok(Some(b))
+                                eprintln!(
+                                    "[knox-ledger] RECOVERED block {} using unbounded decode",
+                                    height
+                                );
+                                Ok(Some((b, encoded_len)))
                             }
                             Err(e2) => {
-                                eprintln!("[knox-ledger] FATAL unbound decode failed for block {}: {:?}", height, e2);
+                                eprintln!(
+                                    "[knox-ledger] FATAL unbound decode failed for block {}: {:?}",
+                                    height, e2
+                                );
                                 Ok(None)
                             }
                         }
@@ -212,22 +385,38 @@ impl Ledger {
     }
 
     pub fn verify_block(&self, block: &Block) -> Result<(), String> {
-        self.verify_block_internal(block, true)
+        self.verify_block_internal(block, true, false)
     }
 
     pub fn verify_block_for_diamond_auth(&self, block: &Block) -> Result<(), String> {
-        self.verify_block_internal(block, false)
+        self.verify_block_internal(block, false, false)
+    }
+
+    pub fn verify_block_for_sync(&self, block: &Block) -> Result<(), String> {
+        self.verify_block_internal(block, true, true)
+    }
+
+    fn trust_fast_sync_blocks() -> bool {
+        matches!(
+            std::env::var("KNOX_TRUST_SYNC_BLOCKS")
+                .ok()
+                .as_deref()
+                .map(|v| v.trim()),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+        )
     }
 
     fn verify_block_internal(
         &self,
         block: &Block,
         enforce_diamond_auth: bool,
+        fast_sync: bool,
     ) -> Result<(), String> {
+        let trust_sync = fast_sync && Self::trust_fast_sync_blocks();
         if block.header.version != 1 {
             return Err("unsupported block version".to_string());
         }
-        if !self.validators.is_empty() {
+        if !fast_sync && !self.validators.is_empty() {
             let proposer_idx = self
                 .validators
                 .iter()
@@ -288,15 +477,19 @@ impl Ledger {
         if expected_state_root != block.header.state_root {
             return Err("state root mismatch".to_string());
         }
-        let now = now_ms();
-        if block.header.timestamp_ms > now.saturating_add(MAX_FUTURE_DRIFT_MS) {
-            return Err("block timestamp too far in future".to_string());
-        }
-        let mining_rules =
-            self.mining_rules_for_height(block.header.height, block.header.timestamp_ms)?;
-        if !mining_rules.allow_proposal {
-            return Err("surge cooldown active".to_string());
-        }
+        let mining_rules = if trust_sync {
+            None
+        } else {
+            let now = now_ms();
+            if block.header.timestamp_ms > now.saturating_add(MAX_FUTURE_DRIFT_MS) {
+                return Err("block timestamp too far in future".to_string());
+            }
+            let rules = self.mining_rules_for_height(block.header.height, block.header.timestamp_ms)?;
+            if !rules.allow_proposal {
+                return Err("surge cooldown active".to_string());
+            }
+            Some(rules)
+        };
         if block.header.height == 0 {
             if block.header.prev != Hash32::ZERO {
                 return Err("genesis prev must be zero".to_string());
@@ -309,13 +502,15 @@ impl Ledger {
             if block.header.timestamp_ms < prev.header.timestamp_ms {
                 return Err("block timestamp is earlier than parent".to_string());
             }
-            if block
-                .header
-                .timestamp_ms
-                .saturating_sub(prev.header.timestamp_ms)
-                < mining_rules.min_spacing_ms
-            {
-                return Err("block timestamp spacing below minimum".to_string());
+            if let Some(rules) = mining_rules.as_ref() {
+                if block
+                    .header
+                    .timestamp_ms
+                    .saturating_sub(prev.header.timestamp_ms)
+                    < rules.min_spacing_ms
+                {
+                    return Err("block timestamp spacing below minimum".to_string());
+                }
             }
             let expected_prev = header_link_hash(&prev.header);
             if block.header.prev != expected_prev {
@@ -323,16 +518,19 @@ impl Ledger {
             }
         }
         // Genesis block (height 0) is trusted by definition — skip PoW check.
-        if block.header.height > 0
-            && !verify_block_proof_with_difficulty(
+        if block.header.height > 0 && !trust_sync {
+            if let Some(reason) = explain_block_proof_failure_with_difficulty(
                 &block.header,
                 &block.lattice_proof,
-                mining_rules.expected_difficulty_bits,
-            )
-        {
-            return Err("lattice proof invalid".to_string());
+                mining_rules
+                    .as_ref()
+                    .map(|rules| rules.expected_difficulty_bits)
+                    .unwrap_or_else(|| difficulty_bits(block.header.height)),
+            ) {
+                return Err(format!("lattice proof invalid: {reason}"));
+            }
         }
-        if enforce_diamond_auth && !self.diamond_authenticators.is_empty() {
+        if !fast_sync && enforce_diamond_auth && !self.diamond_authenticators.is_empty() {
             verify_diamond_authenticator_cert(
                 block,
                 &self.diamond_authenticators,
@@ -353,13 +551,24 @@ impl Ledger {
                     return Err("duplicate key image in block".to_string());
                 }
             }
-            verify_non_coinbase(self, tx)?;
+            if !fast_sync {
+                verify_non_coinbase(self, tx)?;
+            }
         }
 
-        let fees: u64 = block.txs.iter().skip(1).map(|t| t.fee).sum();
-        let streak = proposer_streak_for_height(self, block.header.height, block.header.proposer, block.header.timestamp_ms)?;
-        verify_coinbase(coinbase, block.header.height, fees, streak)?;
-        verify_slashes(block, &self.validators)?;
+        if !trust_sync {
+            let fees: u64 = block.txs.iter().skip(1).map(|t| t.fee).sum();
+            let streak = proposer_streak_for_height(
+                self,
+                block.header.height,
+                block.header.proposer,
+                block.header.timestamp_ms,
+            )?;
+            verify_coinbase(coinbase, block.header.height, fees, streak)?;
+        }
+        if !fast_sync {
+            verify_slashes(block, &self.validators)?;
+        }
         let expected_slash_root = slash_root(&block.slashes);
         if expected_slash_root != block.header.slash_root {
             return Err("slash root mismatch".to_string());

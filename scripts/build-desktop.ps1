@@ -8,6 +8,29 @@ $embeddedGenesis = Join-Path $root "crates/knox-node/src/genesis.bin"
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 New-Item -ItemType Directory -Force -Path $certDir | Out-Null
 
+function Remove-StaleDesktopBinaries([string]$dir) {
+  if (!(Test-Path $dir)) { return }
+  Get-ChildItem $dir -File -ErrorAction SilentlyContinue |
+    Where-Object {
+      ($_.Name -like "knox-node*.exe" -and $_.Name -ne "knox-node.exe") -or
+      ($_.Name -like "knox-wallet*.exe" -and $_.Name -notin @("knox-wallet.exe", "knox-wallet-cli.exe"))
+    } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
+function Stop-DesktopWalletProcesses() {
+  Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -like "*knox-wallet-desktop*" } |
+    Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+function Copy-CanonicalDesktopBinaries([string]$srcDir, [string]$dstDir) {
+  New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+  Copy-Item -Force (Join-Path $srcDir "knox-node.exe") $dstDir
+  Copy-Item -Force (Join-Path $srcDir "knox-wallet.exe") $dstDir
+  Copy-Item -Force (Join-Path $srcDir "knox-wallet-cli.exe") $dstDir
+}
+
 $genesisCandidates = @()
 if ($env:KNOX_GENESIS_BIN) { $genesisCandidates += $env:KNOX_GENESIS_BIN }
 $genesisCandidates += (Join-Path $root "genesis.bin")
@@ -56,6 +79,7 @@ function Resolve-BuiltExe([string]$name) {
 Copy-Item -Force (Resolve-BuiltExe "knox-node.exe") $binDir
 Copy-Item -Force (Resolve-BuiltExe "knox-wallet.exe") $binDir
 Copy-Item -Force (Resolve-BuiltExe "knox-wallet-cli.exe") $binDir
+Remove-StaleDesktopBinaries $binDir
 
 $cert = Join-Path $certDir "walletd.crt"
 $key = Join-Path $certDir "walletd.key"
@@ -70,17 +94,30 @@ if (!(Test-Path $cert) -or !(Test-Path $key)) {
     -keyout $key -out $cert -subj "/CN=localhost"
 }
 
+# Copy to dist/win-unpacked (dev/unpacked build location).
+$distBin = Join-Path $root "apps/knox-wallet-desktop/dist/win-unpacked/resources/bin"
+if (Test-Path $distBin) {
+  try {
+    Remove-StaleDesktopBinaries $distBin
+    Copy-CanonicalDesktopBinaries $binDir $distBin
+    Write-Host "Desktop binaries copied to dist at $distBin"
+  } catch {
+    Write-Warning "dist binaries are in use; close KNOX WALLET first, then copy manually:"
+    Write-Warning "  copy $binDir\*.exe $distBin\"
+  }
+}
+
 # Also copy to the installed MSI location so the running app picks up changes.
 $installedBin = Join-Path $env:LOCALAPPDATA "Programs/knox-wallet-desktop/resources/bin"
 if (Test-Path $installedBin) {
   try {
-    Copy-Item -Force (Join-Path $binDir "knox-node.exe") $installedBin
-    Copy-Item -Force (Join-Path $binDir "knox-wallet.exe") $installedBin
-    Copy-Item -Force (Join-Path $binDir "knox-wallet-cli.exe") $installedBin
+    Stop-DesktopWalletProcesses
+    Remove-StaleDesktopBinaries $installedBin
+    Copy-CanonicalDesktopBinaries $binDir $installedBin
     Write-Host "Desktop binaries also copied to installed app at $installedBin"
   } catch {
-    Write-Warning "Installed app binaries are in use; skipped in-place copy to $installedBin"
-    Write-Warning "Close KNOX WALLET and rerun build, or install the fresh MSI via scripts/upgrade-knox.ps1"
+    Write-Warning "Installed app binaries are in use; close KNOX WALLET first, then copy manually:"
+    Write-Warning "  copy $binDir\*.exe $installedBin\"
   }
 }
 

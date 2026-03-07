@@ -10,7 +10,7 @@ use knox_lattice::{
 use knox_ledger::Ledger;
 use knox_p2p::{Message, Network, NetworkConfig, NetworkSender};
 use knox_types::{
-    hash_bytes, merkle_root, Address, Block, BlockHeader, Hash32, SlashEvidence, Transaction,
+    hash_bytes, merkle_root, Address, Block, BlockHeader, Hash32, LatticeProof, SlashEvidence, Transaction,
     WalletRequest, WalletResponse,
 };
 use std::collections::{HashMap, HashSet};
@@ -23,8 +23,8 @@ use tokio::time::{interval, Duration};
 const MAX_MEMPOOL_TX: usize = 50_000;
 // Diamond-auth requests include full block payloads; keep headroom for
 // larger blocks to avoid mid-write resets between peer nodes.
-const MAX_RPC_BYTES: usize = 16 * 1024 * 1024;
-const MAX_RPC_BLOCKS: u32 = 200;
+const MAX_RPC_BYTES: usize = 512 * 1024 * 1024;
+const MAX_RPC_BLOCKS: u32 = 512;
 const RATE_LIMIT_SUBMIT_PER_SEC: u32 = 10;
 const RATE_LIMIT_BLOCKS_PER_SEC: u32 = 5;
 const RATE_LIMIT_DECOYS_PER_SEC: u32 = 5;
@@ -34,13 +34,19 @@ const MAX_DECOY_CANDIDATES: usize = 200_000;
 const DECOY_CACHE_TTL_MS: u64 = 10_000;
 const DIAMOND_AUTH_RPC_TIMEOUT_MS: u64 = 10_000;
 const MAX_DIAMOND_AUTH_ENDPOINTS: usize = 32;
-const DEFAULT_SYNC_BLOCKS_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_SYNC_BLOCKS_RESPONSE_MAX_BYTES: usize = 128 * 1024 * 1024;
+const SYNC_GETBLOCKS_MAX_COUNT: u32 = 512;
+const DEFAULT_SYNC_RETRY_MS: u64 = 1_000;
+const DEFAULT_SYNC_STALL_MS: u64 = 4_000;
+const DEFAULT_UPSTREAM_SYNC_TIMEOUT_MS: u64 = 120_000;
+const MAX_UPSTREAM_SYNC_BATCH_LOOPS: usize = 8;
+const DEFAULT_UPSTREAM_SYNC_BATCH_COUNT: u32 = 64;
 
 fn sync_blocks_response_max_bytes() -> usize {
     std::env::var("KNOX_SYNC_BLOCKS_RESPONSE_MAX_BYTES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .map(|v| v.clamp(256 * 1024, 64 * 1024 * 1024))
+        .map(|v| v.clamp(256 * 1024, 128 * 1024 * 1024))
         .unwrap_or(DEFAULT_SYNC_BLOCKS_RESPONSE_MAX_BYTES)
 }
 
@@ -120,6 +126,15 @@ pub struct NodeConfig {
 struct MempoolEntry {
     tx: Transaction,
     received_ms: u64,
+}
+
+struct PendingMiningProposal {
+    header: BlockHeader,
+    txs: Vec<Transaction>,
+    slashes: Vec<SlashEvidence>,
+    proposer_sig: Vec<u8>,
+    result_rx:
+        tokio::sync::oneshot::Receiver<Result<(LatticeProof, String), String>>,
 }
 
 pub struct Node {
@@ -260,13 +275,50 @@ impl Node {
         let sync_retry_ms = std::env::var("KNOX_SYNC_RETRY_MS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(5_000)
+            .unwrap_or(DEFAULT_SYNC_RETRY_MS)
             .max(1_000);
         let sync_stall_ms = std::env::var("KNOX_SYNC_STALL_MS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(15_000)
+            .unwrap_or(DEFAULT_SYNC_STALL_MS)
             .max(sync_retry_ms);
+        let upstream_sync_timeout = Duration::from_millis(
+            std::env::var("KNOX_NODE_UPSTREAM_SYNC_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(DEFAULT_UPSTREAM_SYNC_TIMEOUT_MS)
+                .clamp(1_000, 300_000),
+        );
+        let upstream_sync_batch_count = std::env::var("KNOX_NODE_UPSTREAM_SYNC_BATCH_COUNT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(DEFAULT_UPSTREAM_SYNC_BATCH_COUNT)
+            .clamp(1, MAX_RPC_BLOCKS);
+        let mut current_upstream_sync_batch_count = upstream_sync_batch_count;
+        let upstream_sync_rpc = std::env::var("KNOX_NODE_UPSTREAM_RPC")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        eprintln!(
+            "[knox-node] upstream sync config batch={} timeout_ms={} rpc={}",
+            upstream_sync_batch_count,
+            upstream_sync_timeout.as_millis(),
+            upstream_sync_rpc.as_deref().unwrap_or("<disabled>")
+        );
+        let sync_auto_reset_on_conflict = !matches!(
+            std::env::var("KNOX_SYNC_AUTO_RESET_ON_CONFLICT")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("0" | "false" | "no")
+        );
+        let no_mine_node = matches!(
+            std::env::var("KNOX_NODE_NO_MINE")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("1" | "true" | "yes")
+        );
         let mut last_sync_request_ms = 0u64;
         let mut last_sync_progress_ms = now_ms();
         let mut last_sync_progress_height = ledger
@@ -277,6 +329,9 @@ impl Node {
         let mut bootstrap_genesis_stall_count: u32 = 0;
         let mut last_blocks_response_ms = now_ms();
         let mut genesis_mismatch_hits: u32 = 0;
+        let mut sync_conflict_hits: u32 = 0;
+        let mut sync_conflict_height: u64 = 0;
+        let mut pending_mining: Option<PendingMiningProposal> = None;
 
         // If ledger is empty (no genesis yet), proactively request from h=0
         // after peers have had time to connect.
@@ -289,12 +344,86 @@ impl Node {
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     eprintln!("[knox-node] ledger empty at boot — requesting sync from h=0");
-                    sync_sender.send(knox_p2p::Message::GetBlocks { from_height: 0, max_count: 200 }).await;
+                    sync_sender
+                        .send(knox_p2p::Message::GetBlocks {
+                            from_height: 0,
+                            max_count: SYNC_GETBLOCKS_MAX_COUNT,
+                        })
+                        .await;
                 });
             }
         }
 
         loop {
+            if let Some(pending) = pending_mining.as_mut() {
+                match pending.result_rx.try_recv() {
+                    Ok(result) => {
+                        let pending_ready = pending_mining
+                            .take()
+                            .expect("pending mining must exist when result arrives");
+                        let PendingMiningProposal {
+                            header,
+                            txs,
+                            slashes,
+                            proposer_sig,
+                            result_rx: _,
+                        } = pending_ready;
+                        let (lattice_proof, backend_line) = match result {
+                            Ok(v) => v,
+                            Err(err) => {
+                                eprintln!("[knox-node] mining_runtime_error {}", err);
+                                tokio::time::sleep(Duration::from_millis(1200)).await;
+                                continue;
+                            }
+                        };
+                        if backend_line != last_backend_line {
+                            eprintln!("[knox-node] mining_runtime {}", backend_line);
+                            last_backend_line = backend_line;
+                        }
+                        let mut block = Block {
+                            header,
+                            txs,
+                            slashes,
+                            proposer_sig,
+                            lattice_proof,
+                        };
+                        if !diamond_authenticators.is_empty() {
+                            match build_diamond_auth_bundle(
+                                &block,
+                                &diamond_authenticators,
+                                diamond_auth_quorum,
+                                &diamond_auth_endpoints,
+                            )
+                            .await
+                            {
+                                Ok(bundle) => {
+                                    block.proposer_sig = bundle;
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "[knox-node] diamond auth quorum unmet h={}: {}",
+                                        block.header.height, err
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        if append_finalized_block(&block, &ledger, &mempool) {
+                            if block.header.height > last_sync_progress_height {
+                                last_sync_progress_height = block.header.height;
+                                last_sync_progress_ms = now_ms();
+                            }
+                            network.send(Message::Block(block)).await;
+                        }
+                        continue;
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        pending_mining = None;
+                        eprintln!("[knox-node] mining worker closed before delivering proof");
+                    }
+                }
+            }
             tokio::select! {
                 Some(env) = network.inbound.recv() => {
                     match env.msg {
@@ -347,12 +476,6 @@ impl Node {
                                         block.header.height, block.header.round, err
                                     );
                                     if err.contains("missing parent") || err.contains("prev hash mismatch") {
-                                        // Seal guard: if we detect a parent mismatch, pause local mining
-                                        // and aggressively request a range that includes the candidate parent.
-                                        let guard_until = now_ms().saturating_add(fork_guard_pause_ms);
-                                        if guard_until > fork_guard_pause_until_ms {
-                                            fork_guard_pause_until_ms = guard_until;
-                                        }
                                         let (our_tip, has_genesis) = match ledger.lock() {
                                             Ok(l) => (
                                                 l.height().unwrap_or(0),
@@ -361,35 +484,51 @@ impl Node {
                                             Err(_) => (0, false),
                                         };
                                         let from = if has_genesis {
-                                            // Pull slightly before tip to recover from short forks.
-                                            std::cmp::max(1, our_tip.saturating_sub(2))
+                                            our_tip.saturating_add(1)
                                         } else {
                                             0
                                         };
-                                        eprintln!(
-                                            "[knox-node] fork guard active ({} ms) — requesting sync from h={}",
-                                            fork_guard_pause_ms, from
-                                        );
-                                        network.send(Message::GetBlocks { from_height: from, max_count: 200 }).await;
+                                        // Only arm fork-guard for near-tip conflicts. Far-ahead proposals from
+                                        // peers should not pause local mining or force replay-from-tip-2 loops.
+                                        let height_gap = block.header.height.saturating_sub(our_tip);
+                                        if height_gap <= 8 {
+                                            let guard_until = now_ms().saturating_add(fork_guard_pause_ms);
+                                            if guard_until > fork_guard_pause_until_ms {
+                                                fork_guard_pause_until_ms = guard_until;
+                                            }
+                                            eprintln!(
+                                                "[knox-node] fork guard active ({} ms) — requesting sync from h={}",
+                                                fork_guard_pause_ms, from
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "[knox-node] ignoring far-ahead proposal h={} (local_tip={}, gap={}) — requesting forward sync from h={}",
+                                                block.header.height, our_tip, height_gap, from
+                                            );
+                                        }
+                                        network
+                                            .send(Message::GetBlocks {
+                                                from_height: from,
+                                                max_count: SYNC_GETBLOCKS_MAX_COUNT,
+                                            })
+                                            .await;
                                     }
                                 }
                             }
                         }
                         Message::GetBlocks { from_height, max_count } => {
+                            // Serve one batch per request. This preserves requester-to-response
+                            // routing under concurrent peers and avoids cross-delivering
+                            // streamed ranges to the wrong node.
+                            let per_batch_cap =
+                                (max_count as u64).clamp(1, SYNC_GETBLOCKS_MAX_COUNT as u64);
+                            let max_bytes = sync_blocks_response_max_bytes();
                             let blocks = if let Ok(l) = ledger.lock() {
                                 let mut out = Vec::new();
-                                let max_bytes = sync_blocks_response_max_bytes();
                                 let mut used_bytes = 0usize;
-                                let cap = (max_count as u64).min(200);
-                                for h in from_height..from_height.saturating_add(cap) {
-                                    match l.get_block(h) {
-                                        Ok(Some(b)) => {
-                                            let block_bytes = bincode::encode_to_vec(
-                                                &b,
-                                                bincode::config::standard(),
-                                            )
-                                            .map(|v| v.len())
-                                            .unwrap_or(0);
+                                for h in from_height..from_height.saturating_add(per_batch_cap) {
+                                    match l.get_block_with_size(h) {
+                                        Ok(Some((b, block_bytes))) => {
                                             let next_bytes = used_bytes.saturating_add(block_bytes);
                                             if !out.is_empty() && next_bytes > max_bytes {
                                                 break;
@@ -404,67 +543,183 @@ impl Node {
                                     }
                                 }
                                 out
-                            } else { Vec::new() };
+                            } else {
+                                Vec::new()
+                            };
                             if !blocks.is_empty() {
-                                eprintln!("[knox-node] serving {} blocks from h={}", blocks.len(), from_height);
+                                eprintln!(
+                                    "[knox-node] serving {} blocks from h={}",
+                                    blocks.len(),
+                                    from_height
+                                );
                                 network.send(Message::Blocks(blocks)).await;
                             }
                         }
                         Message::Blocks(blocks) => {
                             if !blocks.is_empty() {
                                 last_blocks_response_ms = now_ms();
+                                let first_h = blocks.first().map(|b| b.header.height).unwrap_or(0);
+                                let last_h = blocks.last().map(|b| b.header.height).unwrap_or(0);
+                                eprintln!(
+                                    "[knox-node] sync batch received count={} range={}..{}",
+                                    blocks.len(),
+                                    first_h,
+                                    last_h
+                                );
                             }
-                            let mut last_applied: Option<u64> = None;
-                            for block in &blocks {
-                                if let Ok(l) = ledger.lock() {
-                                    match l.append_block(block) {
+                            let batch_result = match ledger.lock() {
+                                Ok(l) => l.append_sync_batch(&blocks),
+                                Err(_) => {
+                                    eprintln!("[knox-node] sync stop: ledger lock poisoned");
+                                    continue;
+                                }
+                            };
+                            let applied_count = batch_result.applied_count;
+                            let progressed_count = batch_result.progressed_count;
+                            let skipped_out_of_order = batch_result.skipped_out_of_order;
+                            let already_exists_count = batch_result.already_exists_count;
+                            if let Some(last_height) = batch_result.last_progress_height {
+                                eprintln!(
+                                    "[knox-node] sync progressed {} block(s) (new={} existing={}) through h={}",
+                                    progressed_count,
+                                    applied_count,
+                                    already_exists_count,
+                                    last_height
+                                );
+                                if last_height > last_sync_progress_height {
+                                    last_sync_progress_height = last_height;
+                                    last_sync_progress_ms = now_ms();
+                                }
+                                genesis_mismatch_hits = 0;
+                            }
+                            if let (Some(stop_height), Some(e)) =
+                                (batch_result.stop_height, batch_result.stop_error.as_deref())
+                            {
+                                let lower_err = e.to_ascii_lowercase();
+                                let conflict_like = e.contains("conflicting block at height")
+                                    || lower_err.contains("prev hash mismatch")
+                                    || lower_err.contains("missing parent")
+                                    || lower_err.contains("timestamp is earlier than parent");
+                                if conflict_like {
+                                    if sync_conflict_height == stop_height {
+                                        sync_conflict_hits =
+                                            sync_conflict_hits.saturating_add(1);
+                                    } else {
+                                        sync_conflict_height = stop_height;
+                                        sync_conflict_hits = 1;
+                                    }
+                                    eprintln!(
+                                        "[knox-node] sync conflict h={} hit={}",
+                                        stop_height, sync_conflict_hits
+                                    );
+                                }
+                                eprintln!("[knox-node] sync stop h={}: {}", stop_height, e);
+                                let low_height = stop_height <= 1;
+                                let likely_mismatch = e.contains("prev hash mismatch")
+                                    || e.contains("missing parent")
+                                    || e.to_lowercase().contains("genesis");
+                                if low_height && likely_mismatch {
+                                    genesis_mismatch_hits =
+                                        genesis_mismatch_hits.saturating_add(1);
+                                    if genesis_mismatch_hits >= 3 {
+                                        eprintln!(
+                                            "[knox-node] sync blocked at low height; likely genesis mismatch between local embedded genesis and peer network"
+                                        );
+                                    }
+                                }
+                            }
+                            if !blocks.is_empty() && progressed_count == 0 {
+                                let first_h = blocks.first().map(|b| b.header.height).unwrap_or(0);
+                                let last_h = blocks.last().map(|b| b.header.height).unwrap_or(0);
+                                eprintln!(
+                                    "[knox-node] sync batch made no progress range={}..{} already_exists={} skipped_out_of_order={}",
+                                    first_h,
+                                    last_h,
+                                    already_exists_count,
+                                    skipped_out_of_order
+                                );
+                                let local_tip = match ledger.lock() {
+                                    Ok(l) => l.height().unwrap_or(0),
+                                    Err(_) => 0,
+                                };
+                                if last_h <= local_tip {
+                                    // If the entire batch is already behind local tip, immediately
+                                    // ask forward again instead of waiting for the stall ticker.
+                                    let from = local_tip.saturating_add(1);
+                                    eprintln!(
+                                        "[knox-node] sync stale batch behind tip (local_tip={}) — requesting sync from h={}",
+                                        local_tip, from
+                                    );
+                                    network
+                                        .send(Message::GetBlocks {
+                                            from_height: from,
+                                            max_count: SYNC_GETBLOCKS_MAX_COUNT,
+                                        })
+                                        .await;
+                                    last_sync_request_ms = now_ms();
+                                }
+                                let allow_mining_node_reset = min_local_height_for_mining > 0
+                                    && local_tip.saturating_add(1) < min_local_height_for_mining;
+                                let allow_sync_reset = no_mine_node || allow_mining_node_reset;
+                                if sync_auto_reset_on_conflict
+                                    && allow_sync_reset
+                                    && sync_conflict_hits >= 3
+                                {
+                                    eprintln!(
+                                        "[knox-node] sync conflict persists at h={} (hits={}); clearing local ledger for full resync",
+                                        sync_conflict_height, sync_conflict_hits
+                                    );
+                                    let cleared = match ledger.lock() {
+                                        Ok(l) => l.clear_chain(),
+                                        Err(_) => Err("ledger lock poisoned".to_string()),
+                                    };
+                                    match cleared {
                                         Ok(()) => {
-                                            eprintln!("[knox-node] sync h={}", block.header.height);
-                                            if block.header.height > last_sync_progress_height {
-                                                last_sync_progress_height = block.header.height;
-                                                last_sync_progress_ms = now_ms();
-                                            }
-                                            last_applied = Some(block.header.height);
+                                            last_sync_progress_height = 0;
+                                            last_sync_progress_ms = now_ms();
+                                            last_blocks_response_ms = now_ms();
+                                            bootstrap_genesis_stall_count = 0;
                                             genesis_mismatch_hits = 0;
+                                            sync_conflict_hits = 0;
+                                            sync_conflict_height = 0;
+                                            network
+                                                .send(Message::GetBlocks {
+                                                    from_height: 0,
+                                                    max_count: SYNC_GETBLOCKS_MAX_COUNT,
+                                                })
+                                                .await;
+                                            last_sync_request_ms = now_ms();
                                         }
-                                        Err(e) if e.contains("already exists") => {}
-                                        Err(e) => {
-                                            if e.contains("unexpected block height") {
-                                                // `Blocks` responses are gossiped to all peers, so we can receive
-                                                // out-of-window batches intended for someone else (e.g. h=59 while
-                                                // we're still expecting h=1). Skip these and keep waiting for our
-                                                // requested range instead of poisoning bootstrap progress.
-                                                let local_tip = ledger
-                                                    .lock()
-                                                    .ok()
-                                                    .and_then(|l| l.height().ok())
-                                                    .unwrap_or(0);
-                                                eprintln!(
-                                                    "[knox-node] sync skip h={} (local_tip={}, reason=out-of-order batch)",
-                                                    block.header.height, local_tip
-                                                );
-                                                continue;
-                                            }
-                                            eprintln!("[knox-node] sync stop h={}: {}", block.header.height, e);
-                                            let low_height = block.header.height <= 1;
-                                            let likely_mismatch =
-                                                e.contains("prev hash mismatch")
-                                                    || e.contains("missing parent")
-                                                    || e.to_lowercase().contains("genesis");
-                                            if low_height && likely_mismatch {
-                                                genesis_mismatch_hits = genesis_mismatch_hits.saturating_add(1);
-                                                if genesis_mismatch_hits >= 3 {
-                                                    eprintln!(
-                                                        "[knox-node] sync blocked at low height; likely genesis mismatch between local embedded genesis and peer network"
-                                                    );
-                                                }
-                                            }
-                                            break;
+                                        Err(err) => {
+                                            eprintln!(
+                                                "[knox-node] sync auto-reset failed: {}",
+                                                err
+                                            );
                                         }
                                     }
                                 }
                             }
-                            let _ = last_applied;
+                            if progressed_count > 0 {
+                                sync_conflict_hits = 0;
+                                sync_conflict_height = 0;
+                                // Keep draining forward without waiting for the stall timer.
+                                let next_from = match ledger.lock() {
+                                    Ok(l) => l.height().unwrap_or(0).saturating_add(1),
+                                    Err(_) => 0,
+                                };
+                                eprintln!(
+                                    "[knox-node] sync continue from h={} after progressing {} block(s)",
+                                    next_from,
+                                    progressed_count
+                                );
+                                network
+                                    .send(Message::GetBlocks {
+                                        from_height: next_from,
+                                        max_count: SYNC_GETBLOCKS_MAX_COUNT,
+                                    })
+                                    .await;
+                                last_sync_request_ms = now_ms();
+                            }
                         }
                         Message::Vote(_) => {}
                         Message::TimeoutVote(_) => {}
@@ -483,6 +738,174 @@ impl Node {
                 _ = ticker.tick() => {
                     let now = now_ms();
                     let active_peers = network.active_peer_count();
+                    if let Some(upstream_rpc) = upstream_sync_rpc.as_deref() {
+                        let local_tip = match ledger.lock() {
+                            Ok(l) => l.height().unwrap_or(0),
+                            Err(_) => 0,
+                        };
+                        let must_catch_up = min_local_height_for_mining > 0
+                            && local_tip < min_local_height_for_mining;
+                        let stalled_rpc = now.saturating_sub(last_sync_progress_ms) >= sync_retry_ms;
+                        if must_catch_up && stalled_rpc {
+                            let mut batch_loops = 0usize;
+                            let mut next_from = local_tip.saturating_add(1);
+                            while batch_loops < MAX_UPSTREAM_SYNC_BATCH_LOOPS {
+                                batch_loops = batch_loops.saturating_add(1);
+                                last_sync_request_ms = now_ms();
+                                let rpc_limit =
+                                    current_upstream_sync_batch_count.min(MAX_RPC_BLOCKS).max(1);
+                                match rpc_get_blocks_with_timeout(
+                                    upstream_rpc,
+                                    next_from,
+                                    rpc_limit,
+                                    upstream_sync_timeout,
+                                )
+                                .await
+                                {
+                                    Ok(blocks) => {
+                                        if blocks.is_empty() {
+                                            break;
+                                        }
+                                        let first_h =
+                                            blocks.first().map(|b| b.header.height).unwrap_or(0);
+                                        let last_h =
+                                            blocks.last().map(|b| b.header.height).unwrap_or(0);
+                                        eprintln!(
+                                            "[knox-node] upstream sync batch received count={} range={}..{}",
+                                            blocks.len(),
+                                            first_h,
+                                            last_h
+                                        );
+                                        let batch_result = match ledger.lock() {
+                                            Ok(l) => l.append_sync_batch(&blocks),
+                                            Err(_) => {
+                                                eprintln!(
+                                                    "[knox-node] upstream sync stop: ledger lock poisoned"
+                                                );
+                                                break;
+                                            }
+                                        };
+                                        let applied_count = batch_result.applied_count;
+                                        let progressed_count = batch_result.progressed_count;
+                                        if let Some(last_height) =
+                                            batch_result.last_progress_height
+                                        {
+                                            eprintln!(
+                                                "[knox-node] upstream sync progressed {} block(s) (new={} existing={}) through h={}",
+                                                progressed_count,
+                                                applied_count,
+                                                batch_result.already_exists_count,
+                                                last_height
+                                            );
+                                            if last_height > last_sync_progress_height {
+                                                last_sync_progress_height = last_height;
+                                                last_sync_progress_ms = now_ms();
+                                            }
+                                            genesis_mismatch_hits = 0;
+                                        }
+                                        if batch_result.skipped_out_of_order > 0 {
+                                            let local_tip = match ledger.lock() {
+                                                Ok(l) => l.height().unwrap_or(0),
+                                                Err(_) => 0,
+                                            };
+                                            eprintln!(
+                                                "[knox-node] upstream sync skipped {} out-of-order block(s) at local_tip={}",
+                                                batch_result.skipped_out_of_order,
+                                                local_tip
+                                            );
+                                        }
+                                        if let (Some(stop_height), Some(e)) = (
+                                            batch_result.stop_height,
+                                            batch_result.stop_error.as_deref(),
+                                        ) {
+                                            let lower_err = e.to_ascii_lowercase();
+                                            if e.contains("conflicting block at height")
+                                                || lower_err.contains("prev hash mismatch")
+                                                || lower_err.contains("missing parent")
+                                                || lower_err.contains("timestamp is earlier than parent")
+                                            {
+                                                if sync_conflict_height == stop_height {
+                                                    sync_conflict_hits =
+                                                        sync_conflict_hits.saturating_add(1);
+                                                } else {
+                                                    sync_conflict_height = stop_height;
+                                                    sync_conflict_hits = 1;
+                                                }
+                                                eprintln!(
+                                                    "[knox-node] sync conflict h={} hit={}",
+                                                    stop_height,
+                                                    sync_conflict_hits
+                                                );
+                                            }
+                                            eprintln!(
+                                                "[knox-node] upstream sync stop h={}: {}",
+                                                stop_height,
+                                                e
+                                            );
+                                        }
+                                        if progressed_count == 0 {
+                                            break;
+                                        }
+                                        sync_conflict_hits = 0;
+                                        sync_conflict_height = 0;
+                                        if applied_count as u32 >= rpc_limit
+                                            && current_upstream_sync_batch_count
+                                                < upstream_sync_batch_count
+                                        {
+                                            current_upstream_sync_batch_count =
+                                                (current_upstream_sync_batch_count.saturating_mul(2))
+                                                    .min(upstream_sync_batch_count)
+                                                    .max(1);
+                                            eprintln!(
+                                                "[knox-node] upstream sync batch size increased to {}",
+                                                current_upstream_sync_batch_count
+                                            );
+                                        }
+                                        next_from = match ledger.lock() {
+                                            Ok(l) => l.height().unwrap_or(0).saturating_add(1),
+                                            Err(_) => 0,
+                                        };
+                                        if progressed_count < blocks.len() {
+                                            break;
+                                        }
+                                        if next_from > min_local_height_for_mining
+                                            && min_local_height_for_mining > 0
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let lower_err = err.to_ascii_lowercase();
+                                        let mut should_retry_smaller_batch = false;
+                                        if (lower_err.contains("response too large")
+                                            || lower_err.contains("read len timeout")
+                                            || lower_err.contains("read body timeout"))
+                                            && current_upstream_sync_batch_count > 1
+                                        {
+                                            let next_batch =
+                                                (current_upstream_sync_batch_count / 2).max(1);
+                                            if next_batch != current_upstream_sync_batch_count {
+                                                current_upstream_sync_batch_count = next_batch;
+                                                should_retry_smaller_batch = true;
+                                                eprintln!(
+                                                    "[knox-node] upstream sync batch size reduced to {} after error: {}",
+                                                    current_upstream_sync_batch_count, err
+                                                );
+                                            }
+                                        }
+                                        eprintln!(
+                                            "[knox-node] upstream sync request from h={} failed (batch={}): {}",
+                                            next_from, rpc_limit, err
+                                        );
+                                        if should_retry_smaller_batch {
+                                            continue;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if active_peers > 0 && now.saturating_sub(last_sync_request_ms) >= sync_retry_ms {
                         let (tip, has_genesis) = match ledger.lock() {
                             Ok(l) => (
@@ -507,7 +930,10 @@ impl Node {
                                 // fall back to h=0 so peers can resend genesis + first blocks.
                                 if bootstrap_genesis_stall_count >= 3 { 0 } else { 1 }
                             } else {
-                                std::cmp::max(1, tip.saturating_sub(2))
+                                // When stalled above genesis, request from tip+1 (forward progress lane).
+                                // Requesting tip-2 can loop forever when peers chunk responses by byte-size,
+                                // repeatedly returning already-known low-height blocks.
+                                tip.saturating_add(1)
                             };
                             let reason = if !has_genesis {
                                 "bootstrap-no-genesis"
@@ -527,18 +953,21 @@ impl Node {
                             network
                                 .send(Message::GetBlocks {
                                     from_height: from,
-                                    max_count: 200,
+                                    max_count: SYNC_GETBLOCKS_MAX_COUNT,
                                 })
                                 .await;
                             if dual_probe {
+                                // Probe the opposite bootstrap lane to avoid deadlock when peers
+                                // have tip blocks but not an explicit h=0 genesis entry (or vice versa).
+                                let probe_from = if from == 0 { 1 } else { 0 };
                                 eprintln!(
-                                    "[knox-node] sync probe from h=0 (tip=0, peers={}, reason=bootstrap-dual-probe)",
-                                    active_peers
+                                    "[knox-node] sync probe from h={} (tip=0, peers={}, reason=bootstrap-dual-probe)",
+                                    probe_from, active_peers
                                 );
                                 network
                                     .send(Message::GetBlocks {
-                                        from_height: 0,
-                                        max_count: 200,
+                                        from_height: probe_from,
+                                        max_count: SYNC_GETBLOCKS_MAX_COUNT,
                                     })
                                     .await;
                             }
@@ -620,6 +1049,11 @@ impl Node {
                         } else {
                             knox_types::TARGET_BLOCK_TIME_MS
                         };
+                        if pending_mining.is_some() {
+                            // A proof is already being generated; keep the loop responsive
+                            // for inbound sync traffic until that proposal resolves.
+                            continue;
+                        }
                         if now.saturating_sub(last_propose_ms) < propose_interval_ms {
                             continue;
                         }
@@ -684,55 +1118,27 @@ impl Node {
                         let mut worker_id_bytes = [0u8; 8];
                         worker_id_bytes.copy_from_slice(&proposer_id[..8]);
                         let worker_id = u64::from_le_bytes(worker_id_bytes);
-                        let (lattice_proof, backend_status) = match mine_block_proof_with_profile(
-                            &header,
-                            worker_id,
-                            mining_rules.expected_difficulty_bits,
-                            &mining_profile,
-                        ) {
-                            Ok(v) => v,
-                            Err(err) => {
-                                eprintln!("[knox-node] mining_runtime_error {}", err);
-                                tokio::time::sleep(Duration::from_millis(1200)).await;
-                                continue;
-                            }
-                        };
-                        let backend_line = backend_status.to_log_line();
-                        if backend_line != last_backend_line {
-                            eprintln!("[knox-node] mining_runtime {}", backend_line);
-                            last_backend_line = backend_line;
-                        }
-                        let mut block = Block {
+                        let profile_for_mine = mining_profile.clone();
+                        let header_for_mine = header.clone();
+                        let expected_difficulty_bits = mining_rules.expected_difficulty_bits;
+                        let (proof_tx, proof_rx) = tokio::sync::oneshot::channel();
+                        tokio::task::spawn_blocking(move || {
+                            let result = mine_block_proof_with_profile(
+                                &header_for_mine,
+                                worker_id,
+                                expected_difficulty_bits,
+                                &profile_for_mine,
+                            )
+                            .map(|(proof, status)| (proof, status.to_log_line()));
+                            let _ = proof_tx.send(result);
+                        });
+                        pending_mining = Some(PendingMiningProposal {
                             header,
                             txs,
                             slashes,
                             proposer_sig: sig,
-                            lattice_proof,
-                        };
-                        if !diamond_authenticators.is_empty() {
-                            match build_diamond_auth_bundle(
-                                &block,
-                                &diamond_authenticators,
-                                diamond_auth_quorum,
-                                &diamond_auth_endpoints,
-                            )
-                            .await
-                            {
-                                Ok(bundle) => {
-                                    block.proposer_sig = bundle;
-                                }
-                                Err(err) => {
-                                    eprintln!(
-                                        "[knox-node] diamond auth quorum unmet h={}: {}",
-                                        block.header.height, err
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                        if append_finalized_block(&block, &ledger, &mempool) {
-                            network.send(Message::Block(block)).await;
-                        }
+                            result_rx: proof_rx,
+                        });
                     }
                 }
             }
@@ -845,7 +1251,10 @@ async fn rpc_request_with_timeout(
         .map_err(|e| format!("read len {addr} failed: {e}"))?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len == 0 || len > MAX_RPC_BYTES {
-        return Err("rpc response too large".to_string());
+        return Err(format!(
+            "node upstream rpc response too large ({} bytes > {} byte cap)",
+            len, MAX_RPC_BYTES
+        ));
     }
     let mut buf = vec![0u8; len];
     tokio::time::timeout(timeout_dur, stream.read_exact(&mut buf))
@@ -853,9 +1262,25 @@ async fn rpc_request_with_timeout(
         .map_err(|_| format!("read body timeout: {addr}"))?
         .map_err(|e| format!("read body {addr} failed: {e}"))?;
     let (resp, _): (WalletResponse, usize) =
-        bincode::decode_from_slice(&buf, bincode::config::standard().with_limit::<16777216>())
+        bincode::decode_from_slice(
+            &buf,
+            bincode::config::standard().with_limit::<{ 512 * 1024 * 1024 }>(),
+        )
             .map_err(|e| format!("decode response failed: {e}"))?;
     Ok(resp)
+}
+
+async fn rpc_get_blocks_with_timeout(
+    addr: &str,
+    start: u64,
+    limit: u32,
+    timeout_dur: Duration,
+) -> Result<Vec<Block>, String> {
+    match rpc_request_with_timeout(addr, WalletRequest::GetBlocks(start, limit), timeout_dur).await?
+    {
+        WalletResponse::Blocks(blocks) => Ok(blocks),
+        _ => Err("unexpected get-blocks response".to_string()),
+    }
 }
 
 fn append_finalized_block(

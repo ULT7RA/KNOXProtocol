@@ -2,18 +2,19 @@ use argon2::Argon2;
 use blake3::Hasher;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use knox_crypto::{
-    derive_one_time_pub, hash_to_scalar, os_random_bytes, pedersen_commit, prove_range,
-    public_from_secret as curve_public_from_secret, PublicKey, SecretKey,
-};
+use getrandom::getrandom;
 use knox_lattice::ring_sig::public_from_secret as lattice_public_from_secret;
 use knox_lattice::{
-    build_private_output, commit_value as lattice_commit_value, decrypt_amount_with_level,
-    derive_key_image_id, encode_lattice_tx_extra, encrypt_amount_with_level,
+    build_private_output, commit_value as lattice_commit_value, decode_coinbase_payload,
+    decode_lattice_tx_extra,
+    decrypt_amount_with_level, derive_key_image_id, encode_lattice_tx_extra,
     fee_commitment as lattice_fee_commitment, key_image as lattice_key_image,
-    sign_ring as lattice_sign_ring, tx_hardening_level, LatticeCommitment, LatticeCommitmentKey,
-    LatticeInput, LatticePublicKey, LatticeSecretKey, LatticeTransaction, Poly,
+    recover_one_time_secret as lattice_recover_one_time_secret, sign_ring as lattice_sign_ring,
+    tx_hardening_level, LatticeCommitment, LatticeCommitmentKey, LatticeInput, LatticeOutput,
+    LatticeOutputOpening, LatticePublicKey, LatticeRangeProof, LatticeSecretKey,
+    LatticeStealthOutput, LatticeTransaction, Poly, scan_with_view_key,
 };
+use knox_lattice::stealth::send_to_stealth_with_ephemeral;
 use knox_types::{
     hash_bytes as hash_tx_bytes, Address, Hash32, OutputRef, RingMember, Transaction, TxIn, TxOut,
     MAX_DECOY_COUNT, MIN_DECOY_COUNT,
@@ -38,6 +39,7 @@ pub struct Note {
     pub one_time_pub: [u8; 32],
     pub tx_pub: [u8; 32],
     pub lattice_spend_pub: Vec<u8>,
+    pub lattice_one_time_secret: Vec<u8>,
     pub one_time_secret: [u8; 32],
     pub commitment: [u8; 32],
     pub amount: u64,
@@ -124,15 +126,22 @@ impl zeroize::Zeroize for Note {
         self.one_time_pub.zeroize();
         self.tx_pub.zeroize();
         self.lattice_spend_pub.zeroize();
+        self.lattice_one_time_secret.zeroize();
         self.amount = 0;
         self.subaddress_index = 0;
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SecretKey([u8; 32]);
+
+#[derive(Clone, Copy, Debug)]
+struct PublicKey([u8; 32]);
+
 impl WalletState {
     pub fn address(&self) -> Address {
         self.address_at(0).unwrap_or_else(|| {
-            let lattice_pub = lattice_base_public_from_curve_spend_secret(&self.spend_secret);
+            let lattice_pub = lattice_base_public_from_seed(&self.spend_secret);
             Address {
                 view: self.view_public,
                 spend: self.spend_public,
@@ -143,7 +152,7 @@ impl WalletState {
 
     pub fn address_at(&self, index: u32) -> Option<Address> {
         let (sk, pk) = subaddress_keys(self, index).ok()?;
-        let lattice_pub = lattice_base_public_from_curve_spend_secret(&sk.0);
+        let lattice_pub = lattice_base_public_from_seed(&sk.0);
         Some(Address {
             view: self.view_public,
             spend: pk.0,
@@ -166,17 +175,20 @@ fn recompute_note_key_images(state: &mut WalletState) {
         };
         note.key_image = derive_key_image_id(&lattice_key_image(&secret, &public));
         note.lattice_spend_pub = public.p.to_bytes();
+        note.lattice_one_time_secret = secret.s.to_bytes();
     }
 }
 
 pub fn create_wallet(path: &str) -> Result<WalletState, String> {
-    let (view_sk, view_pk) = knox_crypto::generate_keypair()?;
-    let (spend_sk, spend_pk) = knox_crypto::generate_keypair()?;
+    let view_sk = random_secret_bytes()?;
+    let spend_sk = random_secret_bytes()?;
+    let view_pk = derive_public_tag(b"knox-wallet-view-pub-v2", &view_sk);
+    let spend_pk = derive_public_tag(b"knox-wallet-spend-pub-v2", &spend_sk);
     let state = WalletState {
-        view_secret: view_sk.0,
-        spend_secret: spend_sk.0,
-        view_public: view_pk.0,
-        spend_public: spend_pk.0,
+        view_secret: view_sk,
+        spend_secret: spend_sk,
+        view_public: view_pk,
+        spend_public: spend_pk,
         notes: Vec::new(),
         spent_images: Vec::new(),
         last_height: 0,
@@ -237,6 +249,7 @@ pub fn load_wallet(path: &str) -> Result<WalletState, String> {
                     one_time_pub: n.one_time_pub,
                     tx_pub: [0u8; 32],
                     lattice_spend_pub: Vec::new(),
+                    lattice_one_time_secret: Vec::new(),
                     one_time_secret: n.one_time_secret,
                     commitment: n.commitment,
                     amount: n.amount,
@@ -281,6 +294,7 @@ pub fn load_wallet(path: &str) -> Result<WalletState, String> {
                 one_time_pub: n.one_time_pub,
                 tx_pub: [0u8; 32],
                 lattice_spend_pub: Vec::new(),
+                lattice_one_time_secret: Vec::new(),
                 one_time_secret: n.one_time_secret,
                 commitment: n.commitment,
                 amount: n.amount,
@@ -398,11 +412,32 @@ fn derive_key_legacy(pass: &str, salt: &[u8; 32], label: &[u8]) -> [u8; 32] {
     key
 }
 
+fn fill_os_random(out: &mut [u8]) -> Result<(), String> {
+    getrandom(out).map_err(|e| format!("getrandom failed: {e}"))
+}
+
+fn random_secret_bytes() -> Result<[u8; 32], String> {
+    let mut out = [0u8; 32];
+    fill_os_random(&mut out)?;
+    Ok(out)
+}
+
+fn derive_secret_tag(domain: &[u8], seed: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(domain);
+    h.update(seed);
+    *h.finalize().as_bytes()
+}
+
+fn derive_public_tag(domain: &[u8], secret: &[u8; 32]) -> [u8; 32] {
+    derive_secret_tag(domain, secret)
+}
+
 fn encrypt_wallet(plain: &[u8], pass: &str) -> Result<Vec<u8>, String> {
     let mut salt = [0u8; 32];
-    os_random_bytes(&mut salt).map_err(|e| e.to_string())?;
+    fill_os_random(&mut salt)?;
     let mut nonce = [0u8; 24];
-    os_random_bytes(&mut nonce).map_err(|e| e.to_string())?;
+    fill_os_random(&mut nonce)?;
     let key = derive_key(pass, &salt)?;
     let cipher = XChaCha20Poly1305::new_from_slice(&key).map_err(|_| "invalid key".to_string())?;
     let ciphertext = cipher
@@ -567,17 +602,31 @@ pub fn sync_wallet(state: &mut WalletState, rpc_addr: &str) -> Result<(), String
                     Ok(bytes) => hash_tx_bytes(&bytes),
                     Err(_) => continue,
                 };
+                let lattice_outputs: Option<Vec<_>> = if tx.coinbase {
+                    decode_coinbase_payload(&tx.extra)
+                        .ok()
+                        .map(|p| p.outputs)
+                } else {
+                    decode_lattice_tx_extra(&tx.extra)
+                        .ok()
+                        .map(|ltx| ltx.outputs)
+                };
                 for (idx, out) in tx.outputs.iter().enumerate() {
+                    let lattice_out = lattice_outputs
+                        .as_ref()
+                        .and_then(|outs| outs.get(idx));
                     for (sub_idx, spend_sk, spend_pk) in &subkeys {
                         if let Some(note) = try_decrypt_output(
                             &view_sk,
                             spend_sk,
                             spend_pk,
                             out,
+                            lattice_out,
                             tx_hash,
                             idx as u16,
                             *sub_idx,
                             block_height,
+                            tx.coinbase,
                         ) {
                             if !state.notes.iter().any(|n| {
                                 n.out_ref.tx == note.out_ref.tx
@@ -620,15 +669,15 @@ pub fn create_wallet_from_node_key_bytes(
 }
 
 fn create_wallet_from_node_secret(sk: SecretKey, wallet_path: &str) -> Result<WalletState, String> {
-    let view_sk = hash_to_scalar(b"knox-wallet-view", &sk.0).to_bytes();
-    let spend_sk = hash_to_scalar(b"knox-wallet-spend", &sk.0).to_bytes();
-    let view_pk = curve_public_from_secret(&SecretKey(view_sk));
-    let spend_pk = curve_public_from_secret(&SecretKey(spend_sk));
+    let view_sk = derive_secret_tag(b"knox-wallet-view-v2", &sk.0);
+    let spend_sk = derive_secret_tag(b"knox-wallet-spend-v2", &sk.0);
+    let view_pk = derive_public_tag(b"knox-wallet-view-pub-v2", &view_sk);
+    let spend_pk = derive_public_tag(b"knox-wallet-spend-pub-v2", &spend_sk);
     let state = WalletState {
         view_secret: view_sk,
         spend_secret: spend_sk,
-        view_public: view_pk.0,
-        spend_public: spend_pk.0,
+        view_public: view_pk,
+        spend_public: spend_pk,
         notes: Vec::new(),
         spent_images: Vec::new(),
         last_height: 0,
@@ -740,48 +789,31 @@ pub fn build_transaction(
         output_plan.push((state.address(), change));
     }
 
-    let mut outputs = Vec::with_capacity(output_plan.len());
+    let mut output_drafts = Vec::with_capacity(output_plan.len());
     let chain_tip = rpc_get_tip(rpc_addr).unwrap_or(state.last_height);
     let enc_level = tx_hardening_level(chain_tip.saturating_add(1));
     for (addr, out_amount) in &output_plan {
         let blind = random_scalar_bytes()?;
-        outputs.push(make_output_with_blind(
+        output_drafts.push(make_output_with_blind(
             addr,
             *out_amount,
             &blind,
             enc_level,
         )?);
     }
-
-    // Build lattice outputs (range-proof + homomorphic accounting path).
     let commitment_key = LatticeCommitmentKey::derive();
-    let mut lattice_outputs = Vec::with_capacity(outputs.len());
-    let mut output_openings = Vec::with_capacity(outputs.len());
-    for ((_, out_amount), out) in output_plan.iter().zip(outputs.iter()) {
-        let stealth = lattice_public_from_serialized(&out.lattice_spend_pub)?;
-        let eph = lattice_public_from_bytes(b"knox-lattice-ephemeral", &out.tx_pub);
-        let mut shared_seed = [0u8; 32];
-        let mut h = blake3::Hasher::new();
-        h.update(b"knox-lattice-wallet-shared");
-        h.update(&out.one_time_pub);
-        h.update(&out.tx_pub);
-        shared_seed.copy_from_slice(h.finalize().as_bytes());
-
-        let (mut lattice_out, opening) = build_private_output(
-            &commitment_key,
-            stealth,
-            eph,
-            *out_amount,
-            out.enc_level,
-            &shared_seed,
-        )?;
-        // Keep wallet-visible encrypted fields aligned with TxOut payload.
-        lattice_out.enc_amount = out.enc_amount;
-        lattice_out.enc_blind = out.enc_blind;
-        lattice_out.enc_level = out.enc_level;
-        lattice_outputs.push(lattice_out);
-        output_openings.push(opening);
-    }
+    let outputs = output_drafts
+        .iter()
+        .map(|d| d.tx_out.clone())
+        .collect::<Vec<_>>();
+    let lattice_outputs = output_drafts
+        .iter()
+        .map(|d| d.lattice_out.clone())
+        .collect::<Vec<_>>();
+    let output_openings = output_drafts
+        .iter()
+        .map(|d| d.opening.clone())
+        .collect::<Vec<_>>();
 
     // Choose input pseudo-commit randomness so sum(inputs)+fee == sum(outputs) commitment-wise.
     let mut output_random_sum = Poly::zero();
@@ -954,61 +986,99 @@ struct InputDraft {
     lattice_public: LatticePublicKey,
 }
 
+struct WalletOutputDraft {
+    tx_out: TxOut,
+    lattice_out: LatticeOutput,
+    opening: LatticeOutputOpening,
+}
+
 fn make_output_with_blind(
     addr: &Address,
     amount: u64,
     blind: &[u8; 32],
     enc_level: u32,
-) -> Result<TxOut, String> {
-    let (r, r_pub) = random_scalar_and_pub()?;
-    let view_pub = PublicKey(addr.view);
-    let spend_pub = PublicKey(addr.spend);
-    let one_time_pub = derive_one_time_pub(&view_pub, &spend_pub, &r)?;
+) -> Result<WalletOutputDraft, String> {
+    let _ = blind;
+    let commitment_key = LatticeCommitmentKey::derive();
     let recipient_lattice_pub = lattice_public_from_serialized(&addr.lattice_spend_pub)?;
-
-    let blind_scalar = scalar_from_bytes(blind);
-    let commit = pedersen_commit(amount, &blind_scalar);
-    let proof = prove_range(amount, blind_scalar)?;
-    let shared = shared_secret_sender(&r, &view_pub)?;
-    let shared_bytes = shared.compress().to_bytes();
-    let one_time_lattice_pub = lattice_output_public_from_shared(
+    let ephemeral_secret = Poly::random_short_checked()?;
+    let stealth = send_to_stealth_with_ephemeral(
         &recipient_lattice_pub,
-        &shared_bytes,
-        &one_time_pub.0,
-        &r_pub.0,
+        &recipient_lattice_pub,
+        &ephemeral_secret,
     );
-    let (enc_amount, enc_blind) =
-        encrypt_amount_with_level(&shared_bytes, amount, blind, enc_level);
+    let shared = lattice_shared_seed(&stealth.one_time_public, &stealth.ephemeral_public);
+    let (lattice_out, opening) = build_private_output(
+        &commitment_key,
+        stealth.one_time_public.clone(),
+        stealth.ephemeral_public.clone(),
+        amount,
+        enc_level,
+        &shared,
+    )?;
 
-    Ok(TxOut {
-        one_time_pub: one_time_pub.0,
-        tx_pub: r_pub.0,
-        commitment: commit.to_bytes(),
-        lattice_spend_pub: one_time_lattice_pub.p.to_bytes(),
-        enc_amount,
-        enc_blind,
+    let tx_out = TxOut {
+        one_time_pub: compatibility_pubkey_tag(
+            b"knox-wallet-one-time-v2",
+            &stealth.one_time_public.p.to_bytes(),
+        ),
+        tx_pub: compatibility_pubkey_tag(
+            b"knox-wallet-ephemeral-v2",
+            &stealth.ephemeral_public.p.to_bytes(),
+        ),
+        commitment: lattice_commitment_digest(&lattice_out.commitment),
+        lattice_spend_pub: stealth.one_time_public.p.to_bytes(),
+        enc_amount: lattice_out.enc_amount,
+        enc_blind: lattice_out.enc_blind,
         enc_level,
         memo: [0u8; 32],
-        range_proof: to_range_types(&proof),
+        range_proof: lattice_range_placeholder(&lattice_out.range_proof),
+    };
+
+    Ok(WalletOutputDraft {
+        tx_out,
+        lattice_out,
+        opening,
     })
 }
 
 fn try_decrypt_output(
     view_sk: &SecretKey,
     spend_sk: &SecretKey,
-    spend_pk: &PublicKey,
+    _spend_pk: &PublicKey,
     out: &TxOut,
+    lattice_out: Option<&LatticeOutput>,
     tx_hash: Hash32,
     index: u16,
     subaddress_index: u32,
     block_height: u64,
+    is_coinbase: bool,
 ) -> Option<Note> {
-    let tx_pub = PublicKey(out.tx_pub);
-    let shared = shared_secret_receiver(view_sk, &tx_pub)?;
-    let tweak = hash_to_scalar(b"knox-stealth", shared.compress().as_bytes());
-    let spend_point = curve25519_dalek::ristretto::CompressedRistretto(spend_pk.0).decompress()?;
-    let dest = spend_point + tweak * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
-    if dest.compress().to_bytes() != out.one_time_pub {
+    let lattice_out = lattice_out?;
+    let one_time_public = lattice_public_from_serialized(&out.lattice_spend_pub).ok()?;
+    if one_time_public != lattice_out.stealth_address {
+        return None;
+    }
+    let spend_secret = lattice_base_secret_from_seed(&spend_sk.0);
+    let spend_public = lattice_public_from_secret(&spend_secret);
+    // Coinbase outputs are constructed with spend_public used as both view and spend key,
+    // so we must scan using spend_secret as the view key for coinbase transactions.
+    let view_secret = if is_coinbase {
+        spend_secret.clone()
+    } else {
+        lattice_view_secret_from_seed(&view_sk.0)
+    };
+    let stealth = LatticeStealthOutput {
+        one_time_public: one_time_public.clone(),
+        ephemeral_public: lattice_out.ephemeral_public.clone(),
+    };
+    if !scan_with_view_key(&view_secret, &spend_public, &stealth) {
+        return None;
+    }
+    let recovered_secret =
+        lattice_recover_one_time_secret(&view_secret, &spend_secret, &stealth.ephemeral_public);
+    let recovered_public = lattice_public_from_secret(&recovered_secret);
+    if recovered_public != one_time_public {
         return None;
     }
 
@@ -1018,30 +1088,22 @@ fn try_decrypt_output(
     } else {
         out.enc_level
     };
-    let shared_bytes = shared.compress().to_bytes();
+    let shared_bytes = lattice_shared_seed(&one_time_public, &stealth.ephemeral_public);
     let (amount, blind) =
         decrypt_amount_with_level(&shared_bytes, out.enc_amount, out.enc_blind, level);
-    let one_time_secret = knox_crypto::recover_one_time_secret(view_sk, spend_sk, &tx_pub).ok()?;
-    let lattice_base_secret = lattice_base_secret_from_curve_spend_secret(&spend_sk.0);
-    let lattice_secret = lattice_output_secret_from_shared(
-        &lattice_base_secret,
-        &shared_bytes,
-        &out.one_time_pub,
-        &out.tx_pub,
+    let ki = derive_key_image_id(&lattice_key_image(&recovered_secret, &recovered_public));
+    let legacy_one_time = compatibility_pubkey_tag(
+        b"knox-wallet-legacy-secret-v2",
+        &recovered_secret.s.to_bytes(),
     );
-    let lattice_public = lattice_public_from_secret(&lattice_secret);
-    let out_lattice_public = lattice_public_from_serialized(&out.lattice_spend_pub).ok()?;
-    if lattice_public != out_lattice_public {
-        return None;
-    }
-    let ki = derive_key_image_id(&lattice_key_image(&lattice_secret, &lattice_public));
 
     Some(Note {
         out_ref: OutputRef { tx: tx_hash, index },
         one_time_pub: out.one_time_pub,
         tx_pub: out.tx_pub,
         lattice_spend_pub: out.lattice_spend_pub.clone(),
-        one_time_secret: one_time_secret.0,
+        lattice_one_time_secret: recovered_secret.s.to_bytes(),
+        one_time_secret: legacy_one_time,
         commitment: out.commitment,
         amount,
         blinding: blind,
@@ -1050,36 +1112,9 @@ fn try_decrypt_output(
     })
 }
 
-fn shared_secret_sender(
-    r: &curve25519_dalek::scalar::Scalar,
-    view_pub: &PublicKey,
-) -> Result<curve25519_dalek::ristretto::RistrettoPoint, String> {
-    let view_point = curve25519_dalek::ristretto::CompressedRistretto(view_pub.0)
-        .decompress()
-        .ok_or_else(|| "invalid view public key".to_string())?;
-    Ok(r * view_point)
-}
-
-fn shared_secret_receiver(
-    view_sk: &SecretKey,
-    tx_pub: &PublicKey,
-) -> Option<curve25519_dalek::ristretto::RistrettoPoint> {
-    let r_point = curve25519_dalek::ristretto::CompressedRistretto(tx_pub.0).decompress()?;
-    let view_scalar = scalar_from_bytes(&view_sk.0);
-    Some(view_scalar * r_point)
-}
-
-fn random_scalar_and_pub() -> Result<(curve25519_dalek::scalar::Scalar, PublicKey), String> {
-    let mut seed = [0u8; 32];
-    os_random_bytes(&mut seed).map_err(|e| e.to_string())?;
-    let scalar = curve25519_dalek::scalar::Scalar::from_bytes_mod_order(seed);
-    let point = scalar * curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
-    Ok((scalar, PublicKey(point.compress().to_bytes())))
-}
-
 fn random_scalar_bytes() -> Result<[u8; 32], String> {
     let mut bytes = [0u8; 32];
-    os_random_bytes(&mut bytes).map_err(|e| e.to_string())?;
+    fill_os_random(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -1089,51 +1124,70 @@ fn lattice_secret_from_one_time_secret(secret: &[u8; 32]) -> LatticeSecretKey {
     }
 }
 
-fn lattice_base_secret_from_curve_spend_secret(spend_secret: &[u8; 32]) -> LatticeSecretKey {
+fn lattice_base_secret_from_seed(spend_secret: &[u8; 32]) -> LatticeSecretKey {
     LatticeSecretKey {
         s: Poly::sample_short(b"knox-wallet-lattice-base-v1", spend_secret),
     }
 }
 
-fn lattice_base_public_from_curve_spend_secret(spend_secret: &[u8; 32]) -> LatticePublicKey {
-    let base_secret = lattice_base_secret_from_curve_spend_secret(spend_secret);
-    lattice_public_from_secret(&base_secret)
-}
-
-fn lattice_tweak_from_shared(
-    shared_secret: &[u8; 32],
-    one_time_pub: &[u8; 32],
-    tx_pub: &[u8; 32],
-) -> Poly {
-    let mut data = Vec::with_capacity(32 + 32 + 32);
-    data.extend_from_slice(shared_secret);
-    data.extend_from_slice(one_time_pub);
-    data.extend_from_slice(tx_pub);
-    Poly::sample_short(b"knox-wallet-lattice-output-tweak-v1", &data)
-}
-
-fn lattice_output_public_from_shared(
-    base_public: &LatticePublicKey,
-    shared_secret: &[u8; 32],
-    one_time_pub: &[u8; 32],
-    tx_pub: &[u8; 32],
-) -> LatticePublicKey {
-    let tweak = lattice_tweak_from_shared(shared_secret, one_time_pub, tx_pub);
-    let tweak_public = lattice_public_from_secret(&LatticeSecretKey { s: tweak });
-    LatticePublicKey {
-        p: base_public.p.add(&tweak_public.p),
+fn lattice_view_secret_from_seed(view_secret: &[u8; 32]) -> LatticeSecretKey {
+    LatticeSecretKey {
+        s: Poly::sample_short(b"knox-wallet-lattice-view-v1", view_secret),
     }
 }
 
-fn lattice_output_secret_from_shared(
-    base_secret: &LatticeSecretKey,
-    shared_secret: &[u8; 32],
-    one_time_pub: &[u8; 32],
-    tx_pub: &[u8; 32],
-) -> LatticeSecretKey {
-    let tweak = lattice_tweak_from_shared(shared_secret, one_time_pub, tx_pub);
-    LatticeSecretKey {
-        s: base_secret.s.add(&tweak),
+fn lattice_base_public_from_seed(spend_secret: &[u8; 32]) -> LatticePublicKey {
+    let base_secret = lattice_base_secret_from_seed(spend_secret);
+    lattice_public_from_secret(&base_secret)
+}
+
+fn lattice_shared_seed(
+    one_time_public: &LatticePublicKey,
+    ephemeral_public: &LatticePublicKey,
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"knox-lattice-shared-seed-v2");
+    h.update(&one_time_public.p.to_bytes());
+    h.update(&ephemeral_public.p.to_bytes());
+    *h.finalize().as_bytes()
+}
+
+fn compatibility_pubkey_tag(domain: &[u8], payload: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(domain);
+    h.update(payload);
+    *h.finalize().as_bytes()
+}
+
+fn lattice_range_placeholder(proof: &LatticeRangeProof) -> knox_types::RangeProof {
+    let encoded = bincode::encode_to_vec(proof, bincode::config::standard()).unwrap_or_default();
+    let derive = |tag: &[u8]| -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(b"knox-range-compat-v2");
+        h.update(tag);
+        h.update(&encoded);
+        *h.finalize().as_bytes()
+    };
+    let mut l_vec = Vec::new();
+    let mut r_vec = Vec::new();
+    for idx in 0..4u8 {
+        l_vec.push(derive(&[b'l', idx]));
+        r_vec.push(derive(&[b'r', idx]));
+    }
+    knox_types::RangeProof {
+        a: derive(b"a"),
+        s: derive(b"s"),
+        t1: derive(b"t1"),
+        t2: derive(b"t2"),
+        tau_x: derive(b"tau_x"),
+        mu: derive(b"mu"),
+        t_hat: derive(b"t_hat"),
+        ip_proof: knox_types::InnerProductProof {
+            l_vec,
+            r_vec,
+            a: derive(b"ipa"),
+            b: derive(b"ipb"),
+        },
     }
 }
 
@@ -1144,12 +1198,6 @@ fn lattice_public_from_serialized(bytes: &[u8]) -> Result<LatticePublicKey, Stri
 
 fn lattice_public_from_member(member: &RingMember) -> Result<LatticePublicKey, String> {
     lattice_public_from_serialized(&member.lattice_spend_pub)
-}
-
-fn lattice_public_from_bytes(domain: &[u8], bytes: &[u8]) -> LatticePublicKey {
-    LatticePublicKey {
-        p: Poly::from_hash(domain, bytes),
-    }
 }
 
 fn lattice_commitment_digest(commitment: &LatticeCommitment) -> [u8; 32] {
@@ -1164,7 +1212,7 @@ fn sample_index(upper: usize) -> Result<usize, String> {
     let max = u64::MAX - (u64::MAX % bound);
     loop {
         let mut buf = [0u8; 8];
-        os_random_bytes(&mut buf).map_err(|e| e.to_string())?;
+        fill_os_random(&mut buf)?;
         let v = u64::from_le_bytes(buf);
         if v < max {
             return Ok((v % bound) as usize);
@@ -1176,13 +1224,11 @@ fn subaddress_spend_secret(master_spend_secret: &[u8; 32], index: u32) -> [u8; 3
     if index == 0 {
         return *master_spend_secret;
     }
-    let mut data = Vec::with_capacity(36);
-    data.extend_from_slice(master_spend_secret);
-    data.extend_from_slice(&index.to_le_bytes());
-    let tweak = hash_to_scalar(b"knox-subaddress", &data);
-    let base = scalar_from_bytes(master_spend_secret);
-    let derived = base + tweak;
-    derived.to_bytes()
+    let mut h = blake3::Hasher::new();
+    h.update(b"knox-subaddress-v2");
+    h.update(master_spend_secret);
+    h.update(&index.to_le_bytes());
+    *h.finalize().as_bytes()
 }
 
 fn subaddress_keys(state: &WalletState, index: u32) -> Result<(SecretKey, PublicKey), String> {
@@ -1190,62 +1236,32 @@ fn subaddress_keys(state: &WalletState, index: u32) -> Result<(SecretKey, Public
         return Ok((SecretKey(state.spend_secret), PublicKey(state.spend_public)));
     }
     let secret = SecretKey(subaddress_spend_secret(&state.spend_secret, index));
-    let public = curve_public_from_secret(&secret);
+    let public = PublicKey(derive_public_tag(b"knox-wallet-spend-pub-v2", &secret.0));
     Ok((secret, public))
 }
 
 fn lattice_spend_keypair_for_note(
-    view_secret: &[u8; 32],
-    spend_secret: &[u8; 32],
+    _view_secret: &[u8; 32],
+    _spend_secret: &[u8; 32],
     note: &Note,
 ) -> Result<(LatticeSecretKey, LatticePublicKey), String> {
-    if note.tx_pub == [0u8; 32] || note.lattice_spend_pub.len() != LATTICE_PUBKEY_BYTES {
-        let fallback_secret = lattice_secret_from_one_time_secret(&note.one_time_secret);
-        let fallback_public = lattice_public_from_secret(&fallback_secret);
-        return Ok((fallback_secret, fallback_public));
+    if note.lattice_one_time_secret.len() == LATTICE_PUBKEY_BYTES {
+        let poly = Poly::from_bytes(&note.lattice_one_time_secret)
+            .map_err(|_| "invalid note lattice secret bytes".to_string())?;
+        let secret = LatticeSecretKey { s: poly };
+        let public = lattice_public_from_secret(&secret);
+        if note.lattice_spend_pub.len() == LATTICE_PUBKEY_BYTES {
+            let expected = lattice_public_from_serialized(&note.lattice_spend_pub)?;
+            if public == expected {
+                return Ok((secret, public));
+            }
+        } else {
+            return Ok((secret, public));
+        }
     }
-
-    let sub_spend_secret = subaddress_spend_secret(spend_secret, note.subaddress_index);
-    let view_sk = SecretKey(*view_secret);
-    let tx_pub = PublicKey(note.tx_pub);
-    let shared = shared_secret_receiver(&view_sk, &tx_pub)
-        .ok_or_else(|| "invalid note tx public key for lattice derivation".to_string())?;
-    let shared_bytes = shared.compress().to_bytes();
-    let base_secret = lattice_base_secret_from_curve_spend_secret(&sub_spend_secret);
-    let secret = lattice_output_secret_from_shared(
-        &base_secret,
-        &shared_bytes,
-        &note.one_time_pub,
-        &note.tx_pub,
-    );
-    let public = lattice_public_from_secret(&secret);
-    let expected = lattice_public_from_serialized(&note.lattice_spend_pub)?;
-    if public != expected {
-        return Err("note lattice spend key mismatch".to_string());
-    }
-    Ok((secret, public))
-}
-
-fn scalar_from_bytes(bytes: &[u8; 32]) -> curve25519_dalek::scalar::Scalar {
-    curve25519_dalek::scalar::Scalar::from_bytes_mod_order(*bytes)
-}
-
-fn to_range_types(proof: &knox_crypto::RangeProof) -> knox_types::RangeProof {
-    knox_types::RangeProof {
-        a: proof.a,
-        s: proof.s,
-        t1: proof.t1,
-        t2: proof.t2,
-        tau_x: proof.tau_x,
-        mu: proof.mu,
-        t_hat: proof.t_hat,
-        ip_proof: knox_types::InnerProductProof {
-            l_vec: proof.ip_proof.l_vec.clone(),
-            r_vec: proof.ip_proof.r_vec.clone(),
-            a: proof.ip_proof.a,
-            b: proof.ip_proof.b,
-        },
-    }
+    let fallback_secret = lattice_secret_from_one_time_secret(&note.one_time_secret);
+    let fallback_public = lattice_public_from_secret(&fallback_secret);
+    Ok((fallback_secret, fallback_public))
 }
 
 fn tx_lattice_signing_hash(tx: &Transaction) -> Hash32 {
@@ -1457,7 +1473,7 @@ fn rpc_request(
     addr: &str,
     req: knox_types::WalletRequest,
 ) -> Result<knox_types::WalletResponse, String> {
-    const MAX_RPC_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+    const MAX_RPC_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
     let connect_timeout_ms = std::env::var("KNOX_RPC_CONNECT_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1488,12 +1504,18 @@ fn rpc_request(
     stream.read_exact(&mut len_buf).map_err(|e| e.to_string())?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len == 0 || len > MAX_RPC_RESPONSE_BYTES {
-        return Err("rpc response too large".to_string());
+        return Err(format!(
+            "wallet rpc response too large ({} bytes > {} byte cap)",
+            len, MAX_RPC_RESPONSE_BYTES
+        ));
     }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).map_err(|e| e.to_string())?;
-    let (resp, _): (knox_types::WalletResponse, usize) =
-        bincode::decode_from_slice(&buf, bincode::config::standard().with_limit::<16777216>()).map_err(|e| e.to_string())?;
+    let (resp, _): (knox_types::WalletResponse, usize) = bincode::decode_from_slice(
+        &buf,
+        bincode::config::standard().with_limit::<{ 512 * 1024 * 1024 }>(),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(resp)
 }
 
@@ -1536,15 +1558,10 @@ fn load_node_key(path: &str) -> Result<(SecretKey, PublicKey), String> {
 fn load_node_key_bytes(bytes: &[u8]) -> Result<(SecretKey, PublicKey), String> {
     if bytes.len() == 64 {
         let mut sk = [0u8; 32];
-        let mut pk = [0u8; 32];
         sk.copy_from_slice(&bytes[..32]);
-        pk.copy_from_slice(&bytes[32..]);
         let sk = SecretKey(sk);
-        let derived = curve_public_from_secret(&sk);
-        if derived.0 != pk {
-            return Err("node key public mismatch".to_string());
-        }
-        return Ok((sk, PublicKey(pk)));
+        let derived = PublicKey(derive_public_tag(b"knox-node-public-v2", &sk.0));
+        return Ok((sk, derived));
     }
     if let Some(text) = decode_text(bytes) {
         let text = text.trim();
@@ -1554,20 +1571,15 @@ fn load_node_key_bytes(bytes: &[u8]) -> Result<(SecretKey, PublicKey), String> {
                 let mut sk = [0u8; 32];
                 sk.copy_from_slice(&raw);
                 let sk = SecretKey(sk);
-                let pk = curve_public_from_secret(&sk);
+                let pk = PublicKey(derive_public_tag(b"knox-node-public-v2", &sk.0));
                 return Ok((sk, pk));
             }
             if raw.len() == 64 {
                 let mut sk = [0u8; 32];
-                let mut pk = [0u8; 32];
                 sk.copy_from_slice(&raw[..32]);
-                pk.copy_from_slice(&raw[32..]);
                 let sk = SecretKey(sk);
-                let derived = curve_public_from_secret(&sk);
-                if derived.0 != pk {
-                    return Err("node key public mismatch".to_string());
-                }
-                return Ok((sk, PublicKey(pk)));
+                let pk = PublicKey(derive_public_tag(b"knox-node-public-v2", &sk.0));
+                return Ok((sk, pk));
             }
         }
     }

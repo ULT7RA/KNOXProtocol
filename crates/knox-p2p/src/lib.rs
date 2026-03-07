@@ -1,14 +1,13 @@
 use bincode::{Decode, Encode};
 use blake3::Hasher;
-use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305, XNonce};
-use knox_crypto::{os_random_bytes, Prng};
 use knox_types::{
     Block, SlashEvidence, TimeoutCertificate, TimeoutVote, Transaction, Vote,
-    COVER_TRAFFIC_MIN_BYTES, P2P_RELAY_DELAY_MAX_MS, P2P_RELAY_DELAY_MIN_MS,
+    COVER_TRAFFIC_MIN_BYTES, MAX_BLOCK_BYTES, P2P_RELAY_DELAY_MAX_MS, P2P_RELAY_DELAY_MIN_MS,
 };
-use std::collections::HashMap;
+use getrandom::getrandom;
+use subtle::ConstantTimeEq;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,9 +15,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
-const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MESSAGE_BYTES: usize = MAX_BLOCK_BYTES + (2 * 1024 * 1024);
+const MAX_ENVELOPE_DECODE_BYTES: usize = MAX_MESSAGE_BYTES + (2 * 1024 * 1024);
 const PEER_QUEUE_SIZE: usize = 1024;
-const MAX_INBOUND_MSG_PER_SEC: u32 = 200;
+const MAX_INBOUND_MSG_PER_SEC: u32 = 1000;
 const MAX_INBOUND_PER_IP: usize = 8;
 const MAX_INBOUND_IP_STATE: usize = 8_192;
 const INBOUND_STATE_TTL_MS: u64 = 5 * 60_000;
@@ -28,6 +28,15 @@ const FRAME_PLAINTEXT: u8 = 0;
 const FRAME_ENCRYPTED: u8 = 1;
 const MAX_REPLAY_SESSIONS: usize = 16_384;
 const REPLAY_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+const MAX_BLOCK_REQUESTERS: usize = 4_096;
+const BLOCK_REQUESTER_TTL_MS: u64 = 30_000;
+
+#[derive(Clone, Debug)]
+struct BlockRequester {
+    peer: String,
+    from_height: u64,
+    requested_at_ms: u64,
+}
 
 fn unsafe_overrides_enabled() -> bool {
     if std::env::var("KNOX_MAINNET_LOCK").ok().as_deref() == Some("1") {
@@ -69,16 +78,47 @@ struct ReplayState {
     seen_ms: u64,
 }
 
+#[derive(Clone)]
+struct LocalPrng {
+    seed: [u8; 32],
+    counter: u64,
+}
+
+impl LocalPrng {
+    fn new(seed: [u8; 32]) -> Self {
+        Self { seed, counter: 0 }
+    }
+
+    fn fill_bytes(&mut self, out: &mut [u8]) {
+        let mut offset = 0usize;
+        while offset < out.len() {
+            let mut h = Hasher::new_keyed(&self.seed);
+            h.update(b"knox-p2p-prng-v1");
+            h.update(&self.counter.to_le_bytes());
+            let digest = h.finalize();
+            self.counter = self.counter.wrapping_add(1);
+            let chunk = digest.as_bytes();
+            let take = (out.len() - offset).min(chunk.len());
+            out[offset..offset + take].copy_from_slice(&chunk[..take]);
+            offset += take;
+        }
+    }
+}
+
 fn seed_prng() -> Result<[u8; 32], String> {
     let mut seed = [0u8; 32];
-    os_random_bytes(&mut seed)?;
+    fill_os_random(&mut seed)?;
     Ok(seed)
 }
 
 fn random_session_id() -> Result<[u8; 16], String> {
     let mut id = [0u8; 16];
-    os_random_bytes(&mut id)?;
+    fill_os_random(&mut id)?;
     Ok(id)
+}
+
+fn fill_os_random(out: &mut [u8]) -> Result<(), String> {
+    getrandom(out).map_err(|e| format!("getrandom failed: {e}"))
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +130,8 @@ pub struct NetworkConfig {
     pub cover_interval_ms: u64,
     pub lattice_public: Option<Vec<u8>>,
     pub lattice_secret: Option<Vec<u8>>,
+    pub protocol_version: u32,
+    pub genesis_hash: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode)]
@@ -105,6 +147,8 @@ pub enum Message {
         pow_nonce: u64,
         lattice_ephemeral: Option<Vec<u8>>,
         lattice_public: Option<Vec<u8>>,
+        protocol_version: u32,
+        genesis_hash: [u8; 32],
     },
     Tx(Transaction),
     Block(Block),
@@ -168,6 +212,8 @@ impl Network {
         let (tx_out, mut rx_out) = mpsc::channel(1024);
         let peers: Arc<Mutex<HashMap<String, mpsc::Sender<Envelope>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let block_requesters: Arc<Mutex<VecDeque<BlockRequester>>> =
+            Arc::new(Mutex::new(VecDeque::with_capacity(256)));
         let limiter = InboundLimiter::default();
         let counts = InboundCounts::default();
         let replay = ReplayProtector::default();
@@ -176,6 +222,8 @@ impl Network {
         let active_peers = Arc::new(AtomicU64::new(0));
         let local_lattice_public = cfg.lattice_public.clone();
         let local_lattice_secret = cfg.lattice_secret.clone();
+        let local_protocol_version = cfg.protocol_version;
+        let local_genesis_hash = cfg.genesis_hash;
         
         // Remove PSK fallback, use lattice exclusively.
         let outbound_seed =
@@ -194,13 +242,18 @@ impl Network {
                 seed,
                 local_lattice_public.clone(),
                 local_lattice_secret.clone(),
+                local_protocol_version,
+                local_genesis_hash,
+                tx_in.clone(),
                 session_id,
                 next_sequence.clone(),
                 active_peers.clone(),
+                block_requesters.clone(),
             )?;
         }
 
         let active_peers_for_inbound = active_peers.clone();
+        let inbound_requesters = block_requesters.clone();
         tokio::spawn({
             let peers = peers.clone();
             let limiter = limiter.clone();
@@ -217,12 +270,33 @@ impl Network {
                             let limiter = limiter.clone();
                             let counts = counts.clone();
                             let replay = replay.clone();
+                            let peers_for_inbound = peers.clone();
                             let pub_key = local_lattice_public.clone();
                             let sec_key = local_lattice_secret.clone();
+                            let protocol_version = local_protocol_version;
+                            let genesis_hash = local_genesis_hash;
                             let pad_bytes = cfg.pad_bytes;
                             let active_peers_inbound = active_peers_for_inbound.clone();
+                            let peer_label = format!("inbound:{}:{}", addr.ip(), addr.port());
+                            let requesters = inbound_requesters.clone();
                             tokio::spawn(async move {
-                                let _ = handle_inbound(stream, addr.ip(), tx, limiter, replay, pub_key, sec_key, pad_bytes, active_peers_inbound).await;
+                                let _ = handle_inbound(
+                                    stream,
+                                    addr.ip(),
+                                    peer_label,
+                                    tx,
+                                    limiter,
+                                    replay,
+                                    pub_key,
+                                    sec_key,
+                                    protocol_version,
+                                    genesis_hash,
+                                    pad_bytes,
+                                    active_peers_inbound,
+                                    peers_for_inbound,
+                                    requesters,
+                                )
+                                .await;
                                 counts.remove(addr.ip());
                             });
                         }
@@ -235,19 +309,21 @@ impl Network {
         });
 
         let peers_clone = peers.clone();
+        let outbound_requesters = block_requesters.clone();
         tokio::spawn(async move {
-            let mut prng = Prng::new(outbound_seed);
+            let mut prng = LocalPrng::new(outbound_seed);
             while let Some(env) = rx_out.recv().await {
-                let _ = send_to_peers(&peers_clone, &env, &mut prng).await;
+                let _ = send_to_peers(&peers_clone, &outbound_requesters, &env, &mut prng).await;
             }
         });
 
         let cfg_cover = cfg.clone();
         let peers_cover = peers.clone();
+        let cover_requesters = block_requesters.clone();
         let cover_session_id = session_id;
         let cover_sequence = next_sequence.clone();
         tokio::spawn(async move {
-            let mut prng = Prng::new(cover_seed);
+            let mut prng = LocalPrng::new(cover_seed);
             loop {
                 sleep(Duration::from_millis(cfg_cover.cover_interval_ms)).await;
                 let mut junk = vec![0u8; cfg_cover.pad_bytes.max(COVER_TRAFFIC_MIN_BYTES)];
@@ -258,7 +334,7 @@ impl Network {
                     sequence: cover_sequence.fetch_add(1, Ordering::Relaxed),
                     padding: Vec::new(),
                 };
-                let _ = send_to_peers(&peers_cover, &env, &mut prng).await;
+                let _ = send_to_peers(&peers_cover, &cover_requesters, &env, &mut prng).await;
             }
         });
 
@@ -310,112 +386,162 @@ impl NetworkSender {
 }
 
 async fn handle_inbound(
-    mut stream: TcpStream,
+    stream: TcpStream,
     ip: IpAddr,
+    peer_label: String,
     tx: mpsc::Sender<Envelope>,
     limiter: InboundLimiter,
     replay: ReplayProtector,
     local_lattice_public: Option<Vec<u8>>,
     local_lattice_secret: Option<Vec<u8>>,
+    local_protocol_version: u32,
+    local_genesis_hash: [u8; 32],
     pad_bytes: usize,
     active_peers: Arc<AtomicU64>,
+    peers: Arc<Mutex<HashMap<String, mpsc::Sender<Envelope>>>>,
+    block_requesters: Arc<Mutex<VecDeque<BlockRequester>>>,
 ) -> std::io::Result<()> {
+    let _ = stream.set_nodelay(true);
+    let (mut reader, mut writer) = stream.into_split();
+    let (tx_peer, mut rx_peer) = mpsc::channel::<Envelope>(PEER_QUEUE_SIZE);
     let mut window_start = std::time::Instant::now();
     let mut count = 0u32;
     let mut session_key: Option<[u8; 32]> = None;
     let mut handshaked = false;
-    let mut prng = Prng::new(seed_prng().unwrap_or([0u8; 32]));
+    let mut registered_peer = false;
+    let mut prng = LocalPrng::new(seed_prng().unwrap_or([0u8; 32]));
     loop {
-        if window_start.elapsed() >= Duration::from_secs(1) {
-            window_start = std::time::Instant::now();
-            count = 0;
-        }
-        if count >= MAX_INBOUND_MSG_PER_SEC {
-            break;
-        }
-        if !limiter.allow(ip, MAX_INBOUND_MSG_PER_SEC, now_ms()) {
-            break;
-        }
-        let mut len_buf = [0u8; 4];
-        if stream.read_exact(&mut len_buf).await.is_err() {
-            eprintln!("[p2p] read_exact len_buf failed from {}", ip);
-            break;
-        }
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len == 0 || len > MAX_MESSAGE_BYTES {
-            eprintln!("[p2p] invalid message length {} from {}", len, ip);
-            break;
-        }
-        let mut buf = vec![0u8; len];
-        if stream.read_exact(&mut buf).await.is_err() {
-            eprintln!("[p2p] read_exact message failed from {}", ip);
-            break;
-        }
-        if let Some(env) = decode_envelope(&buf, session_key) {
-            if !replay.allow(env.session_id, env.sequence, now_ms()) {
-                break;
-            }
-            match &env.msg {
-                Message::Handshake {
-                    peer_id, pow_nonce, lattice_public, lattice_ephemeral, ..
-                } => {
-                    if !check_pow(*peer_id, *pow_nonce) {
+        tokio::select! {
+            maybe_out = rx_peer.recv(), if handshaked => {
+                let Some(env_to_send) = maybe_out else { break; };
+                if let Some(payload) = encode_envelope(&env_to_send, pad_bytes, &mut prng, session_key) {
+                    if writer.write_all(&payload).await.is_err() {
                         break;
                     }
-                    if lattice_ephemeral.is_none() {
-                        let hello = Envelope {
-                            msg: Message::Handshake {
-                                peer_id: *peer_id,
-                                tip: 0,
-                                pow_nonce: *pow_nonce,
-                                lattice_ephemeral: None,
-                                lattice_public: local_lattice_public.clone(),
-                            },
-                            session_id: env.session_id,
-                            sequence: 0,
-                            padding: Vec::new(),
-                        };
-                        if let Some(payload) = encode_envelope(&hello, pad_bytes, &mut prng, None) {
-                            if stream.write_all(&payload).await.is_err() {
-                                break;
-                            }
+                }
+            }
+            inbound = read_envelope_from_peer(&mut reader, session_key) => {
+                let Some(env) = inbound else {
+                    break;
+                };
+                if window_start.elapsed() >= Duration::from_secs(1) {
+                    window_start = std::time::Instant::now();
+                    count = 0;
+                }
+                if count >= MAX_INBOUND_MSG_PER_SEC {
+                    // Burst traffic during sync catch-up should not flap links.
+                    // Drop over-limit frames and keep the socket alive.
+                    continue;
+                }
+                if !limiter.allow(ip, MAX_INBOUND_MSG_PER_SEC, now_ms()) {
+                    // Drop excess traffic but keep socket alive so transient bursts
+                    // do not cause connection churn.
+                    continue;
+                }
+                if !replay.allow(env.session_id, env.sequence, now_ms()) {
+                    // Duplicate relay frames are expected in gossip-style propagation.
+                    // Ignore stale sequence envelopes instead of tearing down the peer.
+                    continue;
+                }
+                match &env.msg {
+                    Message::Handshake {
+                        peer_id,
+                        pow_nonce,
+                        lattice_public: _lattice_public,
+                        lattice_ephemeral,
+                        protocol_version,
+                        genesis_hash,
+                        ..
+                    } => {
+                        if !check_pow(*peer_id, *pow_nonce) {
+                            break;
                         }
-                    } else if !handshaked {
-                        if let (Some(eph_bytes), Some(sec_bytes)) = (lattice_ephemeral, &local_lattice_secret) {
-                            if let (Ok(peer_eph_poly), Ok(loc_sec_poly)) = (
-                                knox_lattice::poly::Poly::from_bytes(eph_bytes),
-                                knox_lattice::poly::Poly::from_bytes(sec_bytes)
-                            ) {
-                                let loc_sec = knox_lattice::ring_sig::LatticeSecretKey { s: loc_sec_poly };
-                                let peer_eph = knox_lattice::ring_sig::LatticePublicKey { p: peer_eph_poly };
-                                let one_time_sec = knox_lattice::stealth::recover_one_time_secret(&loc_sec, &loc_sec, &peer_eph);
-                                let one_time_pub = knox_lattice::ring_sig::public_from_secret(&one_time_sec);
-                                let tag = blake3::hash(&one_time_pub.p.to_bytes());
-                                let mut sk = [0u8; 32];
-                                sk.copy_from_slice(tag.as_bytes());
-                                session_key = Some(sk);
-                                handshaked = true;
-                                active_peers.fetch_add(1, Ordering::Relaxed);
-                                eprintln!("[p2p] Accepted handshake from {}", ip);
-                            } else {
-                                break;
+                        if *protocol_version != local_protocol_version {
+                            eprintln!(
+                                "[p2p] reject handshake from {}: protocol version mismatch (peer={}, local={})",
+                                ip, *protocol_version, local_protocol_version
+                            );
+                            break;
+                        }
+                        if *genesis_hash != local_genesis_hash {
+                            eprintln!(
+                                "[p2p] reject handshake from {}: genesis hash mismatch",
+                                ip
+                            );
+                            break;
+                        }
+                        if lattice_ephemeral.is_none() {
+                            let hello = Envelope {
+                                msg: Message::Handshake {
+                                    peer_id: *peer_id,
+                                    tip: 0,
+                                    pow_nonce: *pow_nonce,
+                                    lattice_ephemeral: None,
+                                    lattice_public: local_lattice_public.clone(),
+                                    protocol_version: local_protocol_version,
+                                    genesis_hash: local_genesis_hash,
+                                },
+                                session_id: env.session_id,
+                                sequence: 0,
+                                padding: Vec::new(),
+                            };
+                            if let Some(payload) = encode_envelope(&hello, pad_bytes, &mut prng, None) {
+                                if writer.write_all(&payload).await.is_err() {
+                                    break;
+                                }
+                            }
+                        } else if !handshaked {
+                            if let (Some(eph_bytes), Some(sec_bytes)) = (lattice_ephemeral, &local_lattice_secret) {
+                                if let (Ok(peer_eph_poly), Ok(loc_sec_poly)) = (
+                                    knox_lattice::poly::Poly::from_bytes(eph_bytes),
+                                    knox_lattice::poly::Poly::from_bytes(sec_bytes)
+                                ) {
+                                    let loc_sec = knox_lattice::ring_sig::LatticeSecretKey { s: loc_sec_poly };
+                                    let peer_eph = knox_lattice::ring_sig::LatticePublicKey { p: peer_eph_poly };
+                                    let one_time_sec = knox_lattice::stealth::recover_one_time_secret(&loc_sec, &loc_sec, &peer_eph);
+                                    let one_time_pub = knox_lattice::ring_sig::public_from_secret(&one_time_sec);
+                                    let tag = blake3::hash(&one_time_pub.p.to_bytes());
+                                    let mut sk = [0u8; 32];
+                                    sk.copy_from_slice(tag.as_bytes());
+                                    session_key = Some(sk);
+                                    handshaked = true;
+                                    active_peers.fetch_add(1, Ordering::Relaxed);
+                                    if let Ok(mut map) = peers.lock() {
+                                        map.insert(peer_label.clone(), tx_peer.clone());
+                                        registered_peer = true;
+                                    }
+                                    eprintln!("[p2p] Accepted handshake from {}", ip);
+                                } else {
+                                    break;
+                                }
                             }
                         }
                     }
+                    Message::Ping(_) | Message::Pong(_) => {}
+                    Message::GetBlocks { from_height, max_count } => {
+                        eprintln!("[p2p] recv GetBlocks from {} (inbound) from_height={} max_count={}", ip, from_height, max_count);
+                        note_block_requester(&block_requesters, &peer_label, *from_height);
+                    }
+                    _ if !handshaked => {
+                        // During reconnect storms, queued relay traffic can race
+                        // the key-exchange handshake. Drop pre-handshake payloads
+                        // instead of tearing down the socket and flapping forever.
+                        continue;
+                    }
+                    _ => {}
                 }
-                Message::Ping(_) | Message::Pong(_) => {}
-                _ if !handshaked => {
-                    eprintln!("[p2p] Message before handshake from {}", ip);
-                    break;
+                if let Message::Blocks(ref blocks) = env.msg {
+                    eprintln!("[p2p] DEBUG inbound Blocks received count={}", blocks.len());
                 }
-                _ => {}
+                let _ = tx.send(env).await;
+                count = count.saturating_add(1);
             }
-            let _ = tx.send(env).await;
-        } else {
-            eprintln!("[p2p] decode_envelope failed from {}", ip);
-            break;
         }
-        count = count.saturating_add(1);
+    }
+    if registered_peer {
+        if let Ok(mut map) = peers.lock() {
+            map.remove(&peer_label);
+        }
     }
     if handshaked {
         active_peers.fetch_sub(1, Ordering::Relaxed);
@@ -425,10 +551,11 @@ async fn handle_inbound(
 
 async fn send_to_peers(
     peers: &Arc<Mutex<HashMap<String, mpsc::Sender<Envelope>>>>,
+    block_requesters: &Arc<Mutex<VecDeque<BlockRequester>>>,
     env: &Envelope,
-    prng: &mut Prng,
+    prng: &mut LocalPrng,
 ) -> std::io::Result<()> {
-    let delay = relay_delay_ms(env.msg.clone(), prng);
+    let delay = relay_delay_ms(&env.msg, prng);
     if delay > 0 {
         sleep(Duration::from_millis(delay)).await;
     }
@@ -439,13 +566,173 @@ async fn send_to_peers(
             Vec::new()
         }
     };
+    if matches!(&env.msg, Message::GetBlocks { .. }) && !senders.is_empty() {
+        eprintln!("[p2p] DEBUG GetBlocks broadcast to {} peer(s)", senders.len());
+    }
+    if matches!(&env.msg, Message::Blocks(_)) {
+        let first_h = match &env.msg {
+            Message::Blocks(blocks) => blocks.first().map(|b| b.header.height),
+            _ => None,
+        };
+        // Consume exactly one queued requester per Blocks response so
+        // concurrent sync requests do not cross-wire ranges across peers.
+        if let Some(tx) = take_block_requester_sender(peers, block_requesters, first_h) {
+            eprintln!(
+                "[p2p] DEBUG Blocks routed to queued requester (first_h={})",
+                first_h.unwrap_or(0)
+            );
+            let env_clone = env.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(env_clone).await;
+            });
+        } else if first_h.is_some() {
+            let queued = block_requesters
+                .lock()
+                .ok()
+                .map(|q| q.len())
+                .unwrap_or(0);
+            eprintln!(
+                "[p2p] WARN dropping unrouted Blocks batch (first_h={}, queued_requesters={})",
+                first_h.unwrap_or(0),
+                queued
+            );
+        } else {
+            eprintln!("[p2p] WARN no queued requester for Blocks; falling back to broadcast");
+            for tx in senders {
+                let env_clone = env.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(env_clone).await;
+                });
+            }
+        }
+        return Ok(());
+    }
     for tx in senders {
-        let _ = tx.send(env.clone()).await;
+        let needs_delivery = matches!(
+            &env.msg,
+            Message::GetBlocks { .. }
+                | Message::Blocks(_)
+                | Message::Block(_)
+                | Message::Handshake { .. }
+                | Message::Ping(_)
+                | Message::Pong(_)
+        );
+        let env_clone = env.clone();
+        if needs_delivery {
+            // Keep sync/control traffic reliable enough to avoid startup deadlocks.
+            // Spawn the timeout wrapper so we do not block the sender multiplexing loop.
+            // If we block the loop, `rx_out` backs up and deadlocks `knox-node` core.
+            if matches!(&env.msg, Message::Blocks(_)) {
+                tokio::spawn(async move {
+                    let _ = tx.send(env_clone).await;
+                });
+            } else {
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_millis(250), tx.send(env_clone)).await;
+                });
+            }
+            continue;
+        }
+        match tx.try_send(env_clone) {
+            Ok(()) => {}
+            Err(_) => {}
+        }
     }
     Ok(())
 }
 
-fn relay_delay_ms(msg: Message, prng: &mut Prng) -> u64 {
+fn note_block_requester(
+    block_requesters: &Arc<Mutex<VecDeque<BlockRequester>>>,
+    peer: &str,
+    from_height: u64,
+) {
+    if let Ok(mut q) = block_requesters.lock() {
+        prune_stale_block_requesters(&mut q);
+        // Keep only the latest pending request per peer so stale ranges
+        // cannot be routed after a reconnect or local tip rewind.
+        q.retain(|req| req.peer != peer);
+        if q.len() >= MAX_BLOCK_REQUESTERS {
+            q.pop_front();
+        }
+        q.push_back(BlockRequester {
+            peer: peer.to_string(),
+            from_height,
+            requested_at_ms: now_ms(),
+        });
+    }
+}
+
+fn take_block_requester_sender(
+    peers: &Arc<Mutex<HashMap<String, mpsc::Sender<Envelope>>>>,
+    block_requesters: &Arc<Mutex<VecDeque<BlockRequester>>>,
+    first_h: Option<u64>,
+) -> Option<mpsc::Sender<Envelope>> {
+    let map = peers.lock().ok()?;
+    let mut q = block_requesters.lock().ok()?;
+    prune_stale_block_requesters(&mut q);
+    if let Some(first_h) = first_h {
+        let mut idx = 0usize;
+        while idx < q.len() {
+            let matched = q
+                .get(idx)
+                .map(|req| {
+                    req.from_height == first_h
+                        || req.from_height.saturating_sub(1) == first_h
+                        || first_h.saturating_sub(1) == req.from_height
+                        || (req.from_height == 0 && first_h <= 1)
+                })
+                .unwrap_or(false);
+            if matched {
+                let req = q.remove(idx);
+                if let Some(req) = req {
+                    if let Some(tx) = map.get(&req.peer) {
+                        return Some(tx.clone());
+                    }
+                }
+                continue;
+            }
+            idx = idx.saturating_add(1);
+        }
+        while let Some(req) = q.pop_front() {
+            if let Some(tx) = map.get(&req.peer) {
+                return Some(tx.clone());
+            }
+        }
+        return None;
+    }
+    while let Some(req) = q.pop_front() {
+        if let Some(tx) = map.get(&req.peer) {
+            return Some(tx.clone());
+        }
+    }
+    None
+}
+
+fn prune_stale_block_requesters(q: &mut VecDeque<BlockRequester>) {
+    let now = now_ms();
+    q.retain(|req| now.saturating_sub(req.requested_at_ms) <= BLOCK_REQUESTER_TTL_MS);
+}
+
+async fn read_envelope_from_peer(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    session_key: Option<[u8; 32]>,
+) -> Option<Envelope> {
+    let mut len_buf = [0u8; 4];
+    if reader.read_exact(&mut len_buf).await.is_err() {
+        return None;
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len == 0 || len > MAX_MESSAGE_BYTES {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    if reader.read_exact(&mut buf).await.is_err() {
+        return None;
+    }
+    decode_envelope(&buf, session_key)
+}
+
+fn relay_delay_ms(msg: &Message, prng: &mut LocalPrng) -> u64 {
     match msg {
         Message::Ping(_) | Message::Pong(_) | Message::Handshake { .. }
         | Message::GetBlocks { .. } | Message::Blocks(_) => 0,
@@ -468,22 +755,24 @@ fn spawn_peer_writer(
     peer_id: PeerId,
     seed: [u8; 32],
     local_lattice_public: Option<Vec<u8>>,
-    local_lattice_secret: Option<Vec<u8>>,
+    _local_lattice_secret: Option<Vec<u8>>,
+    local_protocol_version: u32,
+    local_genesis_hash: [u8; 32],
+    tx_in: mpsc::Sender<Envelope>,
     session_id: [u8; 16],
     next_sequence: Arc<AtomicU64>,
     active_peers: Arc<AtomicU64>,
+    block_requesters: Arc<Mutex<VecDeque<BlockRequester>>>,
 ) -> std::io::Result<()> {
     let (tx, mut rx) = mpsc::channel::<Envelope>(PEER_QUEUE_SIZE);
-    if let Ok(mut map) = peers.lock() {
-        map.insert(peer.clone(), tx);
-    }
 
     tokio::spawn(async move {
         let mut backoff = Duration::from_millis(500);
-        let mut prng = Prng::new(seed);
+        let mut prng = LocalPrng::new(seed);
         loop {
             match TcpStream::connect(&peer).await {
                 Ok(mut stream) => {
+                    let _ = stream.set_nodelay(true);
                     backoff = Duration::from_millis(500);
                     let mut nonce_seed = [0u8; 8];
                     prng.fill_bytes(&mut nonce_seed);
@@ -505,6 +794,8 @@ fn spawn_peer_writer(
                             pow_nonce,
                             lattice_ephemeral: None,
                             lattice_public: local_lattice_public.clone(),
+                            protocol_version: local_protocol_version,
+                            genesis_hash: local_genesis_hash,
                         },
                         session_id,
                         sequence: next_sequence.fetch_add(1, Ordering::Relaxed),
@@ -524,7 +815,27 @@ fn spawn_peer_writer(
                     
                     let mut peer_pub_bytes = None;
                     if let Some(env2) = decode_envelope(&buf, None) {
-                        if let Message::Handshake { lattice_public: Some(p), .. } = env2.msg {
+                        if let Message::Handshake {
+                            lattice_public: Some(p),
+                            protocol_version,
+                            genesis_hash,
+                            ..
+                        } = env2.msg
+                        {
+                            if protocol_version != local_protocol_version {
+                                eprintln!(
+                                    "[p2p] reject handshake from {}: protocol version mismatch (peer={}, local={})",
+                                    peer, protocol_version, local_protocol_version
+                                );
+                                continue;
+                            }
+                            if genesis_hash != local_genesis_hash {
+                                eprintln!(
+                                    "[p2p] reject handshake from {}: genesis hash mismatch",
+                                    peer
+                                );
+                                continue;
+                            }
                             peer_pub_bytes = Some(p);
                         }
                     }
@@ -552,6 +863,8 @@ fn spawn_peer_writer(
                             pow_nonce,
                             lattice_ephemeral: eph_pub_bytes,
                             lattice_public: local_lattice_public.clone(),
+                            protocol_version: local_protocol_version,
+                            genesis_hash: local_genesis_hash,
                         },
                         session_id,
                         sequence: next_sequence.fetch_add(1, Ordering::Relaxed),
@@ -559,16 +872,49 @@ fn spawn_peer_writer(
                     };
                     let Some(payload2) = encode_envelope(&kex, pad_bytes, &mut prng, None) else { continue; };
                     if stream.write_all(&payload2).await.is_err() { continue; }
+                    if let Ok(mut map) = peers.lock() {
+                        map.insert(peer.clone(), tx.clone());
+                    }
                     eprintln!("[p2p] Connected to {}", peer);
                     active_peers.fetch_add(1, Ordering::Relaxed);
-                    while let Some(env_to_send) = rx.recv().await {
-                        if let Some(payload) = encode_envelope(&env_to_send, pad_bytes, &mut prng, session_key) {
-                            if stream.write_all(&payload).await.is_err() {
-                                break;
+                    let (mut reader, mut writer) = stream.into_split();
+                    loop {
+                        tokio::select! {
+                            maybe_env = rx.recv() => {
+                                let Some(env_to_send) = maybe_env else { break; };
+                                if matches!(&env_to_send.msg, Message::GetBlocks { .. }) {
+                                    eprintln!("[p2p] DEBUG writing GetBlocks to wire peer={}", peer);
+                                }
+                                if let Some(payload) = encode_envelope(&env_to_send, pad_bytes, &mut prng, session_key) {
+                                    if writer.write_all(&payload).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            inbound = read_envelope_from_peer(&mut reader, session_key) => {
+                                let Some(env) = inbound else { break; };
+                                if let Message::GetBlocks { from_height, .. } = &env.msg {
+                                    note_block_requester(&block_requesters, &peer, *from_height);
+                                }
+                                if let Message::Blocks(ref blocks) = env.msg {
+                                    let first_h = blocks.first().map(|b| b.header.height).unwrap_or(0);
+                                    let last_h = blocks.last().map(|b| b.header.height).unwrap_or(0);
+                                    eprintln!(
+                                        "[p2p] DEBUG Blocks received from peer {} (count={}, first_h={}, last_h={}) (forwarding to core)",
+                                        peer,
+                                        blocks.len(),
+                                        first_h,
+                                        last_h
+                                    );
+                                }
+                                let _ = tx_in.send(env).await;
                             }
                         }
                     }
                     eprintln!("[p2p] Reconnecting to {}", peer);
+                    if let Ok(mut map) = peers.lock() {
+                        map.remove(&peer);
+                    }
                     active_peers.fetch_sub(1, Ordering::Relaxed);
                 }
                 Err(_) => {
@@ -584,38 +930,41 @@ fn spawn_peer_writer(
 fn encode_envelope(
     env: &Envelope,
     pad_to: usize,
-    prng: &mut Prng,
+    prng: &mut LocalPrng,
     psk: Option<[u8; 32]>,
 ) -> Option<Vec<u8>> {
     let mut bytes = bincode::encode_to_vec(env, bincode::config::standard()).ok()?;
     if bytes.len() < pad_to {
         let pad_len = pad_to - bytes.len();
-        let mut pad = vec![0u8; pad_len];
-        prng.fill_bytes(&mut pad);
-        bytes.extend_from_slice(&pad);
+        let start = bytes.len();
+        bytes.resize(bytes.len() + pad_len, 0);
+        prng.fill_bytes(&mut bytes[start..]);
     }
     let framed = if let Some(psk_key) = psk {
-        let cipher = XChaCha20Poly1305::new_from_slice(&psk_key).ok()?;
         let mut nonce = [0u8; 24];
-        os_random_bytes(&mut nonce).ok()?;
-        let ciphertext = cipher
-            .encrypt(XNonce::from_slice(&nonce), bytes.as_ref())
-            .ok()?;
-        let mut f = Vec::with_capacity(1 + nonce.len() + ciphertext.len());
+        fill_os_random(&mut nonce).ok()?;
+        
+        // In-place encryption to avoid 50MB allocations
+        let ciphertext = stream_xor(&psk_key, &nonce, &bytes);
+        let tag = envelope_auth_tag(&psk_key, &nonce, &ciphertext);
+        
+        let mut f = Vec::with_capacity(4 + 1 + nonce.len() + tag.len() + ciphertext.len());
+        f.extend_from_slice(&((1 + nonce.len() + tag.len() + ciphertext.len()) as u32).to_le_bytes());
         f.push(FRAME_ENCRYPTED);
         f.extend_from_slice(&nonce);
+        f.extend_from_slice(&tag);
         f.extend_from_slice(&ciphertext);
-        f
+        return Some(f);
     } else {
-        let mut f = Vec::with_capacity(1 + bytes.len());
+        if !matches!(env.msg, Message::Handshake { .. }) {
+            return None;
+        }
+        let mut f = Vec::with_capacity(4 + 1 + bytes.len());
+        f.extend_from_slice(&((1 + bytes.len()) as u32).to_le_bytes());
         f.push(FRAME_PLAINTEXT);
         f.extend_from_slice(&bytes);
-        f
+        return Some(f);
     };
-    let mut out = Vec::with_capacity(4 + framed.len());
-    out.extend_from_slice(&(framed.len() as u32).to_le_bytes());
-    out.extend_from_slice(&framed);
-    Some(out)
 }
 
 fn decode_envelope(frame: &[u8], psk: Option<[u8; 32]>) -> Option<Envelope> {
@@ -627,201 +976,61 @@ fn decode_envelope(frame: &[u8], psk: Option<[u8; 32]>) -> Option<Envelope> {
         (FRAME_PLAINTEXT, None) => frame[1..].to_vec(),
         (FRAME_PLAINTEXT, Some(_)) => return None,
         (FRAME_ENCRYPTED, Some(psk_key)) => {
-            if frame.len() < 1 + 24 {
+            if frame.len() < 1 + 24 + 16 {
                 return None;
             }
             let nonce = &frame[1..25];
-            let ciphertext = &frame[25..];
-            let cipher = XChaCha20Poly1305::new_from_slice(&psk_key).ok()?;
-            cipher.decrypt(XNonce::from_slice(nonce), ciphertext).ok()?
+            let tag = &frame[25..41];
+            let ciphertext = &frame[41..];
+            let mut nonce_arr = [0u8; 24];
+            nonce_arr.copy_from_slice(nonce);
+            let expected_tag = envelope_auth_tag(&psk_key, &nonce_arr, ciphertext);
+            if tag.ct_eq(&expected_tag).unwrap_u8() == 0 {
+                return None;
+            }
+            stream_xor(&psk_key, &nonce_arr, ciphertext)
         }
         (FRAME_ENCRYPTED, None) => return None,
         _ => return None,
     };
-    bincode::decode_from_slice::<Envelope, _>(&payload, bincode::config::standard().with_limit::<{ 32 * 1024 * 1024 }>())
-        .ok()
-        .map(|(env, _)| env)
+    let env = bincode::decode_from_slice::<Envelope, _>(
+        &payload,
+        bincode::config::standard().with_limit::<{ MAX_ENVELOPE_DECODE_BYTES }>(),
+    )
+    .ok()?
+    .0;
+    if mode == FRAME_PLAINTEXT && !matches!(env.msg, Message::Handshake { .. }) {
+        return None;
+    }
+    Some(env)
 }
 
-fn load_psk_from_keyring() -> Result<Option<[u8; 32]>, String> {
-    let is_mainnet_locked =
-        std::env::var("KNOX_MAINNET_LOCK").ok().as_deref() == Some("1");
-
-    // Direct PSK via env var: KNOX_P2P_PSK=<64-hex-chars>
-    // Forbidden in mainnet-lock mode (use OS keyring or file for validators).
-    if !is_mainnet_locked {
-        if let Ok(hex) = std::env::var("KNOX_P2P_PSK") {
-            let hex = hex.trim();
-            if !hex.is_empty() {
-                return Ok(Some(parse_hex_32(hex).map_err(|e| {
-                    format!("KNOX_P2P_PSK contains invalid content: {e}")
-                })?));
-            }
-        }
+fn stream_xor(key: &[u8; 32], nonce: &[u8; 24], input: &[u8]) -> Vec<u8> {
+    let mut hasher = Hasher::new_keyed(key);
+    hasher.update(b"knox-p2p-lattice-stream-v1");
+    hasher.update(nonce);
+    let mut reader = hasher.finalize_xof();
+    
+    let mut out = vec![0u8; input.len()];
+    reader.fill(&mut out);
+    
+    for (out_byte, in_byte) in out.iter_mut().zip(input.iter()) {
+        *out_byte ^= *in_byte;
     }
-
-    // KNOX_P2P_ALLOW_PLAINTEXT is honoured in all build modes (including
-    // release) as long as mainnet lock is not active.  This is required for
-    // desktop wallet nodes that cannot store a PSK in the OS keyring yet.
-    let allow_plain = !is_mainnet_locked
-        && std::env::var("KNOX_P2P_ALLOW_PLAINTEXT")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-
-    let service = std::env::var("KNOX_P2P_PSK_SERVICE").unwrap_or_else(|_| "knox-p2p".to_string());
-    let account = std::env::var("KNOX_P2P_PSK_ACCOUNT").unwrap_or_else(|_| "mainnet".to_string());
-    let secret = match read_keyring_secret(&service, &account) {
-        Ok(v) => v,
-        Err(keyring_err) => {
-            // On headless Linux servers the GUI keyring daemon is unavailable.
-            // Before giving up, check for a hardcoded file-based PSK at the
-            // well-known path /etc/knox/p2p-psk.  The file fallback is
-            // intentionally Linux-only — macOS and Windows keyring works fine
-            // in server contexts and does not need this path.
-            #[cfg(target_os = "linux")]
-            {
-                use std::os::unix::fs::PermissionsExt;
-
-                const PSK_FILE: &str = "/etc/knox/p2p-psk";
-
-                // Use symlink_metadata so we inspect the path itself, not a
-                // target — a symlink must never be accepted.
-                match std::fs::symlink_metadata(PSK_FILE) {
-                    Err(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
-                        // File absent — fall through to the keyring error below.
-                    }
-                    Err(io_err) => {
-                        return Err(format!(
-                            "PSK file {PSK_FILE} could not be accessed: {io_err}"
-                        ));
-                    }
-                    Ok(meta) => {
-                        // Reject symlinks outright.
-                        if meta.file_type().is_symlink() {
-                            return Err(format!(
-                                "PSK file {PSK_FILE} must be a regular file, not a symlink"
-                            ));
-                        }
-                        if !meta.file_type().is_file() {
-                            return Err(format!(
-                                "PSK file {PSK_FILE} must be a regular file"
-                            ));
-                        }
-                        // Enforce strict 0400 permissions so the key is never
-                        // world- or group-readable.
-                        let mode = meta.permissions().mode() & 0o777;
-                        if mode != 0o400 {
-                            return Err(format!(
-                                "PSK file {PSK_FILE} has permissions {mode:04o}; \
-                                 it must be mode 0400 (chmod 0400 {PSK_FILE})"
-                            ));
-                        }
-                        // Read, trim, and parse the 64-character hex PSK.
-                        let raw = std::fs::read_to_string(PSK_FILE).map_err(|io_err| {
-                            format!("failed to read PSK file {PSK_FILE}: {io_err}")
-                        })?;
-                        let trimmed = raw.trim();
-                        return Ok(Some(parse_hex_32(trimmed).map_err(|hex_err| {
-                            format!("PSK file {PSK_FILE} contains invalid content: {hex_err}")
-                        })?));
-                    }
-                }
-            }
-
-            if allow_plain {
-                return Ok(None);
-            }
-            return Err(format!(
-                "unable to read KNOX P2P PSK from OS keyring ({keyring_err}); \
-                 install secret-tool and store PSK, or place 64-hex PSK in \
-                 /etc/knox/p2p-psk with mode 0400"
-            ));
-        }
-    };
-    let trimmed = secret.trim();
-    if trimmed.is_empty() {
-        if allow_plain {
-            return Ok(None);
-        }
-        return Err("empty keyring secret for KNOX P2P PSK".to_string());
-    }
-    Ok(Some(parse_hex_32(trimmed)?))
+    
+    out
 }
 
-fn read_keyring_secret(service: &str, account: &str) -> Result<String, String> {
-    #[cfg(target_os = "linux")]
-    {
-        let out = Command::new("secret-tool")
-            .arg("lookup")
-            .arg("service")
-            .arg(service)
-            .arg("account")
-            .arg(account)
-            .output()
-            .map_err(|e| format!("secret-tool execution failed: {e}"))?;
-        if !out.status.success() {
-            return Err("secret-tool lookup returned non-zero status".to_string());
-        }
-        return Ok(String::from_utf8_lossy(&out.stdout).to_string());
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let out = Command::new("security")
-            .arg("find-generic-password")
-            .arg("-s")
-            .arg(service)
-            .arg("-a")
-            .arg(account)
-            .arg("-w")
-            .output()
-            .map_err(|e| format!("security command failed: {e}"))?;
-        if !out.status.success() {
-            return Err("security keychain lookup returned non-zero status".to_string());
-        }
-        return Ok(String::from_utf8_lossy(&out.stdout).to_string());
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let script = format!(
-            "$pw=(Get-StoredCredential -Target '{service}:{account}').Password; if($pw){{Write-Output $pw}}"
-        );
-        let out = Command::new("powershell")
-            .arg("-NoProfile")
-            .arg("-Command")
-            .arg(script)
-            .output()
-            .map_err(|e| format!("powershell execution failed: {e}"))?;
-        if !out.status.success() {
-            return Err("powershell keyring lookup returned non-zero status".to_string());
-        }
-        return Ok(String::from_utf8_lossy(&out.stdout).to_string());
-    }
-    #[allow(unreachable_code)]
-    Err("OS keyring integration is not supported on this platform".to_string())
-}
-
-fn parse_hex_32(raw: &str) -> Result<[u8; 32], String> {
-    if raw.len() != 64 {
-        return Err("PSK must be exactly 64 hex characters".to_string());
-    }
-    let mut out = [0u8; 32];
-    let bytes = raw.as_bytes();
-    for i in 0..32 {
-        let hi = from_hex(bytes[i * 2])?;
-        let lo = from_hex(bytes[i * 2 + 1])?;
-        out[i] = (hi << 4) | lo;
-    }
-    Ok(out)
-}
-
-fn from_hex(c: u8) -> Result<u8, String> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err("PSK contains invalid hex character".to_string()),
-    }
+fn envelope_auth_tag(key: &[u8; 32], nonce: &[u8; 24], cipher: &[u8]) -> [u8; 16] {
+    let mut hasher = Hasher::new_keyed(key);
+    hasher.update(b"knox-p2p-lattice-auth-v1");
+    hasher.update(nonce);
+    hasher.update(&(cipher.len() as u32).to_le_bytes());
+    hasher.update(cipher);
+    let digest = hasher.finalize();
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&digest.as_bytes()[..16]);
+    tag
 }
 
 fn check_pow(peer_id: PeerId, nonce: u64) -> bool {
@@ -1008,7 +1217,7 @@ mod tests {
     fn relay_delay_within_bounds_for_payload_messages() {
         let mut seed = [0u8; 32];
         seed[0] = 7;
-        let mut prng = Prng::new(seed);
+        let mut prng = LocalPrng::new(seed);
         for _ in 0..512 {
             let d = relay_delay_ms(&Message::Cover(vec![1, 2, 3]), &mut prng);
             assert!(d >= P2P_RELAY_DELAY_MIN_MS);
@@ -1018,7 +1227,7 @@ mod tests {
 
     #[test]
     fn relay_delay_zero_for_handshake_class() {
-        let mut prng = Prng::new([9u8; 32]);
+        let mut prng = LocalPrng::new([9u8; 32]);
         assert_eq!(relay_delay_ms(&Message::Ping(1), &mut prng), 0);
         assert_eq!(relay_delay_ms(&Message::Pong(1), &mut prng), 0);
         assert_eq!(
@@ -1027,6 +1236,10 @@ mod tests {
                     peer_id: PeerId([0u8; 32]),
                     tip: 0,
                     pow_nonce: 0,
+                    lattice_ephemeral: None,
+                    lattice_public: None,
+                    protocol_version: 1,
+                    genesis_hash: [0u8; 32],
                 },
                 &mut prng
             ),
@@ -1043,5 +1256,24 @@ mod tests {
         assert!(!rp.allow(sid, 2, 102));
         assert!(!rp.allow(sid, 1, 103));
         assert!(rp.allow(sid, 3, 104));
+    }
+    #[test]
+    fn test_encode_duration() {
+        use std::time::Instant;
+        let mut prng = LocalPrng::new([0u8; 32]);
+        let pad_bytes = 1024;
+        let psk = Some([1u8; 32]);
+        let mut huge_data = vec![0u8; 50 * 1024 * 1024];
+        let env = Envelope {
+            msg: Message::Cover(huge_data.clone()),
+            session_id: [0u8; 16],
+            sequence: 1,
+            padding: Vec::new(),
+            };
+        println!("Start encode");
+        let t0 = Instant::now();
+        let encoded = encode_envelope(&env, pad_bytes, &mut prng, psk);
+        let el = t0.elapsed();
+        println!("Encoded in {:?} (bytes: {})", el, encoded.map(|v| v.len()).unwrap_or(0));
     }
 }

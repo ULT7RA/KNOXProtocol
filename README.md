@@ -1,5 +1,3 @@
-> **MAINTENANCE IN PROGRESS** — Actively fixing bugs and deploying updates. Network may be intermittent. Stand by.
-
 # KNOX Protocol
 
 **The world's first fully end-to-end lattice-based privacy blockchain.**
@@ -95,14 +93,14 @@ cargo zigbuild -p knox-node --target x86_64-unknown-linux-musl --profile release
 ## Run a Node (CLI)
 
 ```sh
-# Full validator node with mining
-cargo run -p knox-node -- ./data 0.0.0.0:9735 0.0.0.0:9736 127.0.0.1:9735 ./data/validators.txt
+# Full node with mining (open-mining runtime)
+cargo run -p knox-node -- ./data 0.0.0.0:9735 0.0.0.0:9736 127.0.0.1:9735 <miner_knox1_address>
 
 # Sync only
-KNOX_NODE_NO_MINE=1 cargo run -p knox-node -- ./data 0.0.0.0:9735 0.0.0.0:9736 127.0.0.1:9735 ./data/validators.txt
+KNOX_NODE_NO_MINE=1 cargo run -p knox-node -- ./data 0.0.0.0:9735 0.0.0.0:9736 127.0.0.1:9735 <miner_knox1_address>
 ```
 
-`validators.txt` contains hex-encoded lattice consensus public keys, one per line.
+`validators.txt` is only a legacy/back-compat argument slot; current runtime is open-mining and does not require a validator file.
 
 ---
 
@@ -113,7 +111,7 @@ KNOX_NODE_NO_MINE=1 cargo run -p knox-node -- ./data 0.0.0.0:9735 0.0.0.0:9736 1
 | `knox-types` | Wire types and protocol constants |
 | `knox-lattice` | ULT7Rock lattice core: ring sigs, commitments, range proofs, stealth, PoW, surge |
 | `knox-storage` | Encrypted flat-file key-value store |
-| `knox-consensus` | PulsarBFT consensus engine |
+| `knox-consensus` | Lattice consensus primitives (runtime currently uses open-mining with optional Diamond Auth) |
 | `knox-ledger` | Block and UTXO validation and storage |
 | `knox-p2p` | Lattice two-round KEM handshake, authenticated encrypted transport, cover traffic |
 | `knox-core` | Node runtime: mempool, RPC server, block production |
