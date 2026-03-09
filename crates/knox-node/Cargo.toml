@@ -1,14 +1,19 @@
 [package]
 name = "knox-node"
-version = "1.2.6"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "make_genesis"
+path = "src/bin/make_genesis.rs"
+
 [dependencies]
+blake3.workspace = true
+getrandom.workspace = true
 knox-core = { path = "../knox-core" }
 knox-consensus = { path = "../knox-consensus" }
 knox-p2p = { path = "../knox-p2p" }
-knox-crypto = { path = "../knox-crypto" }
 knox-lattice = { path = "../knox-lattice" }
 knox-types = { path = "../knox-types" }
 knox-ledger = { path = "../knox-ledger" }

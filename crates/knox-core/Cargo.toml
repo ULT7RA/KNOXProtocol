@@ -5,12 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3.workspace = true
 bincode.workspace = true
-curve25519-dalek.workspace = true
+getrandom.workspace = true
 knox-consensus = { path = "../knox-consensus" }
 knox-ledger = { path = "../knox-ledger" }
 knox-lattice = { path = "../knox-lattice" }
 knox-p2p = { path = "../knox-p2p" }
 knox-types = { path = "../knox-types" }
-knox-crypto = { path = "../knox-crypto" }
 tokio.workspace = true

@@ -7,7 +7,6 @@ license.workspace = true
 [features]
 default = []
 types = ["knox-types"]
-crypto = ["knox-crypto"]
 consensus = ["knox-consensus"]
 ledger = ["knox-ledger"]
 p2p = ["knox-p2p"]
@@ -16,7 +15,6 @@ tokio = ["dep:tokio"]
 
 [dependencies]
 knox-types = { path = "../knox-types", optional = true }
-knox-crypto = { path = "../knox-crypto", optional = true }
 knox-consensus = { path = "../knox-consensus", optional = true }
 knox-ledger = { path = "../knox-ledger", optional = true }
 knox-p2p = { path = "../knox-p2p", optional = true }

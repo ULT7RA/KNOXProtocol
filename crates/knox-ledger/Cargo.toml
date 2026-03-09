@@ -6,8 +6,6 @@ license.workspace = true
 
 [dependencies]
 bincode.workspace = true
-curve25519-dalek.workspace = true
 knox-storage = { path = "../knox-storage" }
 knox-types = { path = "../knox-types" }
-knox-crypto = { path = "../knox-crypto" }
 knox-lattice = { path = "../knox-lattice" }

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-knox-crypto = { path = "../knox-crypto" }
+blake3.workspace = true
+getrandom.workspace = true
 knox-lattice = { path = "../knox-lattice" }
 knox-types = { path = "../knox-types" }

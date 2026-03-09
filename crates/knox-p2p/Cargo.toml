@@ -8,7 +8,7 @@ license.workspace = true
 blake3.workspace = true
 bincode.workspace = true
 knox-types = { path = "../knox-types" }
-knox-crypto = { path = "../knox-crypto" }
 knox-lattice = { path = "../knox-lattice" }
 tokio.workspace = true
-chacha20poly1305.workspace = true
+getrandom.workspace = true
+subtle.workspace = true
