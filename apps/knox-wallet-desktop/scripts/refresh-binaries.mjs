@@ -9,6 +9,11 @@ const appRoot = path.resolve(__dirname, '..');
 const repoRoot = path.resolve(appRoot, '..', '..');
 const outDir = path.join(appRoot, 'bin');
 const exeExt = process.platform === 'win32' ? '.exe' : '';
+const staleBuildDirs = [
+  path.join(appRoot, 'dist'),
+  path.join(appRoot, 'out'),
+  path.join(appRoot, 'win-unpacked')
+];
 
 const targets = [
   { pkg: 'knox-node', bin: 'knox-node', outName: `knox-node${exeExt}` },
@@ -34,12 +39,35 @@ function resolveBuiltBinary(binName) {
   throw new Error(`built binary not found for ${binName}; looked in ${candidates.join(', ')}`);
 }
 
+function purgeStaleOutputs() {
+  console.log('[binaries] purging stale desktop artifacts...');
+  for (const dir of staleBuildDirs) {
+    if (fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      console.log(`[binaries] removed ${path.relative(repoRoot, dir)}`);
+    }
+  }
+
+  fs.mkdirSync(outDir, { recursive: true });
+  for (const name of fs.readdirSync(outDir)) {
+    const full = path.join(outDir, name);
+    const st = fs.statSync(full);
+    if (!st.isFile()) continue;
+    // Keep only non-binary assets (for example certs in subdirectories).
+    if (/\.(exe|dll|pdb)$/i.test(name)) {
+      fs.rmSync(full, { force: true });
+      console.log(`[binaries] removed stale ${path.relative(repoRoot, full)}`);
+    }
+  }
+}
+
+purgeStaleOutputs();
+
 console.log('[binaries] building desktop runtime binaries...');
 for (const t of targets) {
   run('cargo', ['build', '-p', t.pkg, '--bin', t.bin, '--profile', 'release-lite'], repoRoot);
 }
 
-fs.mkdirSync(outDir, { recursive: true });
 console.log('[binaries] refreshing apps/knox-wallet-desktop/bin ...');
 for (const t of targets) {
   const src = resolveBuiltBinary(t.bin);
