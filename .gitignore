@@ -21,6 +21,9 @@ apps/**/out/
 apps/**/bin/
 apps/**/build/
 apps/**/win-unpacked/
+apps/knox-wallet-desktop/renderer/bundle.css
+apps/knox-wallet-desktop/renderer/bundle.js
+apps/knox-wallet-desktop/renderer/knoc-*.png
 fuzz/target/
 fuzz/corpus/
 
@@ -47,3 +50,7 @@ Oracle VM Consensus Split Resolution Plan.pdf
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Keep ops runbooks/scripts out of public repo
+scripts/
+docs/ANTI_COMPACT_MEMORY.md
