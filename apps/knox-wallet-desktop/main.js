@@ -91,9 +91,9 @@ const DEFAULT_PUBLIC_RPC_CANDIDATES = (() => {
   return raw.length ? raw : [DEFAULT_RPC_FALLBACK];
 })();
 const DEFAULT_MAINNET_GENESIS_HASH = 'd626848546f6511abd38a1ee89610a708d001d53e0c8a27dc509a1e65b964187';
-const DESKTOP_APP_VERSION = '1.3.16';
+const DESKTOP_APP_VERSION = '1.3.17';
 const MIN_SUPPORTED_INSTALLER_VERSION =
-  '1.3.16';
+  '1.3.17';
 const MIN_SUPPORTED_P2P_PROTOCOL_VERSION = 2;
 const RPC_UPSTREAM = normalizeRpcEndpoint(
   ALLOW_NETWORK_ENV_OVERRIDES ? process.env.KNOX_PUBLIC_RPC_ADDR : '',
@@ -1817,11 +1817,19 @@ function saveMiningConfig(incoming) {
 }
 
 function nodeDesktopEnv(mine, profile = null, minLocalHeightForMining = 0, minerAddress = '') {
+  const upstreamRpcCandidate = normalizeRpcEndpoint(
+    String(walletdRpcTarget || RPC_UPSTREAM || '').trim(),
+    ''
+  );
+  const safeNodeUpstreamRpc = (
+    upstreamRpcCandidate
+    && upstreamRpcCandidate !== LOCAL_NODE_RPC
+  ) ? upstreamRpcCandidate : '';
+
   const env = {
     KNOX_NODE_NO_MINE: mine ? '0' : '1',
     KNOX_P2P_PSK_SERVICE: process.env.KNOX_P2P_PSK_SERVICE || 'knox-p2p',
     KNOX_P2P_PSK_ACCOUNT: process.env.KNOX_P2P_PSK_ACCOUNT || 'desktop-local',
-    KNOX_NODE_UPSTREAM_RPC: String(walletdRpcTarget || RPC_UPSTREAM || '').trim(),
     // Improve catch-up throughput for fresh users.
     KNOX_SYNC_BLOCKS_RESPONSE_MAX_BYTES: String(128 * 1024 * 1024),
     // Keep sync polling tight so out-of-window batches do not stall for long.
@@ -1831,6 +1839,9 @@ function nodeDesktopEnv(mine, profile = null, minLocalHeightForMining = 0, miner
     KNOX_NODE_UPSTREAM_SYNC_TIMEOUT_MS: String(DESKTOP_UPSTREAM_SYNC_TIMEOUT_MS),
     KNOX_TRUST_SYNC_BLOCKS: '1'
   };
+  if (safeNodeUpstreamRpc) {
+    env.KNOX_NODE_UPSTREAM_RPC = safeNodeUpstreamRpc;
+  }
   if (MAINNET_LOCKED) {
     env.KNOX_MAINNET_LOCK = '1';
     const premineAddress =
