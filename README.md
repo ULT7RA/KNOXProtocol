@@ -1,5 +1,4 @@
-> [!WARNING]
-> Working out bugs in wallet.MSI/Docker releases live, dont use.
+
 
 # KNOX Protocol
 
