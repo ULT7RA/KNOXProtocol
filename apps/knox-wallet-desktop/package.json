@@ -7,10 +7,11 @@
   "license": "UNLICENSED",
   "scripts": {
     "ensure:icon": "node scripts/ensure-build-icon.mjs",
+    "refresh:binaries": "node scripts/refresh-binaries.mjs",
     "renderer:build": "node scripts/build-renderer.mjs",
     "start": "npm run renderer:build && electron .",
     "dev": "npm run renderer:build && electron .",
-    "predist": "npm run ensure:icon",
+    "predist": "npm run ensure:icon && npm run refresh:binaries",
     "dist": "npm run renderer:build && electron-builder --win msi",
     "build": "npm run dist"
   },

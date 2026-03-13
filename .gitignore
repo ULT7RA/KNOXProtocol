@@ -52,7 +52,7 @@ Oracle VM Consensus Split Resolution Plan.pdf
 Thumbs.db
 
 # Keep ops runbooks/scripts out of public repo
-scripts/
+/scripts/
 docs/ANTI_COMPACT_MEMORY.md
 
 # Local-only sensitive/working notes
