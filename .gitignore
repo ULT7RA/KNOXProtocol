@@ -54,3 +54,14 @@ Thumbs.db
 # Keep ops runbooks/scripts out of public repo
 scripts/
 docs/ANTI_COMPACT_MEMORY.md
+
+# Local-only sensitive/working notes
+AGENT_MEMORY.md
+SSH.txt
+knox_premine_backup.txt
+debug_ledger/
+tmp-wallet-tests/
+tmp_*.ps1
+/--help
+.claude/
+.idea/
