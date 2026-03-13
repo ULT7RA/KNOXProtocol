@@ -55,7 +55,7 @@ const DEFAULT_PUBLIC_P2P_SEEDS = String(process.env.KNOX_DEFAULT_PUBLIC_P2P_SEED
   .filter(Boolean);
 const DEFAULT_RPC_FALLBACK = normalizeRpcEndpoint(
   process.env.KNOX_DEFAULT_PUBLIC_RPC || '',
-  '127.0.0.1:9736'
+  '127.0.0.1:19736'
 );
 
 function splitRpcEndpoint(ep) {
