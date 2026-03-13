@@ -37,6 +37,11 @@ const KEY_PATH = path.join(CERT_DIR, 'walletd.key');
 const MAINNET_LOCKED = app.isPackaged || /^(1|true|yes)$/i.test(
   String(process.env.KNOX_MAINNET_LOCK || '0')
 );
+// Safety default: never rewrite an existing wallet file because of transient
+// CLI parse failures. This can be re-enabled explicitly for emergency recovery.
+const AUTO_IMPORT_ON_ADDRESS_PARSE_FAILURE = /^(1|true|yes)$/i.test(
+  String(process.env.KNOX_AUTO_IMPORT_ON_ADDRESS_PARSE_FAILURE || '0')
+);
 const NETWORK_ENV_OVERRIDE_REQUESTED = /^(1|true|yes)$/i.test(
   String(process.env.KNOX_DESKTOP_ALLOW_NETWORK_ENV_OVERRIDE || '0')
 );
@@ -705,8 +710,18 @@ async function ensureWalletExists() {
   return runCli(['create', WALLET_PATH]);
 }
 
-async function autoImportNodeKey() {
+async function autoImportNodeKey(opts = {}) {
+  const allowOverwrite = !!opts.allowOverwrite;
+  const trigger = String(opts.trigger || 'auto').trim() || 'auto';
   if (!fs.existsSync(NODE_KEY_PATH)) return { ok: false, error: 'node key not found' };
+  if (fs.existsSync(WALLET_PATH)) {
+    const sz = Number(fs.statSync(WALLET_PATH).size || 0);
+    if (sz > 0 && !allowOverwrite) {
+      const msg = 'refusing auto-import over existing wallet (set KNOX_AUTO_IMPORT_ON_ADDRESS_PARSE_FAILURE=1 to allow)';
+      appendLog(mainWindow, `[wallet] ${msg}; trigger=${trigger}; wallet=${WALLET_PATH}`);
+      return { ok: false, error: msg };
+    }
+  }
   const backup = backupWalletSnapshot(mainWindow, 'auto-import-node-key', { minIntervalMs: 10 * 60 * 1000 });
   if (!backup.ok) return backup;
   return runCli(['import-node-key', NODE_KEY_PATH, WALLET_PATH]);
@@ -1308,15 +1323,19 @@ async function walletInfoFromCli() {
   if (!addresses.length && address) addresses.push(address);
 
   if (!address && !addresses.length) {
-    const imported = await autoImportNodeKey();
-    if (imported.ok) {
-      const retryAddr = await runCli(['address', WALLET_PATH]);
-      const retryText = String(retryAddr?.result || '');
-      const mRetry = retryText.match(/knox1[a-f0-9]{32,}/i);
-      if (mRetry) {
-        address = mRetry[0];
-        addresses.push(address);
+    if (AUTO_IMPORT_ON_ADDRESS_PARSE_FAILURE) {
+      const imported = await autoImportNodeKey({ allowOverwrite: false, trigger: 'walletInfoFromCli' });
+      if (imported.ok) {
+        const retryAddr = await runCli(['address', WALLET_PATH]);
+        const retryText = String(retryAddr?.result || '');
+        const mRetry = retryText.match(/knox1[a-f0-9]{32,}/i);
+        if (mRetry) {
+          address = mRetry[0];
+          addresses.push(address);
+        }
       }
+    } else {
+      appendLog(mainWindow, '[wallet] address parse failed; auto-import disabled');
     }
   }
 
@@ -1384,10 +1403,14 @@ async function walletIndexedAddressesFromCli() {
   let result = out.ok ? parseCliAddressLines(out.result) : [];
 
   if (!result.length) {
-    const imported = await autoImportNodeKey();
-    if (imported.ok) {
-      out = await runCli(['addresses', WALLET_PATH]);
-      result = out.ok ? parseCliAddressLines(out.result) : [];
+    if (AUTO_IMPORT_ON_ADDRESS_PARSE_FAILURE) {
+      const imported = await autoImportNodeKey({ allowOverwrite: false, trigger: 'walletIndexedAddressesFromCli' });
+      if (imported.ok) {
+        out = await runCli(['addresses', WALLET_PATH]);
+        result = out.ok ? parseCliAddressLines(out.result) : [];
+      }
+    } else {
+      appendLog(mainWindow, '[wallet] addresses parse failed; auto-import disabled');
     }
   }
 
