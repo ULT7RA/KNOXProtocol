@@ -340,6 +340,7 @@ let upstreamFailureFirstAtMs = 0;
 let upstreamSafetyDisabledNoticeAtMs = 0;
 let walletdFailoverCooldownUntilMs = 0;
 let walletdSwitchPromise = null;
+let walletdAutoRecoverPromise = null;
 let miningSafetyTripped = false;
 let lastUpstreamTipSeen = 0;
 let lastTipRegressionLogMs = 0;
@@ -1421,71 +1422,93 @@ async function walletIndexedAddressesFromCli() {
   return { ok: true, result };
 }
 
-function walletdCall(pathname, body, options = {}) {
+async function walletdCall(pathname, body, options = {}) {
   // Give walletd more headroom under load so transient RPC latency does not look like a disconnect.
   const timeoutMs = Math.max(1000, Number(options.timeoutMs || 10000));
-  return new Promise((resolve) => {
-    const [host, portStr] = WALLETD_BIND.split(':');
-    const ca = readWalletdCa();
-    if (!ca) {
-      resolve({ ok: false, error: 'walletd TLS cert missing; run Generate TLS' });
-      return;
-    }
-    const hostLower = String(host || 'localhost').toLowerCase();
-    const isLocal = hostLower === '127.0.0.1' || hostLower === 'localhost' || hostLower === '::1';
-    const servername = isLocal ? undefined : (hostLower === '127.0.0.1' || hostLower === '::1') ? 'localhost' : hostLower;
+  const suppressAutoRecover = !!options.suppressAutoRecover;
+  const retryOnRefused = options.retryOnRefused !== false;
 
-    const req = https.request(
-      {
-        host,
-        port: Number(portStr),
-        path: pathname,
-        method: body ? 'POST' : 'GET',
-        rejectUnauthorized: !isLocal,
-        ca,
-        minVersion: 'TLSv1.2',
-        servername: servername,
-        headers: {
-          'Authorization': `Bearer ${TOKEN}`,
-          'Content-Type': 'application/json'
-        }
-      },
-      (res) => {
-        let raw = '';
-        res.on('data', (d) => (raw += String(d)));
-        res.on('end', () => {
-          try {
-            const parsed = raw ? JSON.parse(raw) : {};
-            const httpOk = res.statusCode >= 200 && res.statusCode < 300;
-            // walletd wraps payloads as { ok, result, error }; flatten here for renderer.
-            if (
-              parsed &&
-              typeof parsed === 'object' &&
-              Object.prototype.hasOwnProperty.call(parsed, 'ok') &&
-              Object.prototype.hasOwnProperty.call(parsed, 'result')
-            ) {
-              resolve({
-                ok: httpOk && !!parsed.ok,
-                status: res.statusCode,
-                result: parsed.result,
-                error: parsed.error || raw || `http ${res.statusCode}`
-              });
-              return;
-            }
-            resolve({ ok: httpOk, status: res.statusCode, result: parsed, error: parsed.error || raw || `http ${res.statusCode}` });
-          } catch {
-            resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, result: raw, error: raw || `http ${res.statusCode}` });
-          }
-        });
+  const callOnce = () =>
+    new Promise((resolve) => {
+      const [host, portStr] = WALLETD_BIND.split(':');
+      const ca = readWalletdCa();
+      if (!ca) {
+        resolve({ ok: false, error: 'walletd TLS cert missing; run Generate TLS' });
+        return;
       }
-    );
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error('walletd request timeout'));
+      const hostLower = String(host || 'localhost').toLowerCase();
+      const isLocal = hostLower === '127.0.0.1' || hostLower === 'localhost' || hostLower === '::1';
+      const servername = isLocal ? undefined : (hostLower === '127.0.0.1' || hostLower === '::1') ? 'localhost' : hostLower;
+
+      const req = https.request(
+        {
+          host,
+          port: Number(portStr),
+          path: pathname,
+          method: body ? 'POST' : 'GET',
+          rejectUnauthorized: !isLocal,
+          ca,
+          minVersion: 'TLSv1.2',
+          servername: servername,
+          headers: {
+            'Authorization': `Bearer ${TOKEN}`,
+            'Content-Type': 'application/json'
+          }
+        },
+        (res) => {
+          let raw = '';
+          res.on('data', (d) => (raw += String(d)));
+          res.on('end', () => {
+            try {
+              const parsed = raw ? JSON.parse(raw) : {};
+              const httpOk = res.statusCode >= 200 && res.statusCode < 300;
+              // walletd wraps payloads as { ok, result, error }; flatten here for renderer.
+              if (
+                parsed &&
+                typeof parsed === 'object' &&
+                Object.prototype.hasOwnProperty.call(parsed, 'ok') &&
+                Object.prototype.hasOwnProperty.call(parsed, 'result')
+              ) {
+                resolve({
+                  ok: httpOk && !!parsed.ok,
+                  status: res.statusCode,
+                  result: parsed.result,
+                  error: parsed.error || raw || `http ${res.statusCode}`
+                });
+                return;
+              }
+              resolve({ ok: httpOk, status: res.statusCode, result: parsed, error: parsed.error || raw || `http ${res.statusCode}` });
+            } catch {
+              resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, result: raw, error: raw || `http ${res.statusCode}` });
+            }
+          });
+        }
+      );
+      req.setTimeout(timeoutMs, () => {
+        req.destroy(new Error('walletd request timeout'));
+      });
+      req.on('error', (e) => resolve({ ok: false, error: String(e.message || e) }));
+      if (body) req.write(JSON.stringify(body));
+      req.end();
     });
-    req.on('error', (e) => resolve({ ok: false, error: String(e.message || e) }));
-    if (body) req.write(JSON.stringify(body));
-    req.end();
-  });
+
+  let out = await callOnce();
+  if (out.ok) return out;
+  if (suppressAutoRecover || !retryOnRefused || !isConnRefusedErrorText(out.error)) return out;
+
+  const recovered = await recoverWalletdIfRefused(pathname);
+  if (!recovered.ok) {
+    return {
+      ...out,
+      error: `${String(out.error || 'walletd call failed')}; auto-recover failed: ${String(recovered.error || 'unknown')}`
+    };
+  }
+
+  out = await callOnce();
+  if (out.ok) {
+    appendLog(mainWindow, `[repair] walletd recovered after connection refusal; retried ${pathname}`);
+  }
+  return out;
 }
 
 function walletdRpcAddr() {
@@ -1517,15 +1540,45 @@ function startWalletdOnRpc(win, rpcAddr) {
   });
 }
 
-async function waitForWalletdReady(timeoutMs = 5000) {
+async function waitForWalletdReady(timeoutMs = 5000, opts = {}) {
+  const suppressAutoRecover = !!opts.suppressAutoRecover;
   const deadline = Date.now() + Math.max(1000, timeoutMs);
   while (Date.now() < deadline) {
     if (!service.walletd) return false;
-    const probe = await walletdCall('/health', null, { timeoutMs: 1200 });
+    const probe = await walletdCall('/health', null, {
+      timeoutMs: 1200,
+      suppressAutoRecover,
+      retryOnRefused: !suppressAutoRecover
+    });
     if (probe.ok) return true;
     await waitMs(150);
   }
   return false;
+}
+
+async function recoverWalletdIfRefused(pathname = '/unknown') {
+  if (walletdAutoRecoverPromise) return walletdAutoRecoverPromise;
+  walletdAutoRecoverPromise = (async () => {
+    const target = normalizeRpcEndpoint(walletdRpcTarget || walletdRpcAddr(), DEFAULT_PUBLIC_RPC_CANDIDATES[0]);
+    appendLog(
+      mainWindow,
+      `[repair] walletd connection refused on ${pathname}; restarting wallet daemon on ${target}`
+    );
+    if (service.walletd) {
+      stopSvc('walletd');
+      await waitMs(300);
+    }
+    const started = startWalletdOnRpc(mainWindow, target);
+    if (!started.ok) return started;
+    const ready = await waitForWalletdReady(6000, { suppressAutoRecover: true });
+    if (!ready) return { ok: false, error: failedServiceStart('walletd') };
+    return { ok: true, result: target };
+  })();
+  try {
+    return await walletdAutoRecoverPromise;
+  } finally {
+    walletdAutoRecoverPromise = null;
+  }
 }
 
 async function waitForRemoteTipVisible(win, minTip = 1, timeoutMs = 25000) {
@@ -2093,6 +2146,12 @@ function parseKnoxAddress(value) {
 
 function isTimeoutErrorText(text) {
   return /timeout|timed out|ETIMEDOUT|request timeout/i.test(String(text || ''));
+}
+
+function isConnRefusedErrorText(text) {
+  return /(ECONNREFUSED|Connection refused|os error 10061|actively refused)/i.test(
+    String(text || '')
+  );
 }
 
 const WALLET_CLI_RPC_ENV = {
