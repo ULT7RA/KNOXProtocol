@@ -204,6 +204,7 @@ mod tests {
             amounts: Vec::new(),
             outputs: Vec::new(),
             openings: Vec::new(),
+            message: None,
         };
         let mut encoded = encode_coinbase_payload(&payload).expect("encode payload");
         encoded.extend_from_slice(&[0xCC, 0xDD]);

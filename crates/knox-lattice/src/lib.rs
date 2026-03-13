@@ -15,6 +15,7 @@ pub mod sample;
 pub mod stealth;
 pub mod surge;
 pub mod transaction;
+pub mod velox_reaper;
 
 pub use block::{apply_block_immunity, verify_block_view, LatticeBlockView};
 pub use coinbase::{
@@ -39,8 +40,9 @@ pub use key_image::{derive_key_image, derive_key_image_id, KeyImageSet};
 pub use mining::{
     detect_available_backends, difficulty_bits, header_challenge, mine_block_proof,
     mine_block_proof_with_difficulty, mine_block_proof_with_profile, mining_debug_enabled,
-    verify_block_proof, verify_block_proof_with_difficulty, MiningBackend, MiningBackendStatus,
-    MiningMode, MiningProfile,
+    explain_block_proof_failure_with_difficulty, verify_block_proof,
+    verify_block_proof_with_difficulty, MiningBackend, MiningBackendStatus, MiningMode,
+    MiningProfile,
 };
 pub use poly::Poly;
 pub use range_proof::{prove_range_u64, verify_range_u64, LatticeRangeProof};

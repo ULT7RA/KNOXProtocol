@@ -44,13 +44,14 @@ const NETWORK_ENV_OVERRIDE_REQUESTED = /^(1|true|yes)$/i.test(
 // stale endpoint. Keep override support for local/dev runs only.
 const ALLOW_NETWORK_ENV_OVERRIDES = !app.isPackaged && !MAINNET_LOCKED && NETWORK_ENV_OVERRIDE_REQUESTED;
 
-const DEFAULT_PUBLIC_P2P_SEEDS = [
-  '161.153.118.97:9735',
-  '129.146.140.173:9735',
-  '129.146.133.68:9735'
-];
-// Keep wallet RPC sticky on the dedicated sync VM by default.
-const DEFAULT_RPC_FALLBACK = '129.146.133.68:9736';
+const DEFAULT_PUBLIC_P2P_SEEDS = String(process.env.KNOX_DEFAULT_PUBLIC_P2P_SEEDS || '')
+  .split(/[,\s]+/)
+  .map((s) => s.trim())
+  .filter(Boolean);
+const DEFAULT_RPC_FALLBACK = normalizeRpcEndpoint(
+  process.env.KNOX_DEFAULT_PUBLIC_RPC || '',
+  '127.0.0.1:9736'
+);
 
 function splitRpcEndpoint(ep) {
   const m = String(ep || '').match(/^(.+):(\d{2,5})$/);
@@ -73,13 +74,21 @@ function normalizeRpcEndpoint(raw, fallback = DEFAULT_RPC_FALLBACK) {
   return fallback;
 }
 
-const DEFAULT_PUBLIC_RPC_CANDIDATES = [
-  // Canonical public RPC set for the current 3-VM lane.
-  // Keep multiple public endpoints so packaged clients fail over automatically.
-  '129.146.133.68:9736',
-  '129.146.140.173:9736'
-];
+const DEFAULT_PUBLIC_RPC_CANDIDATES = (() => {
+  const raw = String(
+    process.env.KNOX_DEFAULT_PUBLIC_RPC_CANDIDATES
+      || process.env.KNOX_DEFAULT_PUBLIC_RPC
+      || ''
+  )
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return raw.length ? raw : [DEFAULT_RPC_FALLBACK];
+})();
 const DEFAULT_MAINNET_GENESIS_HASH = 'd626848546f6511abd38a1ee89610a708d001d53e0c8a27dc509a1e65b964187';
+const DESKTOP_APP_VERSION = '1.3.15';
+const MIN_SUPPORTED_INSTALLER_VERSION = '1.3.15';
+const MIN_SUPPORTED_P2P_PROTOCOL_VERSION = 2;
 const RPC_UPSTREAM = normalizeRpcEndpoint(
   ALLOW_NETWORK_ENV_OVERRIDES ? process.env.KNOX_PUBLIC_RPC_ADDR : '',
   DEFAULT_PUBLIC_RPC_CANDIDATES[0]
@@ -295,9 +304,11 @@ const runtimeStats = {
     activeBackend: 'cpu',
     availableBackends: ['cpu'],
     activeDevice: 'cpu-main',
+    minerAddress: '',
     fallbackActive: false,
     lastBackendError: '',
-    recentBlocks: []
+    recentBlocks: [],
+    pendingRewardEvents: []
   },
   walletd: {
     running: false,
@@ -326,6 +337,7 @@ let walletdSwitchPromise = null;
 let miningSafetyTripped = false;
 let lastUpstreamTipSeen = 0;
 let lastTipRegressionLogMs = 0;
+let lastGoodNetworkTelemetry = null;
 const UPSTREAM_TIP_REGRESSION_TOLERANCE = Math.max(
   8,
   Number.parseInt(String(process.env.KNOX_UPSTREAM_TIP_REGRESSION_TOLERANCE || '32'), 10) || 32
@@ -346,6 +358,7 @@ function resetRuntimeMiningSession() {
   runtimeStats.node.lastSealedAtMs = 0;
   runtimeStats.node.totalHardeningEstimate = 0;
   runtimeStats.node.recentBlocks = [];
+  runtimeStats.node.pendingRewardEvents = [];
 }
 
 function resetUpstreamFailureState() {
@@ -743,6 +756,14 @@ function appendLog(win, line) {
   win.webContents.send('log', stamped);
 }
 
+function emitWalletUpdated(win, reason = 'wallet-sync') {
+  if (!win || win.isDestroyed()) return;
+  win.webContents.send('wallet-updated', {
+    reason: String(reason || 'wallet-sync'),
+    atMs: Date.now()
+  });
+}
+
 function recordRuntimeBlock(height, txs) {
   const stats = runtimeStats.node;
   const now = Date.now();
@@ -780,6 +801,71 @@ function recordRuntimeBlock(height, txs) {
   ].slice(0, 30);
 }
 
+function recordPendingReward(height, rewards = {}) {
+  const stats = runtimeStats.node;
+  const minerAddress = parseKnoxAddress(stats.minerAddress || desktopMinerAddress || '');
+  const treasuryAddress = parseKnoxAddress(process.env.KNOX_MAINNET_TREASURY_ADDRESS || '');
+  const devAddress = parseKnoxAddress(process.env.KNOX_MAINNET_DEV_ADDRESS || '');
+  const premineAddress = parseKnoxAddress(process.env.KNOX_MAINNET_PREMINE_ADDRESS || '');
+  const addressAmounts = {};
+  const addAmount = (address, amount) => {
+    const atoms = Number(amount || 0);
+    if (!address || !Number.isFinite(atoms) || atoms <= 0) return;
+    addressAmounts[address] = Number(addressAmounts[address] || 0) + atoms;
+  };
+  addAmount(minerAddress, rewards.miner);
+  addAmount(treasuryAddress, rewards.treasury);
+  addAmount(devAddress, rewards.dev);
+  addAmount(premineAddress, rewards.premine);
+  const total = Object.values(addressAmounts).reduce((sum, atoms) => sum + Number(atoms || 0), 0);
+  if (!Number.isFinite(total) || total <= 0) return;
+  const pending = Array.isArray(stats.pendingRewardEvents) ? stats.pendingRewardEvents : [];
+  const filtered = pending.filter((entry) => Number(entry?.height || -1) !== Number(height));
+  filtered.push({
+    height: Number(height || 0),
+    atMs: Date.now(),
+    total,
+    addressAmounts
+  });
+  filtered.sort((a, b) => Number(a.height || 0) - Number(b.height || 0));
+  stats.pendingRewardEvents = filtered.slice(-128);
+}
+
+function trimPendingRewards(walletHeight = 0) {
+  const stats = runtimeStats.node;
+  const confirmedHeight = Number(walletHeight || 0);
+  if (!Number.isFinite(confirmedHeight) || confirmedHeight <= 0) return;
+  stats.pendingRewardEvents = (stats.pendingRewardEvents || []).filter(
+    (entry) => Number(entry?.height || 0) > confirmedHeight
+  );
+}
+
+function pendingRewardsForAddresses(indexedEntries = []) {
+  const pendingEvents = Array.isArray(runtimeStats.node.pendingRewardEvents)
+    ? runtimeStats.node.pendingRewardEvents
+    : [];
+  const byAddress = {};
+  let total = 0;
+  for (const entry of pendingEvents) {
+    const addressAmounts = entry?.addressAmounts || {};
+    for (const [address, amount] of Object.entries(addressAmounts)) {
+      const atoms = Number(amount || 0);
+      if (!address || !Number.isFinite(atoms) || atoms <= 0) continue;
+      byAddress[address] = Number(byAddress[address] || 0) + atoms;
+      total += atoms;
+    }
+  }
+  const bySubaddress = {};
+  for (const entry of indexedEntries) {
+    const address = String(entry?.address || '').trim();
+    const index = Number(entry?.index);
+    if (!address || !Number.isFinite(index)) continue;
+    const atoms = Number(byAddress[address] || 0);
+    if (atoms > 0) bySubaddress[index] = atoms;
+  }
+  return { total, bySubaddress };
+}
+
 function queueWalletAutoSync(win, reason = 'sealed block') {
   if (!service.walletd) return;
   if (walletAutoSyncTimer) clearTimeout(walletAutoSyncTimer);
@@ -803,6 +889,7 @@ async function runWalletAutoSync(win, reason = 'sealed block') {
       runtimeStats.walletd.lastInfoError = '';
       runtimeStats.walletd.lastSyncError = '';
       walletAutoSyncFailCount = 0;
+      emitWalletUpdated(win || mainWindow, `auto-sync:${reason}`);
     } else {
       runtimeStats.walletd.lastSyncError = String(out?.error || 'sync failed');
       appendLog(win || mainWindow, `[walletd] auto-sync (${reason}) failed: ${runtimeStats.walletd.lastSyncError}`);
@@ -889,15 +976,29 @@ function parseRuntimeLine(key, line, win) {
       if (hard > 0) runtimeStats.node.totalHardeningEstimate = hard;
       return;
     }
-    const sealedGenesis = line.match(/sealed genesis block.*txs=(\d+)/i);
+    const sealedGenesis = line.match(/sealed genesis block.*txs=(\d+)(?:\s+rewards miner=(\d+)\s+treasury=(\d+)\s+dev=(\d+)\s+premine=(\d+))?/i);
     if (sealedGenesis) {
       recordRuntimeBlock(0, Number(sealedGenesis[1] || 0));
+      recordPendingReward(0, {
+        miner: Number(sealedGenesis[2] || 0),
+        treasury: Number(sealedGenesis[3] || 0),
+        dev: Number(sealedGenesis[4] || 0),
+        premine: Number(sealedGenesis[5] || 0)
+      });
+      emitWalletUpdated(win || mainWindow, 'sealed:genesis');
       queueWalletAutoSync(win, 'genesis');
       return;
     }
-    const sealed = line.match(/sealed block\s+(\d+)\s+txs=(\d+)/i);
+    const sealed = line.match(/sealed block\s+(\d+)\s+txs=(\d+)(?:\s+rewards miner=(\d+)\s+treasury=(\d+)\s+dev=(\d+)\s+premine=(\d+))?/i);
     if (sealed) {
       recordRuntimeBlock(Number(sealed[1]), Number(sealed[2] || 0));
+      recordPendingReward(Number(sealed[1]), {
+        miner: Number(sealed[3] || 0),
+        treasury: Number(sealed[4] || 0),
+        dev: Number(sealed[5] || 0),
+        premine: Number(sealed[6] || 0)
+      });
+      emitWalletUpdated(win || mainWindow, `sealed:${sealed[1]}`);
       queueWalletAutoSync(win, `height ${sealed[1]}`);
       return;
     }
@@ -964,6 +1065,7 @@ function buildServiceEnv(key, envExtra = {}) {
     // Desktop catch-up needs deterministic upstream sync settings regardless of shell state.
     merged.KNOX_NODE_UPSTREAM_SYNC_BATCH_COUNT = String(DESKTOP_UPSTREAM_SYNC_BATCH);
     merged.KNOX_NODE_UPSTREAM_SYNC_TIMEOUT_MS = String(DESKTOP_UPSTREAM_SYNC_TIMEOUT_MS);
+    merged.KNOX_P2P_PROTOCOL_VERSION = String(MIN_SUPPORTED_P2P_PROTOCOL_VERSION);
   }
   if (key === 'walletd') {
     merged.KNOX_UPSTREAM_PROBE_TIMEOUT_MS = String(UPSTREAM_PROBE_TIMEOUT_MS);
@@ -992,6 +1094,10 @@ function spawnSvc(win, key, bin, args, envExtra = {}) {
   service[key] = p;
   if (key === 'node') {
     runtimeStats.node.running = true;
+    runtimeStats.node.minerAddress =
+      Array.isArray(args) && args.length > 5 && /^knox1[a-f0-9]{32,}$/i.test(String(args[5] || ''))
+        ? String(args[5] || '')
+        : '';
   }
   if (key === 'walletd') {
     runtimeStats.walletd.running = true;
@@ -1167,10 +1273,11 @@ function runCli(args, options = {}) {
 }
 
 async function walletInfoFromCli() {
-  const [addrRes, balRes, addrsRes] = await Promise.all([
+  const [addrRes, balRes, addrsRes, balancesRes] = await Promise.all([
     runCli(['address', WALLET_PATH]),
     runCli(['balance', WALLET_PATH]),
     runCli(['addresses', WALLET_PATH]),
+    walletBalancesFromCli(),
   ]);
 
   const addressText = String(addrRes?.result || '');
@@ -1179,13 +1286,24 @@ async function walletInfoFromCli() {
 
   const balText = String(balRes?.result || '');
   const mAtoms = balText.match(/\((\d+)\)/);
-  const balance = mAtoms ? Number(mAtoms[1]) : 0;
+  const fallbackBalance = mAtoms ? Number(mAtoms[1]) : 0;
+  const balancesInfo = balancesRes?.ok
+    ? balancesRes.result
+    : { totalBalance: fallbackBalance, subaddressBalances: {}, addresses: [] };
+  const balance = Number.isFinite(Number(balancesInfo.totalBalance))
+    ? Number(balancesInfo.totalBalance)
+    : fallbackBalance;
 
   const addresses = [];
   const lines = String(addrsRes?.result || '').split(/\r?\n/);
   for (const line of lines) {
     const m = line.match(/knox1[a-f0-9]{32,}/i);
     if (m) addresses.push(m[0]);
+  }
+  if (Array.isArray(balancesInfo.addresses)) {
+    for (const entry of balancesInfo.addresses) {
+      if (entry?.address) addresses.push(String(entry.address));
+    }
   }
   if (!addresses.length && address) addresses.push(address);
 
@@ -1211,7 +1329,8 @@ async function walletInfoFromCli() {
       address: address || addresses[0] || '',
       balance,
       last_height: 0,
-      addresses
+      addresses: Array.from(new Set(addresses)),
+      subaddressBalances: balancesInfo.subaddressBalances || {}
     }
   };
 }
@@ -1229,6 +1348,35 @@ function parseCliAddressLines(text) {
     if (plain) result.push({ index: result.length, address: plain[0] });
   }
   return result;
+}
+
+function parseCliBalances(text) {
+  const result = {
+    totalBalance: 0,
+    subaddressBalances: {},
+    addresses: []
+  };
+  const lines = String(text || '').split(/\r?\n/);
+  for (const line of lines) {
+    const entry = line.match(/#(\d+):\s*(knox1[a-f0-9]{32,})\s*\|\s*[^(]+\((\d+)\)/i);
+    if (entry) {
+      const index = Number(entry[1]);
+      const address = entry[2];
+      const atoms = Number(entry[3] || 0);
+      if (Number.isFinite(index)) result.subaddressBalances[index] = atoms;
+      if (address) result.addresses.push({ index, address });
+      continue;
+    }
+    const total = line.match(/Total:\s*[^(]+\((\d+)\)/i);
+    if (total) result.totalBalance = Number(total[1] || 0);
+  }
+  return result;
+}
+
+async function walletBalancesFromCli() {
+  const out = await runCli(['balances', WALLET_PATH]);
+  if (!out.ok) return { ok: false, error: out.error || 'wallet balances unavailable' };
+  return { ok: true, result: parseCliBalances(out.result) };
 }
 
 async function walletIndexedAddressesFromCli() {
@@ -1923,11 +2071,20 @@ function isTimeoutErrorText(text) {
   return /timeout|timed out|ETIMEDOUT|request timeout/i.test(String(text || ''));
 }
 
+const WALLET_CLI_RPC_ENV = {
+  KNOX_RPC_CONNECT_TIMEOUT_MS: '15000',
+  KNOX_RPC_IO_TIMEOUT_MS: '120000'
+};
+const WALLET_CLI_SYNC_TIMEOUT_MS = 5 * 60 * 1000;
+
 async function fallbackCliSyncAndReloadWalletd(win, reason = 'fallback') {
   backupWalletSnapshot(win || mainWindow, `sync-${reason}`, { minIntervalMs: 10 * 60 * 1000 });
   const rpcAddr = walletSyncRpcAddr();
   appendLog(win || mainWindow, `[wallet] fallback sync via CLI on ${rpcAddr} (${reason})`);
-  const cli = await runCli(['sync', WALLET_PATH, rpcAddr]);
+  const cli = await runCli(['sync', WALLET_PATH, rpcAddr], {
+    timeoutMs: WALLET_CLI_SYNC_TIMEOUT_MS,
+    env: WALLET_CLI_RPC_ENV
+  });
   if (!cli.ok) {
     appendLog(win || mainWindow, `[wallet] fallback CLI sync failed: ${cli.error || 'unknown'}`);
     return cli;
@@ -1945,6 +2102,7 @@ async function fallbackCliSyncAndReloadWalletd(win, reason = 'fallback') {
       return restarted;
     }
   }
+  emitWalletUpdated(win || mainWindow, `fallback-cli-sync:${reason}`);
   return { ok: true, result: 'fallback sync complete' };
 }
 
@@ -1961,7 +2119,10 @@ async function walletRescanAndReloadWalletd(win, reason = 'manual-rescan') {
     await waitMs(250);
   }
 
-  const cli = await runCli(['rescan', WALLET_PATH, rpcAddr]);
+  const cli = await runCli(['rescan', WALLET_PATH, rpcAddr], {
+    timeoutMs: WALLET_CLI_SYNC_TIMEOUT_MS,
+    env: WALLET_CLI_RPC_ENV
+  });
 
   let restartError = '';
   if (hadWalletd) {
@@ -1982,6 +2143,7 @@ async function walletRescanAndReloadWalletd(win, reason = 'manual-rescan') {
   runtimeStats.walletd.lastInfoAtMs = Date.now();
   runtimeStats.walletd.lastInfoError = '';
   runtimeStats.walletd.lastSyncError = '';
+  emitWalletUpdated(win || mainWindow, `rescan:${reason}`);
 
   if (restartError) {
     return { ok: false, error: `wallet rescan completed but walletd restart failed: ${restartError}` };
@@ -2099,7 +2261,7 @@ async function quickStart(win, profile = null) {
     if (!nodeStart.ok) return nodeStart;
     appendLog(
       win,
-      `[config] node mining=${allowMiningBoot ? 'on' : 'off'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'} cpu_util=${effectiveProfile?.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile?.gpuUtil ?? 'auto'} upstream_batch=${env.KNOX_NODE_UPSTREAM_SYNC_BATCH_COUNT} upstream_timeout_ms=${env.KNOX_NODE_UPSTREAM_SYNC_TIMEOUT_MS}`
+      `[config] node mining=${allowMiningBoot ? 'on' : 'off'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'} cpu_util=${effectiveProfile?.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile?.gpuUtil ?? 'auto'} upstream_batch=${process.env.KNOX_NODE_UPSTREAM_SYNC_BATCH_COUNT} upstream_timeout_ms=${process.env.KNOX_NODE_UPSTREAM_SYNC_TIMEOUT_MS}`
     );
     if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.node && walletdRpcTarget !== LOCAL_NODE_RPC) {
       appendLog(win, `[sync] moving wallet daemon to local RPC: ${LOCAL_NODE_RPC}`);
@@ -2171,6 +2333,10 @@ function runtimeNetworkSnapshot() {
     tip_height: tip,
     total_hardening: computeChainHardening(tip),
     active_miners_recent: minerCount,
+    software_version: DESKTOP_APP_VERSION,
+    latest_installer_version: MIN_SUPPORTED_INSTALLER_VERSION,
+    min_supported_version: MIN_SUPPORTED_INSTALLER_VERSION,
+    min_supported_protocol_version: MIN_SUPPORTED_P2P_PROTOCOL_VERSION,
     current_difficulty_bits: Number(n.currentDifficultyBits || 0),
     tip_proposer_streak: Number(n.currentStreak || 0),
     next_streak_if_same_proposer: Math.max(0, Number(n.currentStreak || 0) + 1),
@@ -2186,6 +2352,53 @@ function runtimeNetworkSnapshot() {
       status: b.status || 'SEALED',
       meta: `${Number(b.txs || 0)} tx`
     }))
+  };
+}
+
+function networkTelemetryBaseSnapshot() {
+  if (lastGoodNetworkTelemetry && typeof lastGoodNetworkTelemetry === 'object') {
+    return {
+      ...lastGoodNetworkTelemetry,
+      software_version: DESKTOP_APP_VERSION,
+      latest_installer_version: MIN_SUPPORTED_INSTALLER_VERSION,
+      min_supported_version: MIN_SUPPORTED_INSTALLER_VERSION,
+      min_supported_protocol_version: MIN_SUPPORTED_P2P_PROTOCOL_VERSION,
+      recent_blocks: Array.isArray(lastGoodNetworkTelemetry.recent_blocks)
+        ? [...lastGoodNetworkTelemetry.recent_blocks]
+        : []
+    };
+  }
+  return runtimeNetworkSnapshot();
+}
+
+function pinnedLocalNetworkTelemetry() {
+  if (!service.node || !lastGoodNetworkTelemetry) return null;
+  const local = runtimeNetworkSnapshot();
+  const localTip = Number(local.tip_height || 0);
+  const cachedTip = Number(lastGoodNetworkTelemetry.tip_height || 0);
+  if (localTip <= 0 || lastUpstreamTipSeen <= 0) return null;
+  if (localTip + UPSTREAM_TIP_REGRESSION_TOLERANCE < lastUpstreamTipSeen) return null;
+  const mergedTip = Math.max(localTip, cachedTip, lastUpstreamTipSeen);
+  return {
+    ...lastGoodNetworkTelemetry,
+    tip_height: mergedTip,
+    total_hardening: computeChainHardening(mergedTip),
+    current_difficulty_bits: Math.max(
+      Number(lastGoodNetworkTelemetry.current_difficulty_bits || 0),
+      Number(local.current_difficulty_bits || 0)
+    ),
+    tip_proposer_streak: Math.max(
+      Number(lastGoodNetworkTelemetry.tip_proposer_streak || 0),
+      Number(local.tip_proposer_streak || 0)
+    ),
+    next_streak_if_same_proposer: Math.max(
+      Number(lastGoodNetworkTelemetry.next_streak_if_same_proposer || 0),
+      Number(local.next_streak_if_same_proposer || 0)
+    ),
+    recent_blocks: local.recent_blocks && local.recent_blocks.length > 0
+      ? local.recent_blocks
+      : (lastGoodNetworkTelemetry.recent_blocks || []),
+    source: 'local-node-pinned'
   };
 }
 
@@ -2480,11 +2693,12 @@ function createWindow() {
     if (service.walletd) {
       const out = await walletdCall('/sync', {}, { timeoutMs: 25000 });
       runtimeStats.walletd.lastInfoAtMs = Date.now();
-      if (out.ok) {
-        runtimeStats.walletd.lastSyncError = '';
-        runtimeStats.walletd.lastInfoError = '';
-        return out;
-      } else {
+    if (out.ok) {
+      runtimeStats.walletd.lastSyncError = '';
+      runtimeStats.walletd.lastInfoError = '';
+      emitWalletUpdated(win, 'manual-sync');
+      return out;
+    } else {
         runtimeStats.walletd.lastSyncError = String(out.error || 'sync failed');
         if (isTimeoutErrorText(out.error)) {
           return fallbackCliSyncAndReloadWalletd(win, 'manual-sync-timeout');
@@ -2492,15 +2706,49 @@ function createWindow() {
       }
       return out;
     }
-    return runCli(['sync', WALLET_PATH, walletSyncRpcAddr()]);
+    return runCli(['sync', WALLET_PATH, walletSyncRpcAddr()], {
+      timeoutMs: WALLET_CLI_SYNC_TIMEOUT_MS,
+      env: WALLET_CLI_RPC_ENV
+    });
   });
   bindIpc('wallet-rescan', 'wallet-rescan', async () => walletRescanAndReloadWalletd(win, 'manual-rescan'));
 
   bindIpc('walletd-health', 'walletd-health', () => walletdCall('/health'));
   bindIpc('walletd-info', 'walletd-info', async () => {
     const out = await walletdCall('/info');
-    if (out.ok) return out;
-    return walletInfoFromCli();
+    const balances = await walletBalancesFromCli();
+    if (out.ok) {
+      const merged = { ...(out.result || {}) };
+      if (balances.ok) {
+        if (Number.isFinite(Number(balances.result?.totalBalance))) {
+          merged.balance = Number(balances.result.totalBalance);
+        }
+        merged.subaddressBalances = balances.result?.subaddressBalances || {};
+        if (Array.isArray(balances.result?.addresses) && balances.result.addresses.length) {
+          const mergedAddresses = new Set(
+            []
+              .concat(Array.isArray(merged.addresses) ? merged.addresses : [])
+              .concat(balances.result.addresses.map((entry) => entry.address).filter(Boolean))
+          );
+          merged.addresses = Array.from(mergedAddresses);
+          if (!merged.address && merged.addresses.length) merged.address = merged.addresses[0];
+        }
+      }
+      trimPendingRewards(merged.last_height || merged.height || 0);
+      const indexedEntries = Array.isArray(balances.result?.addresses) ? balances.result.addresses : [];
+      const pending = pendingRewardsForAddresses(indexedEntries);
+      merged.pendingBalance = pending.total;
+      merged.pendingSubaddressBalances = pending.bySubaddress;
+      return { ok: true, result: merged };
+    }
+    const fallback = await walletInfoFromCli();
+    if (fallback?.ok) {
+      const indexedEntries = Array.isArray(balances.result?.addresses) ? balances.result.addresses : [];
+      const pending = pendingRewardsForAddresses(indexedEntries);
+      fallback.result.pendingBalance = pending.total;
+      fallback.result.pendingSubaddressBalances = pending.bySubaddress;
+    }
+    return fallback;
   });
   bindIpc('walletd-addresses', 'walletd-addresses', async () => {
     const out = await walletdCall('/addresses');
@@ -2532,6 +2780,13 @@ function createWindow() {
     return walletdCall('/send', payload || {});
   });
   bindIpc('walletd-network', 'walletd-network', async () => {
+    // While the local node is running, keep the dashboard pinned to the
+    // local chain view so flaky walletd telemetry cannot bounce the UI back
+    // to stale remote heights/miner counts.
+    if (service.node && Number(runtimeStats.node.lastSealedHeight || 0) > 0) {
+      const pinned = pinnedLocalNetworkTelemetry();
+      return { ok: true, result: pinned || runtimeNetworkSnapshot() };
+    }
     // In explicit local-RPC mode, prefer runtime snapshot while mining.
     if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.node) {
       return { ok: true, result: runtimeNetworkSnapshot() };
@@ -2549,7 +2804,7 @@ function createWindow() {
       if (tipProbeFast.ok && tipProbeFast.result) {
         resetUpstreamFailureState();
         const tipHeight = Number(tipProbeFast.result.tip_height ?? 0);
-        const snap = runtimeNetworkSnapshot();
+        const snap = networkTelemetryBaseSnapshot();
         const mergedTip = Number.isFinite(tipHeight)
           ? Math.max(tipHeight, Number(snap.tip_height || 0))
           : Number(snap.tip_height || 0);
@@ -2562,6 +2817,10 @@ function createWindow() {
           result: {
             ...snap,
             tip_height: mergedTip,
+            software_version: DESKTOP_APP_VERSION,
+            latest_installer_version: MIN_SUPPORTED_INSTALLER_VERSION,
+            min_supported_version: MIN_SUPPORTED_INSTALLER_VERSION,
+            min_supported_protocol_version: MIN_SUPPORTED_P2P_PROTOCOL_VERSION,
             total_hardening: computeChainHardening(mergedTip),
             source: 'upstream-tip-fallback'
           }
@@ -2677,28 +2936,40 @@ function createWindow() {
       const snap = runtimeNetworkSnapshot();
       let realTip = Number(out.result.tip_height ?? 0);
       if (!Number.isFinite(realTip) || realTip < 0) realTip = 0;
-      if (
+      const tipRegressed =
         realTip > 0
         && lastUpstreamTipSeen > 0
-        && realTip + UPSTREAM_TIP_REGRESSION_TOLERANCE < lastUpstreamTipSeen
-      ) {
+        && realTip + UPSTREAM_TIP_REGRESSION_TOLERANCE < lastUpstreamTipSeen;
+      if (tipRegressed) {
         const now = Date.now();
         if (now - lastTipRegressionLogMs > 15000) {
           appendLog(
             win,
-            `[network] ignoring regressed tip=${realTip}; keeping last_seen=${lastUpstreamTipSeen}`
+            `[network] ignoring regressed telemetry tip=${realTip}; keeping last_seen=${lastUpstreamTipSeen}`
           );
           lastTipRegressionLogMs = now;
         }
-        realTip = lastUpstreamTipSeen;
+        const base = networkTelemetryBaseSnapshot();
+        const merged = {
+          ...base,
+          tip_height: Math.max(lastUpstreamTipSeen, Number(base.tip_height || 0)),
+          total_hardening: computeChainHardening(Math.max(lastUpstreamTipSeen, Number(base.tip_height || 0))),
+          source: 'cached-telemetry-fallback'
+        };
+        lastGoodNetworkTelemetry = { ...merged };
+        return { ...out, result: merged };
       }
       if (realTip > 0) {
         lastUpstreamTipSeen = Math.max(lastUpstreamTipSeen, realTip);
       }
-      return {
+      const merged = {
         ...out,
         result: {
           ...out.result,
+          software_version: DESKTOP_APP_VERSION,
+          latest_installer_version: MIN_SUPPORTED_INSTALLER_VERSION,
+          min_supported_version: MIN_SUPPORTED_INSTALLER_VERSION,
+          min_supported_protocol_version: MIN_SUPPORTED_P2P_PROTOCOL_VERSION,
           total_hardening: computeChainHardening(realTip),
           active_miners_recent: Math.max(Number(out.result.active_miners_recent ?? 0), snap.active_miners_recent),
           tip_proposer_streak: snap.tip_proposer_streak || out.result.tip_proposer_streak || 0,
@@ -2707,6 +2978,8 @@ function createWindow() {
             : (out.result.recent_blocks || []),
         }
       };
+      lastGoodNetworkTelemetry = { ...merged.result };
+      return merged;
     }
     // In explicit local-RPC mode, fall back to log-parsed snapshot if walletd is unreachable.
     if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.node) {
@@ -2718,7 +2991,7 @@ function createWindow() {
     });
     if (tipProbe.ok && tipProbe.result) {
       const tipHeight = Number(tipProbe.result.tip_height ?? 0);
-      const snap = runtimeNetworkSnapshot();
+      const snap = networkTelemetryBaseSnapshot();
       const mergedTip = Number.isFinite(tipHeight) ? Math.max(tipHeight, Number(snap.tip_height || 0)) : Number(snap.tip_height || 0);
       if (Number.isFinite(mergedTip)) {
         lastUpstreamTipSeen = Math.max(lastUpstreamTipSeen, mergedTip);
@@ -2729,6 +3002,10 @@ function createWindow() {
         result: {
           ...snap,
           tip_height: mergedTip,
+          software_version: DESKTOP_APP_VERSION,
+          latest_installer_version: MIN_SUPPORTED_INSTALLER_VERSION,
+          min_supported_version: MIN_SUPPORTED_INSTALLER_VERSION,
+          min_supported_protocol_version: MIN_SUPPORTED_P2P_PROTOCOL_VERSION,
           total_hardening: computeChainHardening(mergedTip),
           source: 'upstream-tip-fallback'
         }

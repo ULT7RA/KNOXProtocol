@@ -2,6 +2,9 @@ use argon2::Argon2;
 use blake3::Hasher;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+use curve25519_dalek::ristretto::CompressedRistretto;
+use curve25519_dalek::scalar::Scalar;
 use getrandom::getrandom;
 use knox_lattice::ring_sig::public_from_secret as lattice_public_from_secret;
 use knox_lattice::{
@@ -32,6 +35,9 @@ use zeroize::Zeroize;
 const WALLET_MAGIC_V1: &[u8; 4] = b"PCW1";
 const WALLET_MAGIC_V2: &[u8; 4] = b"PCW2";
 const LATTICE_PUBKEY_BYTES: usize = knox_lattice::params::N * 2;
+const WALLET_DECODE_LIMIT: usize = 32 * 1024 * 1024;
+const DEFAULT_VISIBLE_SUBADDRESSES: u32 = 2;
+const DEFAULT_SCAN_GAP: u32 = 32;
 
 #[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
 pub struct Note {
@@ -48,6 +54,25 @@ pub struct Note {
     pub subaddress_index: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bincode::Encode, bincode::Decode)]
+pub enum RewardKind {
+    Miner,
+    Treasury,
+    Dev,
+    Premine,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, bincode::Encode, bincode::Decode)]
+pub struct RewardRecord {
+    pub block_height: u64,
+    pub block_hash: Hash32,
+    pub tx_hash: Hash32,
+    pub output_index: u16,
+    pub amount: u64,
+    pub subaddress_index: u32,
+    pub kind: RewardKind,
+}
+
 #[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
 pub struct WalletState {
     pub view_secret: [u8; 32],
@@ -55,10 +80,24 @@ pub struct WalletState {
     pub view_public: [u8; 32],
     pub spend_public: [u8; 32],
     pub notes: Vec<Note>,
+    pub reward_records: Vec<RewardRecord>,
     pub spent_images: Vec<[u8; 32]>,
     pub last_height: u64,
     pub subaddress_indices: Vec<u32>,
     pub next_subaddress_index: u32,
+}
+
+#[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
+struct WalletStateV3 {
+    view_secret: [u8; 32],
+    spend_secret: [u8; 32],
+    view_public: [u8; 32],
+    spend_public: [u8; 32],
+    notes: Vec<Note>,
+    spent_images: Vec<[u8; 32]>,
+    last_height: u64,
+    subaddress_indices: Vec<u32>,
+    next_subaddress_index: u32,
 }
 
 #[derive(Clone, Debug, bincode::Encode, bincode::Decode)]
@@ -190,10 +229,11 @@ pub fn create_wallet(path: &str) -> Result<WalletState, String> {
         view_public: view_pk,
         spend_public: spend_pk,
         notes: Vec::new(),
+        reward_records: Vec::new(),
         spent_images: Vec::new(),
         last_height: 0,
-        subaddress_indices: vec![0],
-        next_subaddress_index: 1,
+        subaddress_indices: vec![0, 1],
+        next_subaddress_index: 2,
     };
     save_wallet(path, &state)?;
     Ok(state)
@@ -214,28 +254,31 @@ pub fn load_wallet(path: &str) -> Result<WalletState, String> {
     } else {
         buf
     };
-    if let Ok((mut state, _)) =
-        bincode::decode_from_slice::<WalletState, _>(&raw, bincode::config::standard().with_limit::<4194304>())
-    {
-        if state.subaddress_indices.is_empty() {
-            state.subaddress_indices.push(0);
-        }
-        if state.next_subaddress_index == 0 {
-            state.next_subaddress_index = state
-                .subaddress_indices
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
-        }
+    if let Ok(mut state) = decode_wallet_state_current(&raw) {
+        ensure_default_subaddresses(&mut state);
         recompute_note_key_images(&mut state);
         return Ok(state);
     }
 
-    if let Ok((legacy_v2, _)) =
-        bincode::decode_from_slice::<WalletStateV2, _>(&raw, bincode::config::standard().with_limit::<4194304>())
-    {
+    if let Ok(legacy_v3) = decode_wallet_state_v3(&raw) {
+        let mut state = WalletState {
+            view_secret: legacy_v3.view_secret,
+            spend_secret: legacy_v3.spend_secret,
+            view_public: legacy_v3.view_public,
+            spend_public: legacy_v3.spend_public,
+            notes: legacy_v3.notes,
+            reward_records: Vec::new(),
+            spent_images: legacy_v3.spent_images,
+            last_height: legacy_v3.last_height,
+            subaddress_indices: legacy_v3.subaddress_indices,
+            next_subaddress_index: legacy_v3.next_subaddress_index,
+        };
+        ensure_default_subaddresses(&mut state);
+        recompute_note_key_images(&mut state);
+        return Ok(state);
+    }
+
+    if let Ok(legacy_v2) = decode_wallet_state_v2(&raw) {
         let mut state = WalletState {
             view_secret: legacy_v2.view_secret,
             spend_secret: legacy_v2.spend_secret,
@@ -258,29 +301,18 @@ pub fn load_wallet(path: &str) -> Result<WalletState, String> {
                     subaddress_index: n.subaddress_index,
                 })
                 .collect(),
+            reward_records: Vec::new(),
             spent_images: legacy_v2.spent_images,
             last_height: legacy_v2.last_height,
             subaddress_indices: legacy_v2.subaddress_indices,
             next_subaddress_index: legacy_v2.next_subaddress_index,
         };
-        if state.subaddress_indices.is_empty() {
-            state.subaddress_indices.push(0);
-        }
-        if state.next_subaddress_index == 0 {
-            state.next_subaddress_index = state
-                .subaddress_indices
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
-        }
+        ensure_default_subaddresses(&mut state);
         recompute_note_key_images(&mut state);
         return Ok(state);
     }
 
-    let (legacy, _): (WalletStateV1, usize) =
-        bincode::decode_from_slice(&raw, bincode::config::standard().with_limit::<4194304>()).map_err(|e| e.to_string())?;
+    let legacy = decode_wallet_state_v1(&raw).map_err(|e| e.to_string())?;
     let mut state = WalletState {
         view_secret: legacy.view_secret,
         spend_secret: legacy.spend_secret,
@@ -303,12 +335,70 @@ pub fn load_wallet(path: &str) -> Result<WalletState, String> {
                 subaddress_index: 0,
             })
             .collect(),
+        reward_records: Vec::new(),
         spent_images: legacy.spent_images,
         last_height: legacy.last_height,
-        subaddress_indices: vec![0],
-        next_subaddress_index: 1,
+        subaddress_indices: vec![0, 1],
+        next_subaddress_index: 2,
     };
+    ensure_default_subaddresses(&mut state);
     recompute_note_key_images(&mut state);
+    Ok(state)
+}
+
+fn decode_wallet_state_current(raw: &[u8]) -> Result<WalletState, bincode::error::DecodeError> {
+    if let Ok((state, _)) = bincode::decode_from_slice::<WalletState, _>(
+        raw,
+        bincode::config::standard().with_limit::<WALLET_DECODE_LIMIT>(),
+    ) {
+        return Ok(state);
+    }
+    let (state, _) = bincode::decode_from_slice::<WalletState, _>(
+        raw,
+        bincode::config::legacy().with_limit::<WALLET_DECODE_LIMIT>(),
+    )?;
+    Ok(state)
+}
+
+fn decode_wallet_state_v3(raw: &[u8]) -> Result<WalletStateV3, bincode::error::DecodeError> {
+    if let Ok((state, _)) = bincode::decode_from_slice::<WalletStateV3, _>(
+        raw,
+        bincode::config::standard().with_limit::<WALLET_DECODE_LIMIT>(),
+    ) {
+        return Ok(state);
+    }
+    let (state, _) = bincode::decode_from_slice::<WalletStateV3, _>(
+        raw,
+        bincode::config::legacy().with_limit::<WALLET_DECODE_LIMIT>(),
+    )?;
+    Ok(state)
+}
+
+fn decode_wallet_state_v2(raw: &[u8]) -> Result<WalletStateV2, bincode::error::DecodeError> {
+    if let Ok((state, _)) = bincode::decode_from_slice::<WalletStateV2, _>(
+        raw,
+        bincode::config::standard().with_limit::<WALLET_DECODE_LIMIT>(),
+    ) {
+        return Ok(state);
+    }
+    let (state, _) = bincode::decode_from_slice::<WalletStateV2, _>(
+        raw,
+        bincode::config::legacy().with_limit::<WALLET_DECODE_LIMIT>(),
+    )?;
+    Ok(state)
+}
+
+fn decode_wallet_state_v1(raw: &[u8]) -> Result<WalletStateV1, bincode::error::DecodeError> {
+    if let Ok((state, _)) = bincode::decode_from_slice::<WalletStateV1, _>(
+        raw,
+        bincode::config::standard().with_limit::<WALLET_DECODE_LIMIT>(),
+    ) {
+        return Ok(state);
+    }
+    let (state, _) = bincode::decode_from_slice::<WalletStateV1, _>(
+        raw,
+        bincode::config::legacy().with_limit::<WALLET_DECODE_LIMIT>(),
+    )?;
     Ok(state)
 }
 
@@ -559,17 +649,16 @@ pub fn sync_wallet(state: &mut WalletState, rpc_addr: &str) -> Result<(), String
     let tip = rpc_get_tip(rpc_addr)?;
     if tip < state.last_height {
         state.notes.clear();
+        state.reward_records.clear();
         state.spent_images.clear();
         state.last_height = 0;
     }
     let view_sk = SecretKey(state.view_secret);
-    if state.subaddress_indices.is_empty() {
-        state.subaddress_indices.push(0);
-    }
+    ensure_default_subaddresses(state);
     let mut subkeys: Vec<(u32, SecretKey, PublicKey)> = Vec::new();
-    for idx in &state.subaddress_indices {
-        if let Ok((sk, pk)) = subaddress_keys(state, *idx) {
-            subkeys.push((*idx, sk, pk));
+    for idx in scan_subaddress_indices(state) {
+        if let Ok((sk, pk)) = subaddress_keys(state, idx) {
+            subkeys.push((idx, sk, pk));
         }
     }
     if subkeys.is_empty() {
@@ -580,7 +669,7 @@ pub fn sync_wallet(state: &mut WalletState, rpc_addr: &str) -> Result<(), String
         ));
     }
     let mut h = state.last_height;
-    const SYNC_BATCH: u32 = 5;
+    const SYNC_BATCH: u32 = 64;
     while h <= tip {
         let remaining = tip.saturating_sub(h) + 1;
         let limit = remaining.min(SYNC_BATCH as u64) as u32;
@@ -590,6 +679,7 @@ pub fn sync_wallet(state: &mut WalletState, rpc_addr: &str) -> Result<(), String
         }
         for block in blocks {
             let block_height = block.header.height;
+            let block_hash = header_link_hash(&block.header);
             for tx in block.txs {
                 for input in &tx.inputs {
                     if state.notes.iter().any(|n| n.key_image == input.key_image)
@@ -628,11 +718,28 @@ pub fn sync_wallet(state: &mut WalletState, rpc_addr: &str) -> Result<(), String
                             block_height,
                             tx.coinbase,
                         ) {
+                            if !state.subaddress_indices.contains(sub_idx) {
+                                state.subaddress_indices.push(*sub_idx);
+                                state.subaddress_indices.sort_unstable();
+                                state.subaddress_indices.dedup();
+                            }
+                            state.next_subaddress_index =
+                                state.next_subaddress_index.max(sub_idx.saturating_add(1));
                             if !state.notes.iter().any(|n| {
                                 n.out_ref.tx == note.out_ref.tx
                                     && n.out_ref.index == note.out_ref.index
                             }) {
-                                state.notes.push(note);
+                                state.notes.push(note.clone());
+                            }
+                            if tx.coinbase {
+                                record_reward_event(
+                                    state,
+                                    &note,
+                                    block_height,
+                                    block_hash,
+                                    tx_hash,
+                                    idx as u16,
+                                );
                             }
                             break;
                         }
@@ -648,8 +755,10 @@ pub fn sync_wallet(state: &mut WalletState, rpc_addr: &str) -> Result<(), String
 
 pub fn reset_scan_state(state: &mut WalletState) {
     state.notes.clear();
+    state.reward_records.clear();
     state.spent_images.clear();
     state.last_height = 0;
+    ensure_default_subaddresses(state);
 }
 
 pub fn create_wallet_from_node_key(
@@ -668,6 +777,17 @@ pub fn create_wallet_from_node_key_bytes(
     create_wallet_from_node_secret(sk, wallet_path)
 }
 
+pub fn repair_wallet_from_node_key(
+    node_key_path: &str,
+    wallet_path: &str,
+    rpc_addr: &str,
+) -> Result<WalletState, String> {
+    let mut state = create_wallet_from_node_key(node_key_path, wallet_path)?;
+    sync_wallet(&mut state, rpc_addr)?;
+    save_wallet(wallet_path, &state)?;
+    Ok(state)
+}
+
 fn create_wallet_from_node_secret(sk: SecretKey, wallet_path: &str) -> Result<WalletState, String> {
     let view_sk = derive_secret_tag(b"knox-wallet-view-v2", &sk.0);
     let spend_sk = derive_secret_tag(b"knox-wallet-spend-v2", &sk.0);
@@ -679,16 +799,19 @@ fn create_wallet_from_node_secret(sk: SecretKey, wallet_path: &str) -> Result<Wa
         view_public: view_pk,
         spend_public: spend_pk,
         notes: Vec::new(),
+        reward_records: Vec::new(),
         spent_images: Vec::new(),
         last_height: 0,
-        subaddress_indices: vec![0],
-        next_subaddress_index: 1,
+        subaddress_indices: vec![0, 1],
+        next_subaddress_index: 2,
     };
     save_wallet(wallet_path, &state)?;
     Ok(state)
 }
 
 pub fn list_wallet_addresses(state: &WalletState) -> Vec<(u32, Address)> {
+    let mut state = state.clone();
+    ensure_default_subaddresses(&mut state);
     let mut out = Vec::new();
     for idx in &state.subaddress_indices {
         if let Some(addr) = state.address_at(*idx) {
@@ -720,6 +843,52 @@ pub fn wallet_balance(state: &WalletState) -> u64 {
         .filter(|n| !state.spent_images.contains(&n.key_image))
         .map(|n| n.amount)
         .sum()
+}
+
+pub fn wallet_balances_by_subaddress(state: &WalletState) -> Vec<(u32, u64)> {
+    let mut out = Vec::new();
+    let mut indices = state.subaddress_indices.clone();
+    if indices.is_empty() {
+        indices.push(0);
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    for idx in indices {
+        let balance = state
+            .notes
+            .iter()
+            .filter(|n| n.subaddress_index == idx)
+            .filter(|n| !state.spent_images.contains(&n.key_image))
+            .map(|n| n.amount)
+            .sum();
+        out.push((idx, balance));
+    }
+    out
+}
+
+pub fn wallet_reward_records(state: &WalletState) -> &[RewardRecord] {
+    &state.reward_records
+}
+
+pub fn wallet_reward_totals(state: &WalletState) -> [(RewardKind, u64); 4] {
+    let mut miner = 0u64;
+    let mut treasury = 0u64;
+    let mut dev = 0u64;
+    let mut premine = 0u64;
+    for record in &state.reward_records {
+        match record.kind {
+            RewardKind::Miner => miner = miner.saturating_add(record.amount),
+            RewardKind::Treasury => treasury = treasury.saturating_add(record.amount),
+            RewardKind::Dev => dev = dev.saturating_add(record.amount),
+            RewardKind::Premine => premine = premine.saturating_add(record.amount),
+        }
+    }
+    [
+        (RewardKind::Miner, miner),
+        (RewardKind::Treasury, treasury),
+        (RewardKind::Dev, dev),
+        (RewardKind::Premine, premine),
+    ]
 }
 
 pub fn build_transaction(
@@ -1057,7 +1226,20 @@ fn try_decrypt_output(
     let lattice_out = lattice_out?;
     let one_time_public = lattice_public_from_serialized(&out.lattice_spend_pub).ok()?;
     if one_time_public != lattice_out.stealth_address {
-        return None;
+        return if is_coinbase {
+            try_decrypt_output_legacy_coinbase(
+                view_sk,
+                spend_sk,
+                _spend_pk,
+                out,
+                tx_hash,
+                index,
+                subaddress_index,
+                block_height,
+            )
+        } else {
+            None
+        };
     }
     let spend_secret = lattice_base_secret_from_seed(&spend_sk.0);
     let spend_public = lattice_public_from_secret(&spend_secret);
@@ -1073,7 +1255,20 @@ fn try_decrypt_output(
         ephemeral_public: lattice_out.ephemeral_public.clone(),
     };
     if !scan_with_view_key(&view_secret, &spend_public, &stealth) {
-        return None;
+        return if is_coinbase {
+            try_decrypt_output_legacy_coinbase(
+                view_sk,
+                spend_sk,
+                _spend_pk,
+                out,
+                tx_hash,
+                index,
+                subaddress_index,
+                block_height,
+            )
+        } else {
+            None
+        };
     }
     let recovered_secret =
         lattice_recover_one_time_secret(&view_secret, &spend_secret, &stealth.ephemeral_public);
@@ -1104,6 +1299,64 @@ fn try_decrypt_output(
         lattice_spend_pub: out.lattice_spend_pub.clone(),
         lattice_one_time_secret: recovered_secret.s.to_bytes(),
         one_time_secret: legacy_one_time,
+        commitment: out.commitment,
+        amount,
+        blinding: blind,
+        key_image: ki,
+        subaddress_index,
+    })
+}
+
+fn try_decrypt_output_legacy_coinbase(
+    view_sk: &SecretKey,
+    spend_sk: &SecretKey,
+    spend_pk: &PublicKey,
+    out: &TxOut,
+    tx_hash: Hash32,
+    index: u16,
+    subaddress_index: u32,
+    block_height: u64,
+) -> Option<Note> {
+    let tx_pub = PublicKey(out.tx_pub);
+    let shared = legacy_shared_secret_receiver(view_sk, &tx_pub)?;
+    let tweak = legacy_hash_to_scalar(b"knox-stealth", shared.compress().as_bytes());
+    let spend_point = CompressedRistretto(spend_pk.0).decompress()?;
+    let dest = spend_point + tweak * RISTRETTO_BASEPOINT_POINT;
+    if dest.compress().to_bytes() != out.one_time_pub {
+        return None;
+    }
+
+    let default_level = tx_hardening_level(block_height);
+    let level = if out.enc_level == 0 {
+        default_level
+    } else {
+        out.enc_level
+    };
+    let shared_bytes = shared.compress().to_bytes();
+    let (amount, blind) =
+        decrypt_amount_with_level(&shared_bytes, out.enc_amount, out.enc_blind, level);
+    let one_time_secret = legacy_recover_one_time_secret(view_sk, spend_sk, &tx_pub)?;
+    let lattice_base_secret = lattice_base_secret_from_seed(&spend_sk.0);
+    let lattice_secret = legacy_lattice_output_secret_from_shared(
+        &lattice_base_secret,
+        &shared_bytes,
+        &out.one_time_pub,
+        &out.tx_pub,
+    );
+    let lattice_public = lattice_public_from_secret(&lattice_secret);
+    let out_lattice_public = lattice_public_from_serialized(&out.lattice_spend_pub).ok()?;
+    if lattice_public != out_lattice_public {
+        return None;
+    }
+    let ki = derive_key_image_id(&lattice_key_image(&lattice_secret, &lattice_public));
+
+    Some(Note {
+        out_ref: OutputRef { tx: tx_hash, index },
+        one_time_pub: out.one_time_pub,
+        tx_pub: out.tx_pub,
+        lattice_spend_pub: out.lattice_spend_pub.clone(),
+        lattice_one_time_secret: lattice_secret.s.to_bytes(),
+        one_time_secret: one_time_secret.0,
         commitment: out.commitment,
         amount,
         blinding: blind,
@@ -1354,7 +1607,8 @@ fn rpc_get_network_telemetry_fallback(addr: &str) -> Result<knox_types::NetworkT
     let tip = rpc_get_tip(addr)?;
     let mut start = 0u64;
     let mut total_hardening = 0u64;
-    let mut active_miners = HashSet::new();
+    let mut active_operator_ids = HashSet::new();
+    let mut legacy_proposers = HashSet::new();
     let mut prev_proposer: Option<[u8; 32]> = None;
     let mut current_run = 0u64;
     let mut tip_proposer_streak = 0u64;
@@ -1374,7 +1628,11 @@ fn rpc_get_network_telemetry_fallback(addr: &str) -> Result<knox_types::NetworkT
             total_hardening =
                 total_hardening.saturating_add(block.lattice_proof.difficulty_bits as u64);
             if tip.saturating_sub(h) < 2048 {
-                active_miners.insert(block.header.proposer);
+                if let Some(operator_id) = coinbase_operator_identity(&block) {
+                    active_operator_ids.insert(operator_id);
+                } else {
+                    legacy_proposers.insert(block.header.proposer);
+                }
             }
             match prev_proposer {
                 Some(prev) if prev == block.header.proposer => {
@@ -1399,7 +1657,11 @@ fn rpc_get_network_telemetry_fallback(addr: &str) -> Result<knox_types::NetworkT
             tip_hash = header_link_hash(&block.header);
             current_difficulty_bits = block.lattice_proof.difficulty_bits;
             tip_proposer_streak = 1;
-            active_miners.insert(block.header.proposer);
+            if let Some(operator_id) = coinbase_operator_identity(&block) {
+                active_operator_ids.insert(operator_id);
+            } else {
+                legacy_proposers.insert(block.header.proposer);
+            }
         }
     }
 
@@ -1416,7 +1678,11 @@ fn rpc_get_network_telemetry_fallback(addr: &str) -> Result<knox_types::NetworkT
         tip_height: tip,
         tip_hash,
         total_hardening,
-        active_miners_recent: active_miners.len() as u32,
+        active_miners_recent: if !active_operator_ids.is_empty() {
+            active_operator_ids.len() as u32
+        } else {
+            legacy_proposers.len() as u32
+        },
         current_difficulty_bits,
         tip_proposer_streak,
         next_streak_if_same_proposer,
@@ -1426,6 +1692,250 @@ fn rpc_get_network_telemetry_fallback(addr: &str) -> Result<knox_types::NetworkT
         surge_block_index: 0,
         surge_blocks_remaining: 0,
     })
+}
+
+fn legacy_hash_to_scalar(tag: &[u8], data: &[u8]) -> Scalar {
+    let mut domain = Hasher::new();
+    domain.update(b"knox-domain-key-v1");
+    domain.update(&(tag.len() as u64).to_le_bytes());
+    domain.update(tag);
+    let key = *domain.finalize().as_bytes();
+
+    let mut hasher = Hasher::new_keyed(&key);
+    hasher.update(&(data.len() as u64).to_le_bytes());
+    hasher.update(data);
+    let mut wide = [0u8; 64];
+    let mut reader = hasher.finalize_xof();
+    reader.fill(&mut wide);
+    Scalar::from_bytes_mod_order_wide(&wide)
+}
+
+fn legacy_scalar_from_bytes(bytes: &[u8; 32]) -> Scalar {
+    Scalar::from_bytes_mod_order(*bytes)
+}
+
+fn legacy_shared_secret_receiver(
+    view_sk: &SecretKey,
+    tx_pub: &PublicKey,
+) -> Option<curve25519_dalek::ristretto::RistrettoPoint> {
+    let r_point = CompressedRistretto(tx_pub.0).decompress()?;
+    let view_scalar = legacy_scalar_from_bytes(&view_sk.0);
+    Some(view_scalar * r_point)
+}
+
+fn legacy_recover_one_time_secret(
+    view_secret: &SecretKey,
+    spend_secret: &SecretKey,
+    r_pub: &PublicKey,
+) -> Option<SecretKey> {
+    let view_scalar = Scalar::from_bytes_mod_order(view_secret.0);
+    let r_point = CompressedRistretto(r_pub.0).decompress()?;
+    let shared = view_scalar * r_point;
+    let tweak = legacy_hash_to_scalar(b"knox-stealth", shared.compress().as_bytes());
+    let spend_scalar = Scalar::from_bytes_mod_order(spend_secret.0);
+    Some(SecretKey((spend_scalar + tweak).to_bytes()))
+}
+
+fn legacy_lattice_tweak_from_shared(
+    shared_secret: &[u8; 32],
+    one_time_pub: &[u8; 32],
+    tx_pub: &[u8; 32],
+) -> Poly {
+    let mut data = Vec::with_capacity(96);
+    data.extend_from_slice(shared_secret);
+    data.extend_from_slice(one_time_pub);
+    data.extend_from_slice(tx_pub);
+    Poly::sample_short(b"knox-wallet-lattice-output-tweak-v1", &data)
+}
+
+fn legacy_lattice_output_secret_from_shared(
+    base_secret: &LatticeSecretKey,
+    shared_secret: &[u8; 32],
+    one_time_pub: &[u8; 32],
+    tx_pub: &[u8; 32],
+) -> LatticeSecretKey {
+    let tweak = legacy_lattice_tweak_from_shared(shared_secret, one_time_pub, tx_pub);
+    LatticeSecretKey {
+        s: base_secret.s.add(&tweak),
+    }
+}
+
+fn wallet_scan_gap() -> u32 {
+    env::var("KNOX_WALLET_SCAN_GAP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_SCAN_GAP)
+}
+
+fn ensure_default_subaddresses(state: &mut WalletState) {
+    for idx in 0..DEFAULT_VISIBLE_SUBADDRESSES {
+        if !state.subaddress_indices.contains(&idx) {
+            state.subaddress_indices.push(idx);
+        }
+    }
+    state.subaddress_indices.sort_unstable();
+    state.subaddress_indices.dedup();
+    state.next_subaddress_index = state
+        .next_subaddress_index
+        .max(
+            state
+                .subaddress_indices
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+        )
+        .max(DEFAULT_VISIBLE_SUBADDRESSES);
+}
+
+fn scan_subaddress_indices(state: &WalletState) -> Vec<u32> {
+    let upper = state
+        .next_subaddress_index
+        .max(DEFAULT_VISIBLE_SUBADDRESSES)
+        .saturating_add(wallet_scan_gap());
+    (0..upper).collect()
+}
+
+fn reward_kind_for_coinbase_output(height: u64, output_index: usize) -> Option<RewardKind> {
+    let split = knox_lattice::coinbase::coinbase_split(height, 0, 1);
+    let mut cursor = 0usize;
+    if output_index == cursor {
+        return Some(RewardKind::Miner);
+    }
+    cursor = cursor.saturating_add(1);
+    if split.treasury > 0 {
+        if output_index == cursor {
+            return Some(RewardKind::Treasury);
+        }
+        cursor = cursor.saturating_add(1);
+    }
+    if split.dev > 0 {
+        if output_index == cursor {
+            return Some(RewardKind::Dev);
+        }
+        cursor = cursor.saturating_add(1);
+    }
+    if split.premine > 0 && output_index == cursor {
+        return Some(RewardKind::Premine);
+    }
+    None
+}
+
+fn record_reward_event(
+    state: &mut WalletState,
+    note: &Note,
+    block_height: u64,
+    block_hash: Hash32,
+    tx_hash: Hash32,
+    output_index: u16,
+) {
+    if state
+        .reward_records
+        .iter()
+        .any(|record| record.tx_hash == tx_hash && record.output_index == output_index)
+    {
+        return;
+    }
+    let Some(kind) = reward_kind_for_coinbase_output(block_height, output_index as usize) else {
+        return;
+    };
+    state.reward_records.push(RewardRecord {
+        block_height,
+        block_hash,
+        tx_hash,
+        output_index,
+        amount: note.amount,
+        subaddress_index: note.subaddress_index,
+        kind,
+    });
+}
+
+fn coinbase_operator_identity(block: &knox_types::Block) -> Option<[u8; 32]> {
+    let coinbase = block.txs.first()?;
+    if !coinbase.coinbase {
+        return None;
+    }
+    let memo = coinbase.outputs.first()?.memo;
+    if memo == [0u8; 32] {
+        None
+    } else {
+        Some(memo)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reward_kind_maps_genesis_outputs_in_order() {
+        let split = knox_lattice::coinbase::coinbase_split(0, 0, 1);
+        assert_eq!(reward_kind_for_coinbase_output(0, 0), Some(RewardKind::Miner));
+        assert_eq!(reward_kind_for_coinbase_output(0, 1), Some(RewardKind::Treasury));
+        let mut next = 2usize;
+        if split.dev > 0 {
+            assert_eq!(reward_kind_for_coinbase_output(0, next), Some(RewardKind::Dev));
+            next = next.saturating_add(1);
+        }
+        assert_eq!(
+            reward_kind_for_coinbase_output(0, next),
+            Some(RewardKind::Premine)
+        );
+        assert_eq!(reward_kind_for_coinbase_output(0, next.saturating_add(1)), None);
+    }
+
+    #[test]
+    fn balances_group_by_subaddress_and_ignore_spent_notes() {
+        let mut state = WalletState {
+            view_secret: [0u8; 32],
+            spend_secret: [0u8; 32],
+            view_public: [0u8; 32],
+            spend_public: [0u8; 32],
+            notes: vec![
+                Note {
+                    out_ref: OutputRef {
+                        tx: Hash32([1u8; 32]),
+                        index: 0,
+                    },
+                    one_time_pub: [0u8; 32],
+                    tx_pub: [0u8; 32],
+                    lattice_spend_pub: Vec::new(),
+                    lattice_one_time_secret: Vec::new(),
+                    one_time_secret: [0u8; 32],
+                    commitment: [0u8; 32],
+                    amount: 10,
+                    blinding: [0u8; 32],
+                    key_image: [1u8; 32],
+                    subaddress_index: 0,
+                },
+                Note {
+                    out_ref: OutputRef {
+                        tx: Hash32([2u8; 32]),
+                        index: 1,
+                    },
+                    one_time_pub: [0u8; 32],
+                    tx_pub: [0u8; 32],
+                    lattice_spend_pub: Vec::new(),
+                    lattice_one_time_secret: Vec::new(),
+                    one_time_secret: [0u8; 32],
+                    commitment: [0u8; 32],
+                    amount: 20,
+                    blinding: [0u8; 32],
+                    key_image: [2u8; 32],
+                    subaddress_index: 1,
+                },
+            ],
+            reward_records: Vec::new(),
+            spent_images: vec![[2u8; 32]],
+            last_height: 0,
+            subaddress_indices: vec![0, 1],
+            next_subaddress_index: 2,
+        };
+        ensure_default_subaddresses(&mut state);
+        assert_eq!(wallet_balances_by_subaddress(&state), vec![(0, 10), (1, 0)]);
+    }
 }
 
 fn rpc_get_fib_wall(addr: &str, limit: u32) -> Result<Vec<knox_types::FibWallEntry>, String> {
@@ -1477,12 +1987,12 @@ fn rpc_request(
     let connect_timeout_ms = std::env::var("KNOX_RPC_CONNECT_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(2500)
+        .unwrap_or(15000)
         .clamp(200, 30000);
     let io_timeout_ms = std::env::var("KNOX_RPC_IO_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(8000)
+        .unwrap_or(120000)
         .clamp(200, 120000);
     let connect_timeout = Duration::from_millis(connect_timeout_ms);
     let io_timeout = Duration::from_millis(io_timeout_ms);

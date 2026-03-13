@@ -2,7 +2,7 @@ use knox_consensus::{ConsensusConfig, ValidatorSet};
 use getrandom::getrandom;
 use knox_lattice::{
     consensus_public_key_id, consensus_secret_from_seed, sign_consensus,
-    coinbase_split, encode_coinbase_payload, encrypt_amount_with_level,
+    coinbase_split, decode_coinbase_payload, encode_coinbase_payload, encrypt_amount_with_level,
     mine_block_proof_with_profile, private_coinbase_outputs, tx_hardening_level,
     verify_consensus, LatticeCoinbasePayload, LatticeCommitment, LatticeCommitmentKey,
     LatticeOutput, LatticePublicKey, LatticeSecretKey, MiningProfile,
@@ -41,6 +41,7 @@ const DEFAULT_SYNC_STALL_MS: u64 = 4_000;
 const DEFAULT_UPSTREAM_SYNC_TIMEOUT_MS: u64 = 120_000;
 const MAX_UPSTREAM_SYNC_BATCH_LOOPS: usize = 8;
 const DEFAULT_UPSTREAM_SYNC_BATCH_COUNT: u32 = 64;
+const CHAIN_CONTINUITY_CHECK_MS: u64 = 5_000;
 
 fn sync_blocks_response_max_bytes() -> usize {
     std::env::var("KNOX_SYNC_BLOCKS_RESPONSE_MAX_BYTES")
@@ -271,6 +272,11 @@ impl Node {
         let mut last_peer_gate_log_ms = 0u64;
         let mut fork_guard_pause_until_ms = 0u64;
         let mut last_fork_guard_log_ms = 0u64;
+        let mut chain_continuity_ok = true;
+        let mut chain_continuity_checked_once = false;
+        let mut chain_continuity_reason = String::new();
+        let mut last_chain_continuity_check_ms = 0u64;
+        let mut last_chain_continuity_log_ms = 0u64;
         let mut last_backend_line = String::new();
         let sync_retry_ms = std::env::var("KNOX_SYNC_RETRY_MS")
             .ok()
@@ -299,6 +305,10 @@ impl Node {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        if upstream_sync_rpc.is_none() {
+            chain_continuity_ok = true;
+            chain_continuity_checked_once = true;
+        }
         eprintln!(
             "[knox-node] upstream sync config batch={} timeout_ms={} rpc={}",
             upstream_sync_batch_count,
@@ -739,6 +749,48 @@ impl Node {
                     let now = now_ms();
                     let active_peers = network.active_peer_count();
                     if let Some(upstream_rpc) = upstream_sync_rpc.as_deref() {
+                        if now.saturating_sub(last_chain_continuity_check_ms) >= CHAIN_CONTINUITY_CHECK_MS {
+                            last_chain_continuity_check_ms = now;
+                            match verify_chain_continuity(&ledger, upstream_rpc, upstream_sync_timeout).await {
+                                Ok(Some(status)) => {
+                                    chain_continuity_checked_once = true;
+                                    if status.ok {
+                                        chain_continuity_ok = true;
+                                        chain_continuity_reason.clear();
+                                    } else {
+                                        chain_continuity_ok = false;
+                                        chain_continuity_reason = format!(
+                                            "mismatch at h={} local={} upstream={}",
+                                            status.shared_height,
+                                            status.local_hash,
+                                            status.upstream_hash
+                                        );
+                                        if now.saturating_sub(last_chain_continuity_log_ms) >= 10_000 {
+                                            eprintln!(
+                                                "[knox-node] chain continuity mismatch at h={} (local_tip={} upstream_tip={}) local={} upstream={} — mining disabled until chain realigns",
+                                                status.shared_height,
+                                                status.local_tip,
+                                                status.upstream_tip,
+                                                status.local_hash,
+                                                status.upstream_hash
+                                            );
+                                            last_chain_continuity_log_ms = now;
+                                        }
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    if !chain_continuity_checked_once {
+                                        chain_continuity_ok = false;
+                                        chain_continuity_reason = format!("validation unavailable: {}", err);
+                                    }
+                                    if now.saturating_sub(last_chain_continuity_log_ms) >= 10_000 {
+                                        eprintln!("[knox-node] chain continuity check unavailable: {}", err);
+                                        last_chain_continuity_log_ms = now;
+                                    }
+                                }
+                            }
+                        }
                         let local_tip = match ledger.lock() {
                             Ok(l) => l.height().unwrap_or(0),
                             Err(_) => 0,
@@ -1021,6 +1073,20 @@ impl Node {
                         }
                         continue;
                     }
+                    if !chain_continuity_ok {
+                        if now.saturating_sub(last_chain_continuity_log_ms) > 10_000 {
+                            eprintln!(
+                                "[knox-node] mining paused: chain continuity not verified ({})",
+                                if chain_continuity_reason.is_empty() {
+                                    "waiting for trusted chain confirmation"
+                                } else {
+                                    &chain_continuity_reason
+                                }
+                            );
+                            last_chain_continuity_log_ms = now;
+                        }
+                        continue;
+                    }
                     {
                         let ts_now = now_ms();
                         let (height, proposer_streak, mining_rules, prev_block) = match ledger.lock() {
@@ -1283,6 +1349,105 @@ async fn rpc_get_blocks_with_timeout(
     }
 }
 
+async fn rpc_get_tip_with_timeout(addr: &str, timeout_dur: Duration) -> Result<u64, String> {
+    match rpc_request_with_timeout(addr, WalletRequest::GetTip, timeout_dur).await? {
+        WalletResponse::Tip(height) => Ok(height),
+        _ => Err("unexpected get-tip response".to_string()),
+    }
+}
+
+async fn rpc_get_block_with_timeout(
+    addr: &str,
+    height: u64,
+    timeout_dur: Duration,
+) -> Result<Option<Block>, String> {
+    match rpc_request_with_timeout(addr, WalletRequest::GetBlock(height), timeout_dur).await? {
+        WalletResponse::Block(block) => Ok(block),
+        _ => Err("unexpected get-block response".to_string()),
+    }
+}
+
+struct ChainContinuityStatus {
+    ok: bool,
+    shared_height: u64,
+    local_tip: u64,
+    upstream_tip: u64,
+    local_hash: String,
+    upstream_hash: String,
+}
+
+async fn verify_chain_continuity(
+    ledger: &Arc<Mutex<Ledger>>,
+    upstream_rpc: &str,
+    timeout_dur: Duration,
+) -> Result<Option<ChainContinuityStatus>, String> {
+    let (local_tip, has_genesis, local_genesis_hash, local_anchor_hash) = {
+        let l = ledger
+            .lock()
+            .map_err(|_| "ledger lock poisoned".to_string())?;
+        let local_tip = l.height().unwrap_or(0);
+        let Some(genesis) = l.get_block(0).unwrap_or(None) else {
+            return Ok(None);
+        };
+        let local_genesis_hash = hash_header_for_link(&genesis.header);
+        let local_anchor_hash = if local_tip == 0 {
+            local_genesis_hash
+        } else {
+            let anchor = l
+                .get_block(local_tip)
+                .map_err(|e| format!("local anchor lookup failed: {e}"))?
+                .ok_or_else(|| format!("local anchor block missing at h={local_tip}"))?;
+            hash_header_for_link(&anchor.header)
+        };
+        (local_tip, true, local_genesis_hash, local_anchor_hash)
+    };
+    if !has_genesis {
+        return Ok(None);
+    }
+
+    let upstream_tip = rpc_get_tip_with_timeout(upstream_rpc, timeout_dur).await?;
+    let upstream_genesis = rpc_get_block_with_timeout(upstream_rpc, 0, timeout_dur)
+        .await?
+        .ok_or_else(|| "upstream genesis missing".to_string())?;
+    let upstream_genesis_hash = hash_header_for_link(&upstream_genesis.header);
+    if upstream_genesis_hash != local_genesis_hash {
+        return Ok(Some(ChainContinuityStatus {
+            ok: false,
+            shared_height: 0,
+            local_tip,
+            upstream_tip,
+            local_hash: hex_hash(local_genesis_hash),
+            upstream_hash: hex_hash(upstream_genesis_hash),
+        }));
+    }
+
+    let shared_height = local_tip.min(upstream_tip);
+    let local_hash = if shared_height == local_tip {
+        local_anchor_hash
+    } else {
+        let l = ledger
+            .lock()
+            .map_err(|_| "ledger lock poisoned".to_string())?;
+        let local_shared = l
+            .get_block(shared_height)
+            .map_err(|e| format!("local shared block lookup failed: {e}"))?
+            .ok_or_else(|| format!("local shared block missing at h={shared_height}"))?;
+        hash_header_for_link(&local_shared.header)
+    };
+    let upstream_shared = rpc_get_block_with_timeout(upstream_rpc, shared_height, timeout_dur)
+        .await?
+        .ok_or_else(|| format!("upstream shared block missing at h={shared_height}"))?;
+    let upstream_hash = hash_header_for_link(&upstream_shared.header);
+    Ok(Some(ChainContinuityStatus {
+        ok: local_hash == upstream_hash,
+        shared_height,
+        local_tip,
+        upstream_tip,
+        local_hash: hex_hash(local_hash),
+        upstream_hash: hex_hash(upstream_hash),
+    }))
+}
+
 fn append_finalized_block(
     block: &Block,
     ledger: &Arc<Mutex<Ledger>>,
@@ -1295,16 +1460,19 @@ fn append_finalized_block(
     };
     match result {
         Ok(()) => {
+            let reward_log = coinbase_reward_log(block);
             if height == 0 {
                 eprintln!(
-                    "[knox-node] sealed genesis block (premine minted) txs={}",
-                    block.txs.len()
+                    "[knox-node] sealed genesis block (premine minted) txs={}{}",
+                    block.txs.len(),
+                    reward_log
                 );
             } else {
                 eprintln!(
-                    "[knox-node] sealed block {} txs={}",
+                    "[knox-node] sealed block {} txs={}{}",
                     height,
-                    block.txs.len()
+                    block.txs.len(),
+                    reward_log
                 );
             }
             if let Ok(mut mp) = mempool.lock() {
@@ -1331,6 +1499,45 @@ fn append_finalized_block(
             false
         }
     }
+}
+
+fn coinbase_reward_log(block: &Block) -> String {
+    let Some(coinbase) = block.txs.first() else {
+        return String::new();
+    };
+    if !coinbase.coinbase {
+        return String::new();
+    }
+    let Ok(payload) = decode_coinbase_payload(&coinbase.extra) else {
+        return String::new();
+    };
+    let split = coinbase_split(block.header.height, 0, 1);
+    let mut cursor = 0usize;
+    let miner = payload.amounts.get(cursor).copied().unwrap_or(0);
+    cursor = cursor.saturating_add(1);
+    let treasury = if split.treasury > 0 {
+        let value = payload.amounts.get(cursor).copied().unwrap_or(0);
+        cursor = cursor.saturating_add(1);
+        value
+    } else {
+        0
+    };
+    let dev = if split.dev > 0 {
+        let value = payload.amounts.get(cursor).copied().unwrap_or(0);
+        cursor = cursor.saturating_add(1);
+        value
+    } else {
+        0
+    };
+    let premine = if split.premine > 0 {
+        payload.amounts.get(cursor).copied().unwrap_or(0)
+    } else {
+        0
+    };
+    format!(
+        " rewards miner={} treasury={} dev={} premine={}",
+        miner, treasury, dev, premine
+    )
 }
 
 async fn run_rpc(
@@ -1841,6 +2048,15 @@ fn hash_header_for_link(header: &BlockHeader) -> Hash32 {
     hash_header_for_signing(&h)
 }
 
+fn hex_hash(hash: Hash32) -> String {
+    let mut out = String::with_capacity(64);
+    for b in hash.0 {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{:02x}", b);
+    }
+    out
+}
+
 impl RateLimiter {
     fn allow(&self, ip: IpAddr, limit_per_sec: u32, now_ms: u64) -> bool {
         let Ok(mut map) = self.inner.lock() else {
@@ -1998,7 +2214,11 @@ fn build_coinbase(
             enc_amount,
             enc_blind,
             enc_level,
-            memo: [0u8; 32],
+            memo: if idx == 0 {
+                miner_operator_identity(recipient)
+            } else {
+                [0u8; 32]
+            },
             range_proof: lattice_range_placeholder(&lattice_out.range_proof),
         };
         outputs.push(tx_out);
@@ -2023,6 +2243,13 @@ fn build_coinbase(
         fee: 0,
         extra,
     })
+}
+
+fn miner_operator_identity(addr: &Address) -> [u8; 32] {
+    let mut data = Vec::with_capacity(26 + addr.view.len());
+    data.extend_from_slice(b"knox-miner-operator-v1");
+    data.extend_from_slice(&addr.view);
+    hash_bytes(&data).0
 }
 
 fn lattice_public_from_serialized(bytes: &[u8]) -> Result<LatticePublicKey, String> {

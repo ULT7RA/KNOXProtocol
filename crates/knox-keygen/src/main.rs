@@ -1,6 +1,6 @@
 use std::fs;
 
-use knox_crypto::generate_keypair;
+use getrandom::getrandom;
 use knox_lattice::{
     consensus_public_from_secret, consensus_secret_from_seed, encode_consensus_public_key,
 };
@@ -31,18 +31,32 @@ fn main() {
         return;
     }
     let expose_secret = args.iter().any(|a| a == "--full-keypair");
-    match generate_keypair() {
-        Ok((sk, pk)) => {
+    match random_secret_bytes() {
+        Ok(sk) => {
+            let pk = derive_public_tag(&sk);
             if expose_secret {
-                println!("{}{}", hex(&sk.0), hex(&pk.0));
+                println!("{}{}", hex(&sk), hex(&pk));
             } else {
-                println!("{}", hex(&pk.0));
+                println!("{}", hex(&pk));
             }
         }
         Err(e) => {
             eprintln!("error: {e}");
         }
     }
+}
+
+fn random_secret_bytes() -> Result<[u8; 32], String> {
+    let mut out = [0u8; 32];
+    getrandom(&mut out).map_err(|e| format!("getrandom failed: {e}"))?;
+    Ok(out)
+}
+
+fn derive_public_tag(secret: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"knox-node-public-v2");
+    h.update(secret);
+    *h.finalize().as_bytes()
 }
 
 fn hex(bytes: &[u8]) -> String {

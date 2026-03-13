@@ -1,15 +1,15 @@
-use argon2::{Algorithm, Argon2, Params, Version};
 use knox_types::{BlockHeader, LatticeProof};
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::path::Path;
 
-const CUDA_FATBIN: &[u8] = include_bytes!("knox_mining_32.fatbin");
+const CUDA_FATBIN: &[u8] = include_bytes!("kernelcuda.fatbin");
 
 use crate::params::{
     ANNUAL_ESCALATION, BLOCKS_PER_YEAR, MEMORY_ANNUAL_GROWTH, MEMORY_BASE_BYTES, MIN_SEQ_STEPS, N,
 };
 use crate::poly::{ntt_forward, ntt_inverse, ntt_pointwise_mul_in_place};
 use crate::sample::{hash_to_poly, sample_cbd};
+use crate::velox_reaper;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MiningMode {
@@ -100,7 +100,7 @@ impl Default for MiningProfile {
             seq_steps: None,
             memory_bytes: None,
             cpu_util: 70,
-            gpu_util: 90,
+            gpu_util: 100,
             gpu_device_id: None,
             cuda_device_ordinal: None,
         }
@@ -577,24 +577,17 @@ pub fn sequential_proof(header_hash: &[u8; 32], nonce: u64, steps: u64) -> [u8; 
     h
 }
 
-/// Argon2id memory-hard pass anchored to the lattice chain output.
+/// VeloxReaper memory-hard pass anchored to the lattice chain output.
 ///
-/// The password is the full 2 048-byte serialised polynomial so that
-/// memory-hard cost is bound to the ULT7Rock chain result.
-/// The salt is the previous block hash for chain binding.
+/// Replaces Argon2id with a pure-lattice DAG that bottlenecks on DRAM
+/// latency.  The polynomial bytes from the sequential chain serve as the
+/// seed; the previous block hash provides chain binding.
 pub fn memory_proof(
     lattice_poly_bytes: &[u8],
     prev_hash: &[u8; 32],
-    memory_bytes: u32,
+    height: u64,
 ) -> Result<[u8; 32], String> {
-    let m_cost_kib = (memory_bytes / 1024).max(8 * 1024);
-    let params = Params::new(m_cost_kib, 2, 1, Some(32)).map_err(|e| e.to_string())?;
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut output = [0u8; 32];
-    argon2
-        .hash_password_into(lattice_poly_bytes, prev_hash, &mut output)
-        .map_err(|e| e.to_string())?;
-    Ok(output)
+    velox_reaper::memory_proof(lattice_poly_bytes, prev_hash, height)
 }
 
 // Retained as a dead-code stub for any external callers that may reference it.
@@ -627,11 +620,11 @@ fn try_mine_nonce(
     nonce: u64,
     difficulty_bits: u32,
     steps: u64,
-    mem: u32,
+    height: u64,
 ) -> Option<LatticeProof> {
     let (poly_bytes, digest) = lattice_sequential_chain(a_hat, header_hash, nonce, steps);
 
-    // Fast-reject: most nonces fail here before touching Argon2.
+    // Fast-reject: most nonces fail here before touching VeloxReaper DAG.
     if leading_zero_bits(&digest) < difficulty_bits.max(1) {
         return None;
     }
@@ -640,7 +633,7 @@ fn try_mine_nonce(
     // so the verifier can reconstruct and compare without transmitting 2 048 bytes.
     let seq_digest: [u8; 32] = *blake3::hash(&poly_bytes).as_bytes();
 
-    let mem_hash = memory_proof(&poly_bytes, prev_hash, mem).ok()?;
+    let mem_hash = memory_proof(&poly_bytes, prev_hash, height).ok()?;
     let contrib = clh_contribution(&seq_digest, &mem_hash, &digest);
 
     Some(LatticeProof {
@@ -670,7 +663,7 @@ fn proof_from_s_hat_after_chain(
     header: &BlockHeader,
     nonce: u64,
     difficulty_bits: u32,
-    mem: u32,
+    height: u64,
     s_hat_after: &[u64],
 ) -> Option<LatticeProof> {
     if s_hat_after.len() != N {
@@ -696,7 +689,7 @@ fn proof_from_s_hat_after_chain(
         return None;
     }
     let seq_digest: [u8; 32] = *blake3::hash(&poly_bytes).as_bytes();
-    let mem_hash = memory_proof(&poly_bytes, &header.prev.0, mem).ok()?;
+    let mem_hash = memory_proof(&poly_bytes, &header.prev.0, height).ok()?;
     let contrib = clh_contribution(&seq_digest, &mem_hash, &digest);
     Some(LatticeProof {
         nonce,
@@ -718,8 +711,7 @@ pub fn mine_block_proof_with_difficulty(
     difficulty_bits: u32,
 ) -> LatticeProof {
     let steps = sequential_steps(header.height);
-    let mem = memory_bytes(header.height);
-    mine_block_proof_custom(header, worker_id, difficulty_bits, steps, mem)
+    mine_block_proof_custom(header, worker_id, difficulty_bits, steps, header.height)
 }
 
 fn mine_block_proof_custom(
@@ -727,7 +719,7 @@ fn mine_block_proof_custom(
     worker_id: u64,
     difficulty_bits: u32,
     steps: u64,
-    mem: u32,
+    height: u64,
 ) -> LatticeProof {
     let header_hash = header_challenge(header);
     // Pre-compute the fixed block challenge once — reused for every nonce.
@@ -743,7 +735,7 @@ fn mine_block_proof_custom(
             nonce,
             difficulty_bits,
             steps,
-            mem,
+            height,
         ) {
             return proof;
         }
@@ -790,7 +782,7 @@ fn mine_block_proof_gpu_assisted(
     worker_id: u64,
     difficulty_bits: u32,
     steps: u64,
-    mem: u32,
+    height: u64,
     backend: MiningBackend,
     profile: &MiningProfile,
 ) -> Result<LatticeProof, String> {
@@ -876,7 +868,7 @@ fn mine_block_proof_gpu_assisted(
                     header,
                     nonce,
                     difficulty_bits,
-                    mem,
+                    height,
                     &chain_states[off..off + N],
                 ) {
                     return Ok(proof);
@@ -894,7 +886,7 @@ fn mine_block_proof_gpu_assisted(
             if let Some(winning_nonce) = offload_res {
                 if let Some(proof) = try_mine_nonce(
                     &a_hat, &header_hash, &header.prev.0,
-                    winning_nonce, difficulty_bits, steps, mem
+                    winning_nonce, difficulty_bits, steps, height
                 ) {
                     return Ok(proof);
                 }
@@ -1556,6 +1548,9 @@ type CuLaunchKernel = unsafe extern "C" fn(
 ) -> CuResult;
 type CuCtxSynchronize = unsafe extern "C" fn() -> CuResult;
 type CuCtxSetCurrent = unsafe extern "C" fn(CuContext) -> CuResult;
+type CuStreamCreate = unsafe extern "C" fn(*mut CuStream, u32) -> CuResult;
+type CuStreamDestroy = unsafe extern "C" fn(CuStream) -> CuResult;
+type CuStreamSynchronize = unsafe extern "C" fn(CuStream) -> CuResult;
 
 struct CudaFns {
     init: CuInit,
@@ -1573,6 +1568,9 @@ struct CudaFns {
     memcpy_htod: CuMemcpyHtoD,
     launch_kernel: CuLaunchKernel,
     ctx_synchronize: CuCtxSynchronize,
+    stream_create: CuStreamCreate,
+    stream_destroy: CuStreamDestroy,
+    stream_synchronize: CuStreamSynchronize,
 }
 
 
@@ -1589,12 +1587,21 @@ struct CudaNonceSource {
     a_hat_ptr: CuDevicePtr,
     twiddle_fwd_ptr: CuDevicePtr,
     twiddle_inv_ptr: CuDevicePtr,
-    out_winning_nonce_ptr: CuDevicePtr,
-    out_found_flag_ptr: CuDevicePtr,
+    // Double-buffering: 2 streams + 2 output buffer pairs (flag + nonce).
+    // Slot N's kernel runs on streams[N]; results land in out_flag_ptrs[N] / out_nonce_ptrs[N].
+    streams: [CuStream; 2],
+    out_nonce_ptrs: [CuDevicePtr; 2],
+    out_flag_ptrs: [CuDevicePtr; 2],
+    // Which slot has a kernel currently in-flight (None on first call).
+    pending_slot: Option<usize>,
+    // Which slot will be used for the next launch.
+    current_slot: usize,
     // Reused host-side staging buffers to avoid per-launch allocations.
     host_a_32: Vec<u32>,
     host_fw_32: Vec<u32>,
     host_iv_32: Vec<u32>,
+    // Cache the last uploaded header so static GPU data is only re-uploaded on block change.
+    cached_header: [u8; 32],
 }
 
 impl CudaNonceSource {
@@ -1621,6 +1628,9 @@ impl CudaNonceSource {
                 memcpy_htod: load_symbol_any(&lib, &["cuMemcpyHtoD_v2", "cuMemcpyHtoD"])?,
                 launch_kernel: load_symbol(&lib, "cuLaunchKernel")?,
                 ctx_synchronize: load_symbol(&lib, "cuCtxSynchronize")?,
+                stream_create: load_symbol(&lib, "cuStreamCreate")?,
+                stream_destroy: load_symbol(&lib, "cuStreamDestroy")?,
+                stream_synchronize: load_symbol(&lib, "cuStreamSynchronize")?,
             }
         };
 
@@ -1656,25 +1666,38 @@ impl CudaNonceSource {
         let mut a_hat_ptr = 0u64;
         let mut twiddle_fwd_ptr = 0u64;
         let mut twiddle_inv_ptr = 0u64;
-        let mut out_winning_nonce_ptr = 0u64;
-        let mut out_found_flag_ptr = 0u64;
+        let mut out_nonce_ptr0 = 0u64;
+        let mut out_nonce_ptr1 = 0u64;
+        let mut out_flag_ptr0 = 0u64;
+        let mut out_flag_ptr1 = 0u64;
+        let mut stream0: CuStream = std::ptr::null_mut();
+        let mut stream1: CuStream = std::ptr::null_mut();
 
         unsafe {
         cuda_ok(unsafe { (fns.mem_alloc)(&mut header_hash_ptr as *mut _, 32) }, "cuMemAlloc_header")?;
         cuda_ok(unsafe { (fns.mem_alloc)(&mut a_hat_ptr as *mut _, (N * 4) as usize) }, "cuMemAlloc_ahat")?;
         cuda_ok(unsafe { (fns.mem_alloc)(&mut twiddle_fwd_ptr as *mut _, (N * 4) as usize) }, "cuMemAlloc_fwd")?;
         cuda_ok(unsafe { (fns.mem_alloc)(&mut twiddle_inv_ptr as *mut _, (N * 4) as usize) }, "cuMemAlloc_inv")?;
-        cuda_ok(unsafe { (fns.mem_alloc)(&mut out_winning_nonce_ptr as *mut _, 8) }, "cuMemAlloc_nonce")?;
-        cuda_ok(unsafe { (fns.mem_alloc)(&mut out_found_flag_ptr as *mut _, 4) }, "cuMemAlloc_flag")?;
+        cuda_ok(unsafe { (fns.mem_alloc)(&mut out_nonce_ptr0 as *mut _, 8) }, "cuMemAlloc_nonce0")?;
+        cuda_ok(unsafe { (fns.mem_alloc)(&mut out_nonce_ptr1 as *mut _, 8) }, "cuMemAlloc_nonce1")?;
+        cuda_ok(unsafe { (fns.mem_alloc)(&mut out_flag_ptr0 as *mut _, 4) }, "cuMemAlloc_flag0")?;
+        cuda_ok(unsafe { (fns.mem_alloc)(&mut out_flag_ptr1 as *mut _, 4) }, "cuMemAlloc_flag1")?;
+        cuda_ok(unsafe { (fns.stream_create)(&mut stream0 as *mut _, 0) }, "cuStreamCreate_0")?;
+        cuda_ok(unsafe { (fns.stream_create)(&mut stream1 as *mut _, 0) }, "cuStreamCreate_1")?;
         }
 
         Ok(Self {
             _lib: lib, fns, context, module, kernel,
             header_hash_ptr, a_hat_ptr, twiddle_fwd_ptr, twiddle_inv_ptr,
-            out_winning_nonce_ptr, out_found_flag_ptr,
+            streams: [stream0, stream1],
+            out_nonce_ptrs: [out_nonce_ptr0, out_nonce_ptr1],
+            out_flag_ptrs: [out_flag_ptr0, out_flag_ptr1],
+            pending_slot: None,
+            current_slot: 0,
             host_a_32: vec![0u32; N],
             host_fw_32: vec![0u32; N],
             host_iv_32: vec![0u32; N],
+            cached_header: [0u8; 32],
         })
     }
 
@@ -1692,20 +1715,46 @@ impl CudaNonceSource {
         // → driver reads garbage → 113 GB phantom allocation → crash.
         cuda_ok(unsafe { (self.fns.ctx_set_current)(self.context) }, "cuCtxSetCurrent")?;
 
-        // Cast u64 arrays to u32 into reusable staging buffers.
-        for i in 0..N {
-            self.host_a_32[i] = a_hat[i] as u32;
-            self.host_fw_32[i] = twiddle_fwd[i] as u32;
-            self.host_iv_32[i] = twiddle_inv[i] as u32;
-        }
+        // ---- Phase 1: collect result from the previously-launched slot (if any) ----
+        // We sync *before* touching shared static buffers so there's no write-while-read race
+        // if the header changed and we need to re-upload a_hat / twiddles.
+        let prev_result: Option<u64> = if let Some(pending) = self.pending_slot {
+            cuda_ok(unsafe { (self.fns.stream_synchronize)(self.streams[pending]) }, "cuStreamSynchronize")?;
+            let mut host_flag = [0u32];
+            cuda_ok(unsafe { (self.fns.memcpy_dtoh)(host_flag.as_mut_ptr() as *mut _, self.out_flag_ptrs[pending], 4) }, "cuMemcpyDtoH_flag")?;
+            if host_flag[0] == 1 {
+                let mut host_nonce = [0u64];
+                cuda_ok(unsafe { (self.fns.memcpy_dtoh)(host_nonce.as_mut_ptr() as *mut _, self.out_nonce_ptrs[pending], 8) }, "cuMemcpyDtoH_nonce")?;
+                Some(host_nonce[0])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
+        // ---- Phase 2: launch next kernel on current_slot asynchronously ----
+        let slot = self.current_slot;
+        let stream = self.streams[slot];
         let zero_flag = [0u32];
 
-        cuda_ok(unsafe { (self.fns.memcpy_htod)(self.header_hash_ptr, header_hash.as_ptr() as *const _, 32) }, "cuMemcpyHtoD_header")?;
-        cuda_ok(unsafe { (self.fns.memcpy_htod)(self.a_hat_ptr, self.host_a_32.as_ptr() as *const _, N * 4) }, "cuMemcpyHtoD_ahat")?;
-        cuda_ok(unsafe { (self.fns.memcpy_htod)(self.twiddle_fwd_ptr, self.host_fw_32.as_ptr() as *const _, N * 4) }, "cuMemcpyHtoD_fwd")?;
-        cuda_ok(unsafe { (self.fns.memcpy_htod)(self.twiddle_inv_ptr, self.host_iv_32.as_ptr() as *const _, N * 4) }, "cuMemcpyHtoD_inv")?;
-        cuda_ok(unsafe { (self.fns.memcpy_htod)(self.out_found_flag_ptr, zero_flag.as_ptr() as *const _, 4) }, "cuMemcpyHtoD_flag")?;
+        // Only re-upload static block data when the header changes (new block).
+        // Safe: pending slot's stream was synced above, so GPU is done reading these buffers.
+        if *header_hash != self.cached_header {
+            for i in 0..N {
+                self.host_a_32[i] = a_hat[i] as u32;
+                self.host_fw_32[i] = twiddle_fwd[i] as u32;
+                self.host_iv_32[i] = twiddle_inv[i] as u32;
+            }
+            cuda_ok(unsafe { (self.fns.memcpy_htod)(self.header_hash_ptr, header_hash.as_ptr() as *const _, 32) }, "cuMemcpyHtoD_header")?;
+            cuda_ok(unsafe { (self.fns.memcpy_htod)(self.a_hat_ptr, self.host_a_32.as_ptr() as *const _, N * 4) }, "cuMemcpyHtoD_ahat")?;
+            cuda_ok(unsafe { (self.fns.memcpy_htod)(self.twiddle_fwd_ptr, self.host_fw_32.as_ptr() as *const _, N * 4) }, "cuMemcpyHtoD_fwd")?;
+            cuda_ok(unsafe { (self.fns.memcpy_htod)(self.twiddle_inv_ptr, self.host_iv_32.as_ptr() as *const _, N * 4) }, "cuMemcpyHtoD_inv")?;
+            self.cached_header = *header_hash;
+        }
+
+        // Reset this slot's output flag so the kernel can set it if it finds a nonce.
+        cuda_ok(unsafe { (self.fns.memcpy_htod)(self.out_flag_ptrs[slot], zero_flag.as_ptr() as *const _, 4) }, "cuMemcpyHtoD_flag")?;
 
         let block_x = 256u32;
         let grid_x = ((batch_size as u32).saturating_add(block_x - 1)) / block_x;
@@ -1717,8 +1766,8 @@ impl CudaNonceSource {
         let mut p_nonce = base_nonce;
         let mut p_steps = steps;
         let mut p_diff = difficulty_bits;
-        let mut p_out_nonce = self.out_winning_nonce_ptr;
-        let mut p_out_flag = self.out_found_flag_ptr;
+        let mut p_out_nonce = self.out_nonce_ptrs[slot];
+        let mut p_out_flag = self.out_flag_ptrs[slot];
 
         let mut params = [
             &mut p_header as *mut _ as *mut c_void,
@@ -1732,23 +1781,19 @@ impl CudaNonceSource {
             &mut p_out_flag as *mut _ as *mut c_void,
         ];
 
+        // Launch asynchronously on this slot's stream — GPU runs while CPU returns.
         cuda_ok(unsafe { (self.fns.launch_kernel)(
             self.kernel, grid_x.max(1), 1, 1, block_x, 1, 1, 16384,
-            std::ptr::null_mut(), params.as_mut_ptr(), std::ptr::null_mut()
+            stream, params.as_mut_ptr(), std::ptr::null_mut()
         ) }, "cuLaunchKernel")?;
 
-        cuda_ok(unsafe { (self.fns.ctx_synchronize)() }, "cuCtxSynchronize")?;
+        // Advance the double-buffer: next call will sync this slot and launch on the other.
+        self.pending_slot = Some(slot);
+        self.current_slot = 1 - slot;
 
-        let mut host_flag = [0u32];
-        cuda_ok(unsafe { (self.fns.memcpy_dtoh)(host_flag.as_mut_ptr() as *mut _, self.out_found_flag_ptr, 4) }, "cuMemcpyDtoH")?;
-
-        if host_flag[0] == 1 {
-            let mut host_nonce = [0u64];
-            cuda_ok(unsafe { (self.fns.memcpy_dtoh)(host_nonce.as_mut_ptr() as *mut _, self.out_winning_nonce_ptr, 8) }, "cuMemcpyDtoH")?;
-            Ok(Some(host_nonce[0]))
-        } else {
-            Ok(None)
-        }
+        // Return the result from the *previous* kernel (one-batch pipeline delay).
+        // The caller retries until a nonce is found; a single-batch delay is inconsequential.
+        Ok(prev_result)
     }
 }
 
@@ -1815,15 +1860,12 @@ pub fn mine_block_proof_with_profile(
 
     let difficulty = expected_difficulty_bits.max(1);
     let mut steps = sequential_steps(header.height);
-    let mut mem = memory_bytes(header.height);
+    let height = header.height;
 
     // Keep mainnet deterministic: explicit profile overrides only apply in debug mode.
     if mining_debug_enabled() {
         if let Some(v) = profile.seq_steps {
             steps = v.max(1);
-        }
-        if let Some(v) = profile.memory_bytes {
-            mem = v.max(1024);
         }
     }
 
@@ -1862,7 +1904,7 @@ pub fn mine_block_proof_with_profile(
                 effective_worker_id,
                 difficulty,
                 steps,
-                mem,
+                height,
                 active_backend,
                 profile,
             ) {
@@ -1885,11 +1927,11 @@ pub fn mine_block_proof_with_profile(
                         Some(prev) => format!("{prev}|{tag}"),
                         None => tag,
                     });
-                    mine_block_proof_custom(header, effective_worker_id, difficulty, steps, mem)
+                    mine_block_proof_custom(header, effective_worker_id, difficulty, steps, height)
                 }
             }
         }
-        _ => mine_block_proof_custom(header, effective_worker_id, difficulty, steps, mem),
+        _ => mine_block_proof_custom(header, effective_worker_id, difficulty, steps, height),
     };
 
     let device_label = match active_backend {
@@ -1926,9 +1968,25 @@ pub fn verify_block_proof_with_difficulty(
     proof: &LatticeProof,
     expected_difficulty_bits: u32,
 ) -> bool {
+    explain_block_proof_failure_with_difficulty(header, proof, expected_difficulty_bits).is_none()
+}
+
+fn short_hash(hash: &[u8; 32]) -> String {
+    hash[..6].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn explain_block_proof_failure_with_difficulty(
+    header: &BlockHeader,
+    proof: &LatticeProof,
+    expected_difficulty_bits: u32,
+) -> Option<String> {
     let header_hash = header_challenge(header);
-    if proof.difficulty_bits != expected_difficulty_bits.max(1) {
-        return false;
+    let expected_bits = expected_difficulty_bits.max(1);
+    if proof.difficulty_bits != expected_bits {
+        return Some(format!(
+            "difficulty mismatch expected={} got={}",
+            expected_bits, proof.difficulty_bits
+        ));
     }
 
     // Recompute the ULT7Rock lattice chain from the nonce stored in the proof.
@@ -1938,29 +1996,58 @@ pub fn verify_block_proof_with_difficulty(
 
     // The pow_hash field holds the BLAKE3 commitment digest that met the target.
     if digest != proof.pow_hash {
-        return false;
+        return Some(format!(
+            "pow_hash mismatch expected={} got={}",
+            short_hash(&digest),
+            short_hash(&proof.pow_hash)
+        ));
     }
-    if leading_zero_bits(&digest) < proof.difficulty_bits {
-        return false;
+    let got_bits = leading_zero_bits(&digest);
+    if got_bits < proof.difficulty_bits {
+        return Some(format!(
+            "insufficient leading zero bits expected>={} got={}",
+            proof.difficulty_bits, got_bits
+        ));
     }
 
     // The sequential_chain field holds BLAKE3(poly_bytes) — verify it matches.
     let expected_seq_digest: [u8; 32] = *blake3::hash(&poly_bytes).as_bytes();
     if expected_seq_digest != proof.sequential_chain {
-        return false;
+        return Some(format!(
+            "sequential chain mismatch expected={} got={}",
+            short_hash(&expected_seq_digest),
+            short_hash(&proof.sequential_chain)
+        ));
     }
 
-    // Verify the Argon2id memory-hard pass over the full polynomial bytes.
-    let mem = memory_bytes(header.height);
-    let mem_hash = match memory_proof(&poly_bytes, &header.prev.0, mem) {
+    // Verify the VeloxReaper memory-hard pass over the full polynomial bytes.
+    let mem_hash = match memory_proof(&poly_bytes, &header.prev.0, header.height) {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(err) => {
+            return Some(format!(
+                "memory proof recompute failed: {}",
+                sanitize_log_value(&err)
+            ))
+        }
     };
     if mem_hash != proof.memory_hash {
-        return false;
+        return Some(format!(
+            "memory hash mismatch expected={} got={}",
+            short_hash(&mem_hash),
+            short_hash(&proof.memory_hash)
+        ));
     }
 
-    clh_contribution(&expected_seq_digest, &mem_hash, &digest) == proof.clh_contribution
+    let expected_clh = clh_contribution(&expected_seq_digest, &mem_hash, &digest);
+    if expected_clh != proof.clh_contribution {
+        return Some(format!(
+            "clh contribution mismatch expected={} got={}",
+            short_hash(&expected_clh),
+            short_hash(&proof.clh_contribution)
+        ));
+    }
+
+    None
 }
 
 #[cfg(test)]

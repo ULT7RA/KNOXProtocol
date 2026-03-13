@@ -28,6 +28,8 @@ pub const MIN_BLOCK_TIME_MS: u64 = 30_000;
 pub const MAX_BLOCK_TIME_MS: u64 = 60_000;
 
 pub const MAX_BLOCK_TX: usize = 12000;
+pub const MAX_BLOCK_BYTES: usize = 128 * 1024 * 1024;
+pub const LEDGER_SNAPSHOT_INTERVAL_BLOCKS: u64 = 500;
 
 pub const DEFAULT_DECOY_COUNT: usize = 31;
 pub const MIN_DECOY_COUNT: usize = 15;

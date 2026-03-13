@@ -18,6 +18,10 @@ name = "rpc_tip"
 path = "src/bin/rpc_tip.rs"
 
 [[bin]]
+name = "rpc_block"
+path = "src/bin/rpc_block.rs"
+
+[[bin]]
 name = "genesis_decode"
 path = "src/bin/genesis_decode.rs"
 
@@ -29,5 +33,6 @@ argon2.workspace = true
 zeroize.workspace = true
 subtle.workspace = true
 getrandom.workspace = true
+curve25519-dalek = "4"
 knox-lattice = { path = "../knox-lattice" }
 knox-types = { path = "../knox-types" }

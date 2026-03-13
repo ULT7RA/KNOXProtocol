@@ -585,19 +585,18 @@ async fn send_to_peers(
             tokio::spawn(async move {
                 let _ = tx.send(env_clone).await;
             });
-        } else if first_h.is_some() {
+        } else {
             let queued = block_requesters
                 .lock()
                 .ok()
                 .map(|q| q.len())
                 .unwrap_or(0);
             eprintln!(
-                "[p2p] WARN dropping unrouted Blocks batch (first_h={}, queued_requesters={})",
+                "[p2p] WARN unrouted Blocks batch; falling back to broadcast (first_h={}, queued_requesters={}, peers={})",
                 first_h.unwrap_or(0),
-                queued
+                queued,
+                senders.len()
             );
-        } else {
-            eprintln!("[p2p] WARN no queued requester for Blocks; falling back to broadcast");
             for tx in senders {
                 let env_clone = env.clone();
                 tokio::spawn(async move {

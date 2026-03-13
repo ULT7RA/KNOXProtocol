@@ -1,6 +1,6 @@
 use knox_consensus::{ConsensusConfig, ValidatorSet};
 use knox_core::{Node, NodeConfig};
-use knox_crypto::{generate_keypair, hash_to_scalar, public_from_secret, PublicKey, SecretKey};
+use getrandom::getrandom;
 use knox_ledger::Ledger;
 use knox_lattice::{
     consensus_public_from_secret, consensus_public_key_id, consensus_secret_from_seed,
@@ -9,14 +9,21 @@ use knox_lattice::{
 use knox_p2p::NetworkConfig;
 use knox_types::{hash_bytes, Address, Block};
 use std::fs;
-use std::io::Write;
 use std::path::Path;
+#[cfg(unix)]
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 const LATTICE_PUBKEY_BYTES: usize = knox_lattice::params::N * 2;
+
+#[derive(Clone, Copy)]
+struct SecretKey([u8; 32]);
+
+#[derive(Clone, Copy)]
+struct PublicKey([u8; 32]);
 
 fn main() {
     if std::env::var("KNOX_NODE_EXIT_IMMEDIATELY").is_ok() {
@@ -146,18 +153,9 @@ async fn async_main() {
             std::process::exit(1);
         }
     }
-    if let Some(lock) = &lock {
-        if miner_address != lock.premine_address {
-            eprintln!(
-                "mainnet lock violation: premine/miner address mismatch (expected {})",
-                address_to_string(&lock.premine_address)
-            );
-            std::process::exit(1);
-        }
-        if let Err(e) = enforce_existing_genesis(lock, &data_dir) {
-            eprintln!("mainnet lock violation: {e}");
-            std::process::exit(1);
-        }
+    if let Err(e) = enforce_existing_genesis(lock.as_ref(), &data_dir) {
+        eprintln!("genesis consistency violation: {e}");
+        std::process::exit(1);
     }
 
     // Emit ledger tip stats so the desktop UI can pre-populate height and
@@ -180,6 +178,34 @@ async fn async_main() {
         }
     }
 
+    let premine_address = lock
+        .as_ref()
+        .map(|l| l.premine_address.clone())
+        .unwrap_or_else(|| miner_address.clone());
+    let treasury_address = lock
+        .as_ref()
+        .and_then(|l| l.treasury_address.clone())
+        .unwrap_or_else(|| miner_address.clone());
+    let p2p_protocol_version = std::env::var("KNOX_P2P_PROTOCOL_VERSION")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(2);
+    let p2p_genesis_hash_hex = lock
+        .as_ref()
+        .and_then(|l| l.genesis_hash_hex.clone())
+        .map(Ok)
+        .unwrap_or_else(embedded_genesis_hash_hex);
+    let p2p_genesis_hash = match p2p_genesis_hash_hex
+        .and_then(|h| parse_hash32_hex(&h))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("p2p genesis hash config error: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let cfg = NodeConfig {
         data_dir,
         network: NetworkConfig {
@@ -190,6 +216,8 @@ async fn async_main() {
             cover_interval_ms: 5000,
             lattice_public: Some(consensus_public.p.to_bytes()),
             lattice_secret: Some(consensus_secret.s.to_bytes()),
+            protocol_version: p2p_protocol_version,
+            genesis_hash: p2p_genesis_hash,
         },
         consensus: ConsensusConfig {
             epoch_length: 120,
@@ -200,9 +228,9 @@ async fn async_main() {
         consensus_keypair: Some((consensus_secret, consensus_public)),
         rpc_bind,
         miner_address: miner_address.clone(),
-        treasury_address: miner_address.clone(),
+        treasury_address,
         dev_address: miner_address.clone(),
-        premine_address: miner_address,
+        premine_address,
         mining_enabled: mining_enabled(),
         mining_profile: MiningProfile::from_env(),
         diamond_authenticators,
@@ -242,18 +270,18 @@ fn seed_embedded_genesis(data_dir: &str) -> Result<(), String> {
 fn derive_address_from_node_key(sk: &SecretKey) -> Address {
     if std::env::var("KNOX_NODE_ADDRESS_RAW").ok().as_deref() == Some("1") {
         let pk = public_from_secret(sk);
-        let lattice_pub = lattice_base_public_from_curve_spend_secret(&sk.0);
+        let lattice_pub = lattice_base_public_from_seed(&sk.0);
         return Address {
             view: pk.0,
             spend: pk.0,
             lattice_spend_pub: lattice_pub.p.to_bytes(),
         };
     }
-    let view_sk = hash_to_scalar(b"knox-wallet-view", &sk.0).to_bytes();
-    let spend_sk = hash_to_scalar(b"knox-wallet-spend", &sk.0).to_bytes();
+    let view_sk = derive_secret_tag(b"knox-wallet-view-v2", &sk.0);
+    let spend_sk = derive_secret_tag(b"knox-wallet-spend-v2", &sk.0);
     let view_pk = public_from_secret(&SecretKey(view_sk));
     let spend_pk = public_from_secret(&SecretKey(spend_sk));
-    let lattice_pub = lattice_base_public_from_curve_spend_secret(&spend_sk);
+    let lattice_pub = lattice_base_public_from_seed(&spend_sk);
     Address {
         view: view_pk.0,
         spend: spend_pk.0,
@@ -264,7 +292,9 @@ fn derive_address_from_node_key(sk: &SecretKey) -> Address {
 fn load_or_create_keypair(data_dir: &str) -> Result<(SecretKey, PublicKey), String> {
     if std::env::var("KNOX_NODE_EPHEMERAL_KEY").is_ok() {
         eprintln!("[knox-node] ephemeral keypair (no file IO)");
-        return generate_keypair();
+        let sk = SecretKey(random_secret_bytes()?);
+        let pk = public_from_secret(&sk);
+        return Ok((sk, pk));
     }
     if let Ok(hex) = std::env::var("KNOX_NODE_KEY_HEX") {
         let hex = hex.trim();
@@ -297,11 +327,10 @@ fn load_or_create_keypair(data_dir: &str) -> Result<(SecretKey, PublicKey), Stri
         eprintln!("[knox-node] key bytes: {}", bytes.len());
         if bytes.len() == 64 {
             let mut sk = [0u8; 32];
-            let mut pk = [0u8; 32];
             sk.copy_from_slice(&bytes[..32]);
-            pk.copy_from_slice(&bytes[32..]);
+            let pk = public_from_secret(&SecretKey(sk));
             eprintln!("[knox-node] key loaded (raw)");
-            return Ok((SecretKey(sk), PublicKey(pk)));
+            return Ok((SecretKey(sk), pk));
         }
         if let Some(text) = decode_text(&bytes) {
             let text = text.trim();
@@ -310,11 +339,10 @@ fn load_or_create_keypair(data_dir: &str) -> Result<(SecretKey, PublicKey), Stri
                 let raw = hex_decode(text)?;
                 if raw.len() == 64 {
                     let mut sk = [0u8; 32];
-                    let mut pk = [0u8; 32];
                     sk.copy_from_slice(&raw[..32]);
-                    pk.copy_from_slice(&raw[32..]);
+                    let pk = public_from_secret(&SecretKey(sk));
                     eprintln!("[knox-node] key loaded (hex)");
-                    return Ok((SecretKey(sk), PublicKey(pk)));
+                    return Ok((SecretKey(sk), pk));
                 }
             }
         } else {
@@ -323,7 +351,8 @@ fn load_or_create_keypair(data_dir: &str) -> Result<(SecretKey, PublicKey), Stri
     }
     eprintln!("[knox-node] generating keypair");
     fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
-    let (sk, pk) = generate_keypair()?;
+    let sk = SecretKey(random_secret_bytes()?);
+    let pk = public_from_secret(&sk);
     let mut bytes = Vec::with_capacity(64);
     bytes.extend_from_slice(&sk.0);
     bytes.extend_from_slice(&pk.0);
@@ -402,6 +431,7 @@ fn load_diamond_auth_endpoints() -> Vec<String> {
 #[derive(Clone)]
 struct MainnetLock {
     premine_address: Address,
+    treasury_address: Option<Address>,
     genesis_hash_hex: Option<String>,
 }
 
@@ -413,12 +443,19 @@ fn load_mainnet_lock() -> Result<Option<MainnetLock>, String> {
         "KNOX_MAINNET_PREMINE_ADDRESS is required when KNOX_MAINNET_LOCK=1".to_string()
     })?;
     let premine_address = parse_address(&premine_str)?;
+    let treasury_address = std::env::var("KNOX_MAINNET_TREASURY_ADDRESS")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(|v| parse_address(&v))
+        .transpose()?;
     let genesis_hash_hex = std::env::var("KNOX_MAINNET_GENESIS_HASH")
         .ok()
         .map(|v| v.trim().to_ascii_lowercase())
         .filter(|v| !v.is_empty());
     Ok(Some(MainnetLock {
         premine_address,
+        treasury_address,
         genesis_hash_hex,
     }))
 }
@@ -435,8 +472,6 @@ fn enforce_mainnet_preflight(
         "KNOX_NODE_ADDRESS_RAW",
         "KNOX_NODE_ALLOW_ANY_VALIDATORS_PATH",
         "KNOX_P2P_PSK",
-        "KNOX_P2P_PSK_SERVICE",
-        "KNOX_P2P_PSK_ACCOUNT",
         "KNOX_P2P_ALLOW_PLAINTEXT",
         "KNOX_ALLOW_UNSAFE_OVERRIDES",
         "KNOX_LATTICE_OPEN_MINING",
@@ -483,10 +518,18 @@ fn enforce_mainnet_preflight(
     Ok(())
 }
 
-fn enforce_existing_genesis(lock: &MainnetLock, data_dir: &str) -> Result<(), String> {
-    let expected = match &lock.genesis_hash_hex {
-        Some(v) => v,
-        None => return Ok(()),
+fn enforce_existing_genesis(lock: Option<&MainnetLock>, data_dir: &str) -> Result<(), String> {
+    let embedded = embedded_genesis_hash_hex()?;
+    let expected = match lock.and_then(|l| l.genesis_hash_hex.as_ref()) {
+        Some(v) => {
+            if *v != embedded {
+                return Err(format!(
+                    "configured KNOX_MAINNET_GENESIS_HASH does not match embedded genesis (configured {v}, embedded {embedded})"
+                ));
+            }
+            v.clone()
+        }
+        None => embedded,
     };
     let ledger = Ledger::open(&format!("{}/ledger", data_dir)).map_err(|e| e.to_string())?;
     let block0 = match ledger.get_block(0)? {
@@ -496,12 +539,26 @@ fn enforce_existing_genesis(lock: &MainnetLock, data_dir: &str) -> Result<(), St
     let header_bytes = bincode::encode_to_vec(&block0.header, bincode::config::standard())
         .map_err(|e| e.to_string())?;
     let got = hex_encode(&hash_bytes(&header_bytes).0);
-    if &got != expected {
+    if got != expected {
         return Err(format!(
-            "genesis hash mismatch (expected {expected}, got {got})"
+            "genesis hash mismatch (expected {expected}, got {got}). remove '{}/ledger' and resync",
+            data_dir
         ));
     }
     Ok(())
+}
+
+fn embedded_genesis_hash_hex() -> Result<String, String> {
+    const EMBEDDED_GENESIS: &[u8] = include_bytes!("genesis.bin");
+    if EMBEDDED_GENESIS.is_empty() {
+        return Err("embedded genesis is empty".to_string());
+    }
+    let (block, _): (Block, usize) =
+        bincode::decode_from_slice(EMBEDDED_GENESIS, bincode::config::standard())
+            .map_err(|e| format!("embedded genesis decode failed: {e}"))?;
+    let header_bytes = bincode::encode_to_vec(&block.header, bincode::config::standard())
+        .map_err(|e| format!("embedded genesis header encode failed: {e}"))?;
+    Ok(hex_encode(&hash_bytes(&header_bytes).0))
 }
 
 fn mining_enabled() -> bool {
@@ -604,6 +661,16 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+fn parse_hash32_hex(s: &str) -> Result<[u8; 32], String> {
+    let bytes = hex_decode(s)?;
+    if bytes.len() != 32 {
+        return Err(format!("expected 32-byte hash, got {} bytes", bytes.len()));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
 fn from_hex(c: u8) -> Result<u8, String> {
     match c {
         b'0'..=b'9' => Ok(c - b'0'),
@@ -645,19 +712,26 @@ fn parse_address(s: &str) -> Result<Address, String> {
     })
 }
 
-fn address_to_string(addr: &Address) -> String {
-    let mut out = String::from("knox1");
-    out.push_str(&hex_encode(&addr.view));
-    out.push_str(&hex_encode(&addr.spend));
-    out.push_str(&hex_encode(&addr.lattice_spend_pub));
-    out
-}
-
-fn lattice_base_public_from_curve_spend_secret(
-    spend_secret: &[u8; 32],
-) -> knox_lattice::LatticePublicKey {
+fn lattice_base_public_from_seed(spend_secret: &[u8; 32]) -> knox_lattice::LatticePublicKey {
     let secret = knox_lattice::LatticeSecretKey {
         s: knox_lattice::Poly::sample_short(b"knox-wallet-lattice-base-v1", spend_secret),
     };
     knox_lattice::ring_sig::public_from_secret(&secret)
+}
+
+fn public_from_secret(secret: &SecretKey) -> PublicKey {
+    PublicKey(derive_secret_tag(b"knox-node-public-v2", &secret.0))
+}
+
+fn derive_secret_tag(domain: &[u8], seed: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(domain);
+    h.update(seed);
+    *h.finalize().as_bytes()
+}
+
+fn random_secret_bytes() -> Result<[u8; 32], String> {
+    let mut out = [0u8; 32];
+    getrandom(&mut out).map_err(|e| format!("getrandom failed: {e}"))?;
+    Ok(out)
 }

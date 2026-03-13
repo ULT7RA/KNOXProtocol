@@ -34,6 +34,26 @@ fn main() {
                 Err(e) => eprintln!("error: {e}"),
             }
         }
+        "balances" => {
+            let path = args.next().unwrap_or_else(|| "wallet.bin".to_string());
+            match load_wallet(&path) {
+                Ok(state) => {
+                    for (idx, bal) in wallet_balances_by_subaddress(&state) {
+                        if let Some(addr) = state.address_at(idx) {
+                            println!(
+                                "#{idx}: {} | {} ({})",
+                                address_to_string(&addr),
+                                format_atoms(bal),
+                                bal
+                            );
+                        }
+                    }
+                    let total = wallet_balance(&state);
+                    println!("Total: {} ({})", format_atoms(total), total);
+                }
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
         "new-address" => {
             let path = args.next().unwrap_or_else(|| "wallet.bin".to_string());
             match load_wallet(&path) {
@@ -57,6 +77,19 @@ fn main() {
                 Ok(state) => {
                     println!("Wallet created from node key: {}", path);
                     println!("Address: {}", address_to_string(&state.address()));
+                }
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+        "repair-from-node-key" => {
+            let node_key = args.next().unwrap_or_else(|| "data/node.key".to_string());
+            let path = args.next().unwrap_or_else(|| "wallet.bin".to_string());
+            let rpc = args.next().unwrap_or_else(|| "127.0.0.1:9736".to_string());
+            match repair_wallet_from_node_key(&node_key, &path, &rpc) {
+                Ok(state) => {
+                    println!("Wallet repaired from node key: {}", path);
+                    println!("Address: {}", address_to_string(&state.address()));
+                    println!("Balance: {} ({})", format_atoms(wallet_balance(&state)), wallet_balance(&state));
                 }
                 Err(e) => eprintln!("error: {e}"),
             }
@@ -100,6 +133,49 @@ fn main() {
                 Ok(state) => {
                     let bal = wallet_balance(&state);
                     println!("Balance: {} ({})", format_atoms(bal), bal);
+                }
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+        "reward-audit" => {
+            let path = args.next().unwrap_or_else(|| "wallet.bin".to_string());
+            match load_wallet(&path) {
+                Ok(state) => {
+                    let totals = wallet_reward_totals(&state);
+                    println!("Recorded reward events: {}", wallet_reward_records(&state).len());
+                    for (kind, amount) in totals {
+                        println!("{}: {} ({})", reward_kind_label(kind), format_atoms(amount), amount);
+                    }
+                    println!();
+                    println!("By subaddress:");
+                    for (idx, amount) in wallet_balances_by_subaddress(&state) {
+                        if let Some(addr) = state.address_at(idx) {
+                            println!(
+                                "#{idx}: {} | current balance {} ({})",
+                                address_to_string(&addr),
+                                format_atoms(amount),
+                                amount
+                            );
+                        }
+                    }
+                    if !wallet_reward_records(&state).is_empty() {
+                        println!();
+                        println!("Recent reward events:");
+                        let records = wallet_reward_records(&state);
+                        let start = records.len().saturating_sub(12);
+                        for record in &records[start..] {
+                            println!(
+                                "h={} kind={} subaddress=#{} amount={} ({}) out={}#{}",
+                                record.block_height,
+                                reward_kind_label(record.kind),
+                                record.subaddress_index,
+                                format_atoms(record.amount),
+                                record.amount,
+                                format_hash32(record.tx_hash),
+                                record.output_index
+                            );
+                        }
+                    }
                 }
                 Err(e) => eprintln!("error: {e}"),
             }
@@ -168,11 +244,14 @@ fn main() {
             eprintln!("  knox-wallet-cli create <wallet.bin>");
             eprintln!("  knox-wallet-cli address <wallet.bin>");
             eprintln!("  knox-wallet-cli addresses <wallet.bin>");
+            eprintln!("  knox-wallet-cli balances <wallet.bin>");
             eprintln!("  knox-wallet-cli new-address <wallet.bin>");
             eprintln!("  knox-wallet-cli import-node-key <node.key> <wallet.bin>");
+            eprintln!("  knox-wallet-cli repair-from-node-key <node.key> <wallet.bin> <rpc_addr>");
             eprintln!("  knox-wallet-cli sync <wallet.bin> <rpc_addr>");
             eprintln!("  knox-wallet-cli balance <wallet.bin>");
             eprintln!("  knox-wallet-cli rescan <wallet.bin> <rpc_addr>");
+            eprintln!("  knox-wallet-cli reward-audit <wallet.bin>");
             eprintln!("  knox-wallet-cli send <wallet.bin> <rpc_addr> <address> <amount_coins> <fee_coins> [ring]");
             eprintln!("  amount/fee accept decimal coin units (8 decimals max), e.g. 1, 0.01");
         }
@@ -218,4 +297,22 @@ fn format_atoms(atoms: u64) -> String {
     let whole = atoms / knox_types::ATOMS_PER_COIN;
     let frac = atoms % knox_types::ATOMS_PER_COIN;
     format!("{whole}.{:08} KNOX", frac)
+}
+
+fn reward_kind_label(kind: RewardKind) -> &'static str {
+    match kind {
+        RewardKind::Miner => "miner",
+        RewardKind::Treasury => "treasury",
+        RewardKind::Dev => "dev",
+        RewardKind::Premine => "premine",
+    }
+}
+
+fn format_hash32(hash: knox_types::Hash32) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in hash.0 {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }

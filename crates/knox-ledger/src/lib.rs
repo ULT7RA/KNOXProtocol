@@ -881,14 +881,23 @@ impl Ledger {
 
     fn active_miners_recent(&self, tip: u64, lookback: u64) -> Result<u32, String> {
         let start = tip.saturating_sub(lookback.saturating_sub(1));
-        let mut miners = HashSet::new();
+        let mut operator_ids = HashSet::new();
+        let mut legacy_proposers = HashSet::new();
         for h in start..=tip {
             let Some(block) = self.get_block(h)? else {
                 continue;
             };
-            miners.insert(block.header.proposer);
+            if let Some(operator_id) = coinbase_operator_identity(&block) {
+                operator_ids.insert(operator_id);
+            } else {
+                legacy_proposers.insert(block.header.proposer);
+            }
         }
-        Ok(miners.len() as u32)
+        if !operator_ids.is_empty() {
+            Ok(operator_ids.len() as u32)
+        } else {
+            Ok(legacy_proposers.len() as u32)
+        }
     }
 
     fn apply_tx(
@@ -1116,6 +1125,19 @@ fn verify_coinbase_lattice(
         }
     }
     Ok(())
+}
+
+fn coinbase_operator_identity(block: &Block) -> Option<[u8; 32]> {
+    let coinbase = block.txs.first()?;
+    if !coinbase.coinbase {
+        return None;
+    }
+    let memo = coinbase.outputs.first()?.memo;
+    if memo == [0u8; 32] {
+        None
+    } else {
+        Some(memo)
+    }
 }
 
 fn proposer_streak_for_height(

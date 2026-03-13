@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1.85-bookworm AS builder
+WORKDIR /src
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    pkg-config \
+    libssl-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+
+RUN cargo build -p knox-node --bin knox-node --profile release-lite
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    tini \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --shell /bin/bash --uid 10001 knox \
+  && mkdir -p /var/lib/knox/node \
+  && chown -R knox:knox /var/lib/knox
+
+COPY --from=builder /src/target/release-lite/knox-node /usr/local/bin/knox-node
+COPY docker/entrypoint-node.sh /usr/local/bin/entrypoint-node.sh
+RUN chmod +x /usr/local/bin/knox-node /usr/local/bin/entrypoint-node.sh
+
+USER knox
+WORKDIR /home/knox
+
+ENV KNOX_NODE_DATA_DIR=/var/lib/knox/node \
+    KNOX_NODE_P2P_BIND=0.0.0.0:9735 \
+    KNOX_NODE_RPC_BIND=0.0.0.0:9736 \
+    KNOX_NODE_PEERS= \
+    KNOX_NODE_RPC_ALLOW_REMOTE=1
+
+EXPOSE 9735 9736
+VOLUME ["/var/lib/knox/node"]
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint-node.sh"]

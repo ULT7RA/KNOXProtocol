@@ -1,0 +1,38 @@
+services:
+  knox-node:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    image: knox/node:linux
+    container_name: knox-node
+    environment:
+      KNOX_NODE_DATA_DIR: /var/lib/knox/node
+      KNOX_NODE_P2P_BIND: 0.0.0.0:9735
+      KNOX_NODE_RPC_BIND: 0.0.0.0:9736
+      KNOX_NODE_RPC_ALLOW_REMOTE: "1"
+      KNOX_NODE_PEERS: ${KNOX_NODE_PEERS:-}
+      KNOX_NODE_MINER_ADDRESS: ${KNOX_NODE_MINER_ADDRESS:-}
+    ports:
+      - "9735:9735"
+      - "9736:9736"
+    volumes:
+      - knox-node-data:/var/lib/knox/node
+    restart: unless-stopped
+
+  knox-gui:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gui
+    image: knox/gui:linux
+    container_name: knox-gui
+    environment:
+      DISPLAY: ${DISPLAY}
+      KNOX_ELECTRON_NO_SANDBOX: ${KNOX_ELECTRON_NO_SANDBOX:-0}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - knox-gui-data:/home/knox/.config/knox-wallet-desktop
+    restart: unless-stopped
+
+volumes:
+  knox-node-data:
+  knox-gui-data:

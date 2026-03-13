@@ -17,6 +17,20 @@ const useUiStore = create((set) => ({
 }));
 
 const views = ['dashboard', 'mining', 'send', 'logs', 'settings'];
+const CURRENT_DESKTOP_VERSION = '1.3.15';
+
+function compareSemverLike(a, b) {
+  const left = String(a || '').split('.').map((v) => Number(v || 0));
+  const right = String(b || '').split('.').map((v) => Number(v || 0));
+  const len = Math.max(left.length, right.length);
+  for (let i = 0; i < len; i += 1) {
+    const l = Number.isFinite(left[i]) ? left[i] : 0;
+    const r = Number.isFinite(right[i]) ? right[i] : 0;
+    if (l > r) return 1;
+    if (l < r) return -1;
+  }
+  return 0;
+}
 
 function safeShortAddress(addr) {
   const s = String(addr || '');
@@ -211,11 +225,12 @@ export default function App() {
   const [cudaDeviceOrdinal, setCudaDeviceOrdinal] = useState(0);
   const [advanced, setAdvanced] = useState({
     scheduleEnabled: false,
-    surgeAutoMax: true,
+    surgeAutoMax: false,
     tempThrottle: true,
     powerCostPerKwh: 0.12
   });
   const [configReady, setConfigReady] = useState(false);
+  const [configLoaded, setConfigLoaded] = useState(false);
   const [samples, setSamples] = useState([]);
   const [blocks, setBlocks] = useState([]);
   const [selectedMinerAddressLive, setSelectedMinerAddressLive] = useState('');
@@ -323,7 +338,10 @@ export default function App() {
     (async () => {
       const res = await window.knox.miningConfigGet();
       if (!res?.ok || dead) {
-        if (!dead) setConfigReady(true);
+        if (!dead) {
+          setConfigLoaded(false);
+          setConfigReady(true);
+        }
         return;
       }
       const cfg = res.result || {};
@@ -341,10 +359,11 @@ export default function App() {
       setCudaDeviceOrdinal(Number.isFinite(Number(cfg.cudaDeviceOrdinal)) ? Number(cfg.cudaDeviceOrdinal) : 0);
       setAdvanced({
         scheduleEnabled: Boolean(cfg.scheduleEnabled),
-        surgeAutoMax: cfg.surgeAutoMax !== false,
+        surgeAutoMax: Boolean(cfg.surgeAutoMax),
         tempThrottle: cfg.tempThrottle !== false,
         powerCostPerKwh: Number.isFinite(Number(cfg.powerCostPerKwh)) ? Number(cfg.powerCostPerKwh) : 0.12
       });
+      setConfigLoaded(true);
       setConfigReady(true);
     })();
     return () => { dead = true; };
@@ -444,6 +463,34 @@ export default function App() {
   });
 
   useEffect(() => {
+    if (!window.knox?.onWalletUpdated) return;
+    const refetchWalletViews = () => {
+      walletInfoQ.refetch();
+      walletHealthQ.refetch();
+      walletAddrIndexedQ.refetch();
+      walletAddressesTextQ.refetch();
+      walletAddressQ.refetch();
+    };
+    const timers = new Set();
+    const off = window.knox.onWalletUpdated((payload) => {
+      const reason = String(payload?.reason || 'wallet-sync');
+      setActionStatus(`Wallet updated: ${reason}`);
+      refetchWalletViews();
+      for (const delay of [750, 2000]) {
+        const id = setTimeout(() => {
+          timers.delete(id);
+          refetchWalletViews();
+        }, delay);
+        timers.add(id);
+      }
+    });
+    return () => {
+      for (const id of timers) clearTimeout(id);
+      if (typeof off === 'function') off();
+    };
+  }, [walletInfoQ, walletHealthQ, walletAddrIndexedQ, walletAddressesTextQ, walletAddressQ]);
+
+  useEffect(() => {
     const net = netQ.data;
     if (!net?.ok || !net.result) return;
     const runtimeNode = runtimeQ.data?.result?.node || {};
@@ -475,7 +522,7 @@ export default function App() {
       hardening,
       reward: Number(runtimeNode.running ? (runtimeNode.sealedCount || 0) : 0),
       streak,
-      bonus: 0,
+      bonus,
       miners,
       surge: surgeActive,
       source: 'network'
@@ -514,10 +561,15 @@ export default function App() {
       height: displayHeight,
       attempts: Number(runtimeNode.running ? estAttempts : 0),
       difficulty: Number(runtimeNode.currentDifficultyBits || 0),
-      hardening: Number(runtimeNode.totalHardeningEstimate || 0),
+      hardening: Number(
+        runtimeNode.totalHardeningEstimate ??
+        netQ.data?.result?.total_hardening ??
+        netQ.data?.result?.hardening ??
+        0
+      ),
       reward: Number(runtimeNode.running ? (runtimeNode.sealedCount || 0) : 0),
       streak: Number(runtimeNode.currentStreak || 0),
-      bonus: 0,
+      bonus: Number(netQ.data?.result?.streak_bonus_ppm ?? netQ.data?.result?.bonus ?? 0),
       miners: Number(runtimeMinerCount(runtimeNode)),
       surge: false,
       source: 'runtime'
@@ -542,7 +594,16 @@ export default function App() {
   const runtimeNode = runtime.node || {};
   const runtimeWalletd = runtime.walletd || {};
   const backendInfo = backendQ.data?.result || { availableBackends: ['cpu'], preferredBackend: 'cpu', devices: [] };
-  const availableBackends = ['auto', ...Array.from(new Set((backendInfo.availableBackends || ['cpu']).map((v) => String(v).toLowerCase())))];
+  const availableBackends = [
+    'auto',
+    ...Array.from(
+      new Set(
+        [...(backendInfo.availableBackends || ['cpu']), miningBackend]
+          .map((v) => String(v).toLowerCase())
+          .filter(Boolean)
+      )
+    )
+  ];
   const activeBackendLabel = String(runtimeNode.activeBackend || 'cpu').toUpperCase();
   const configuredBackendLabel = String(runtimeNode.configuredBackend || miningBackend || 'auto').toUpperCase();
   const runtimeFallback = Boolean(runtimeNode.fallbackActive);
@@ -551,6 +612,27 @@ export default function App() {
   const onboarding = onboardQ.data?.result || {};
   const info = walletInfoQ.data?.result || {};
   const infoOk = walletInfoQ.data?.ok;
+  const totalWalletBalance = Number(info.balance || 0);
+  const pendingWalletBalance = Number(info.pendingBalance || 0);
+  const projectedWalletBalance = totalWalletBalance + pendingWalletBalance;
+  const subaddressBalances = useMemo(() => {
+    const raw = info.subaddressBalances;
+    if (!raw || typeof raw !== 'object') return {};
+    return Object.fromEntries(
+      Object.entries(raw)
+        .map(([idx, amount]) => [Number(idx), Number(amount || 0)])
+        .filter(([idx, amount]) => Number.isFinite(idx) && Number.isFinite(amount))
+    );
+  }, [info.subaddressBalances]);
+  const pendingSubaddressBalances = useMemo(() => {
+    const raw = info.pendingSubaddressBalances;
+    if (!raw || typeof raw !== 'object') return {};
+    return Object.fromEntries(
+      Object.entries(raw)
+        .map(([idx, amount]) => [Number(idx), Number(amount || 0)])
+        .filter(([idx, amount]) => Number.isFinite(idx) && Number.isFinite(amount))
+    );
+  }, [info.pendingSubaddressBalances]);
   const walletHealth = walletHealthQ.data?.result || {};
   const infoAddresses = useMemo(() => {
     if (Array.isArray(info.addresses) && info.addresses.length) {
@@ -644,11 +726,16 @@ export default function App() {
         : (Number.isFinite(latestHardening) && latestHardening > 0 ? latestHardening : runtimeHardening),
       reward: !runtimeNode.running ? 0 : runtimeReward,
       streak: !runtimeNode.running ? 0 : runtimeStreak,
-      bonus: Number.isFinite(latest.bonus) ? latest.bonus : Number(net.streak_bonus_ppm ?? 0),
+      bonus: Number.isFinite(Number(net.streak_bonus_ppm ?? net.bonus))
+        ? Number(net.streak_bonus_ppm ?? net.bonus)
+        : (Number.isFinite(latest.bonus) ? latest.bonus : 0),
       miners: Number.isFinite(netMiners) && netMiners > 0
         ? netMiners
         : (Number.isFinite(latestMiners) && latestMiners > 0 ? latestMiners : runtimeMiners),
-      surge: latest.surge ? 'Active' : 'Idle'
+      surge: latest.surge ? 'Active' : 'Idle',
+      min_supported_version: String(net.min_supported_version || ''),
+      latest_installer_version: String(net.latest_installer_version || ''),
+      min_supported_protocol_version: Number(net.min_supported_protocol_version || 0)
     };
   }, [
     samples,
@@ -661,11 +748,10 @@ export default function App() {
     runtimeNode.sealedCount,
     runtimeNode.running
   ]);
-
-  useEffect(() => {
-    if (availableBackends.includes(miningBackend)) return;
-    setMiningBackend('auto');
-  }, [availableBackends, miningBackend]);
+  const minSupportedVersion = String(telemetry.min_supported_version || '');
+  const latestInstallerVersion = String(telemetry.latest_installer_version || '');
+  const upgradeRequired =
+    !!minSupportedVersion && compareSemverLike(CURRENT_DESKTOP_VERSION, minSupportedVersion) < 0;
 
   function numOrNa(value) {
     return Number.isFinite(Number(value)) ? Number(value) : 'N/A';
@@ -690,7 +776,10 @@ export default function App() {
 
   const metricPills = [
     { label: 'Height', value: (telemetry.height || 0).toLocaleString(), tone: 'cyan' },
-    { label: 'Balance', value: `${fmtAtoms(info.balance || 0)} KNOX`, tone: 'cyan' },
+    { label: 'Balance', value: `${fmtAtoms(projectedWalletBalance)} KNOX`, tone: 'cyan' },
+    ...(pendingWalletBalance > 0
+      ? [{ label: 'Pending', value: `${fmtAtoms(pendingWalletBalance)} KNOX`, tone: 'amber' }]
+      : []),
     { label: 'Miners', value: numOrNa(telemetry.miners), tone: 'green' },
     { label: 'Difficulty', value: telemetry.difficulty ? telemetry.difficulty.toFixed(6) : 'N/A', tone: 'cyan' },
     { label: 'Streak', value: numOrNa(telemetry.streak), tone: 'pink' },
@@ -744,7 +833,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (!configReady) return;
+    if (!configReady || !configLoaded) return;
     const id = setTimeout(() => {
       saveMiningConfig();
     }, 500);
@@ -763,7 +852,8 @@ export default function App() {
     advanced.scheduleEnabled,
     advanced.surgeAutoMax,
     advanced.tempThrottle,
-    advanced.powerCostPerKwh
+    advanced.powerCostPerKwh,
+    configLoaded
   ]);
 
   async function act(label, fn) {
@@ -855,10 +945,11 @@ export default function App() {
 
   useEffect(() => {
     if (!advanced.surgeAutoMax) return;
+    if (miningPreset === 'custom') return;
     if (String(telemetry.surge || '').toLowerCase() !== 'active') return;
     applyPreset('maximum');
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [telemetry.surge, advanced.surgeAutoMax]);
+  }, [telemetry.surge, advanced.surgeAutoMax, miningPreset]);
 
   useEffect(() => {
     if (!advanced.scheduleEnabled) return;
@@ -991,12 +1082,17 @@ export default function App() {
           <div className="version-tagline">suggestions</div>
           <div className="version-tagline">feedback</div>
           <div className="version-email">KNOXULT7Rock@proton.me</div>
-          <div className="version-build">KNOX Wallet v1.2.6</div>
+          <div className="version-build">KNOX Wallet v1.3.15</div>
         </div>
       </aside>
 
       <ErrorBoundary>
         <main className="main">
+          {upgradeRequired && (
+            <section className="warning-banner">
+              Update required: this installer is obsolete. Minimum supported version is {minSupportedVersion}. Please upgrade to {latestInstallerVersion || minSupportedVersion} before mining.
+            </section>
+          )}
           <header className="pill-row">
             {metricPills.map((m) => (
               <span key={m.label} className={`pill pill-${m.tone}`}>
@@ -1096,7 +1192,9 @@ export default function App() {
                     Address: {primaryAddress ? safeShortAddress(primaryAddress) : 'N/A'}
                     Address Count: {addresses.length}
                     Indexed Address Count: {indexedAddresses.length}
-                    Balance: {fmtAtoms(info.balance || 0)} KNOX
+                    Confirmed Balance: {fmtAtoms(totalWalletBalance)} KNOX
+                    Pending Sealed Rewards: {fmtAtoms(pendingWalletBalance)} KNOX
+                    Projected Balance: {fmtAtoms(projectedWalletBalance)} KNOX
                     Last Height: {Number(info.last_height || telemetry.height || 0)}
                     Wallet State: {infoOk ? 'Connected' : 'Disconnected'}
                     Wallet Health: {walletHealthQ.data?.ok ? String(walletHealth.status || 'ok') : `error: ${walletHealthQ.data?.error || 'unavailable'}`}
@@ -1353,7 +1451,10 @@ export default function App() {
                     <div className={`address-item ${selectedMinerAddress === entry.address ? 'selected' : ''}`} key={`${entry.address}-${entry.index}-${i}`}>
                       <div className="idx">#{entry.index}</div>
                       <div className="addr" title={entry.address}>{safeShortAddress(entry.address)}</div>
-                      <div className="bal">{entry.index === 0 ? `${fmtAtoms(info.balance)} KNOX` : '-'}</div>
+                      <div className="bal">
+                        {`${fmtAtoms((subaddressBalances[entry.index] || 0) + (pendingSubaddressBalances[entry.index] || 0))} KNOX`}
+                        {pendingSubaddressBalances[entry.index] > 0 ? ` (+${fmtAtoms(pendingSubaddressBalances[entry.index])} pending)` : ''}
+                      </div>
                       <button
                         className="mini-btn"
                         onClick={() => copyAddressToClipboard(entry.address)}

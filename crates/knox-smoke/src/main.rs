@@ -6,11 +6,6 @@ fn main() {
         let _ = knox_types::Hash32::ZERO;
     }
 
-    #[cfg(feature = "crypto")]
-    {
-        let _ = knox_crypto::hash_bytes(b"knox-smoke", b"crypto");
-    }
-
     #[cfg(feature = "consensus")]
     {
         let _ = knox_consensus::ConsensusConfig {
@@ -33,6 +28,10 @@ fn main() {
             max_peers: 1,
             pad_bytes: 0,
             cover_interval_ms: 1000,
+            lattice_public: None,
+            lattice_secret: None,
+            protocol_version: 1,
+            genesis_hash: [0u8; 32],
         };
     }
 
@@ -46,6 +45,10 @@ fn main() {
                 max_peers: 1,
                 pad_bytes: 0,
                 cover_interval_ms: 1000,
+                lattice_public: None,
+                lattice_secret: None,
+                protocol_version: 1,
+                genesis_hash: [0u8; 32],
             },
             consensus: knox_consensus::ConsensusConfig {
                 epoch_length: 1,

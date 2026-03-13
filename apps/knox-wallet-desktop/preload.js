@@ -38,5 +38,10 @@ contextBridge.exposeInMainWorld('knox', {
     const handler = (_event, message) => cb(message);
     ipcRenderer.on('log', handler);
     return () => ipcRenderer.removeListener('log', handler);
+  },
+  onWalletUpdated: (cb) => {
+    const handler = (_event, payload) => cb(payload || {});
+    ipcRenderer.on('wallet-updated', handler);
+    return () => ipcRenderer.removeListener('wallet-updated', handler);
   }
 });

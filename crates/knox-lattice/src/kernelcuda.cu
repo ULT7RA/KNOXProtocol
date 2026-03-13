@@ -1,28 +1,24 @@
 /********************************************************************
  *  ULT7Rock – Lattice‑based PoW (CUDA)
  *
- *  The kernel now distributes the CBD generation (Step 3) and the
- *  Proof‑of‑Time loop (Step 5) across all warps in the CTA.
- *  All other code (nonce handling, NTT, Blake‑3, win detection) is
- *  unchanged.
  ********************************************************************/
 
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <stdint.h>
-#include "blake3.cu"                     // device‑only Blake‑3 implementation
+#include "blake3.cu"                     
 
 #define KNOX_N          1024u
 #define KNOX_Q          12289u
-#define N_INV           12277u               // 1024⁻¹ mod 12289
-#define PAD_IDX(i)      ((i) + ((i) >> 5))   // one extra word every 32 entries
+#define N_INV           12277u               
+#define PAD_IDX(i)      ((i) + ((i) >> 5))   
 
 /* -----------------------------------------------------------------
  *  Fast Barrett reduction (Q = 12289)
  * ----------------------------------------------------------------- */
 static __forceinline__ __device__ uint32_t barrett_reduce(uint32_t a) {
-    const uint64_t mu = 349496ULL;               // floor(2^32 / Q)
-    uint64_t t = ((uint64_t)a * mu) >> 32;       // floor(a*mu/2^32)
+    const uint64_t mu = 349496ULL;               
+    uint64_t t = ((uint64_t)a * mu) >> 32;       
     uint32_t r = a - (uint32_t)(t * KNOX_Q);
     if (r >= KNOX_Q) r -= KNOX_Q;
     return r;
@@ -32,175 +28,82 @@ static __forceinline__ __device__ uint32_t mul_mod(uint32_t a, uint32_t b) {
 }
 
 /* -----------------------------------------------------------------
- *  Forward Negacyclic NTT – warp‑synchronous, multi‑warp CTA
+ * Forward Negacyclic NTT (Warp-Synchronous: 32 Threads)
  * ----------------------------------------------------------------- */
-static __device__ void ntt_forward_multiwarp(uint32_t *poly,
-                                             const uint32_t *twiddle)
+static __device__ void ntt_forward_shared(uint32_t *poly,
+                                          const uint32_t *twiddle,
+                                          int lane_id)
 {
     const int total_butterflies = KNOX_N / 2;   // 512
-    const int warps_per_cta    = blockDim.x / 32;   // e.g. 8 for 256‑thread block
-    const int butterflies_per_warp = total_butterflies / warps_per_cta; // 64
-
-    int lane_id = threadIdx.x & 31;            // 0 … 31
-    int warp_id = threadIdx.x >> 5;            // 0 … warps_per_cta‑1
-
-    int len = KNOX_N / 2;                      // 512 → 256 → … → 1
-    int twiddle_base = 1;                      // stage‑0 starts at index 1
+    int len = KNOX_N / 2;                       // 512, 256, ..., 1
+    int twiddle_base = 1;
 
     while (len >= 1) {
-        // Each warp works on a *contiguous* chunk of butterflies.
-        // The global butterfly index for this lane is:
-        //   base_of_this_warp + lane_id + step*32
-        int base = warp_id * butterflies_per_warp;   // start of this warp's chunk
+        // 32 threads in the warp, each computing 16 butterflies per stage.
+        for (int idx = lane_id; idx < total_butterflies; idx += 32) {
+            int group = idx / len;
+            int j     = idx % len;
+            int start = group * 2 * len;
 
-        for (int idx = base + lane_id;
-             idx < base + butterflies_per_warp;
-             idx += 32) {
-
-            int group = idx / len;                 // which “start” block
-            int j     = idx % len;                 // offset inside the block
-            int start = group * 2 * len;           // first element of the block
-
-            uint32_t w = twiddle[PAD_IDX(twiddle_base + group)];
+            int tw_idx = twiddle_base + group;
+            uint32_t w = twiddle[PAD_IDX(tw_idx)];
 
             uint32_t u = poly[PAD_IDX(start + j)];
             uint32_t v = mul_mod(poly[PAD_IDX(start + j + len)], w);
+
             uint32_t sum = u + v;
             if (sum >= KNOX_Q) sum -= KNOX_Q;
             uint32_t diff = (u >= v) ? (u - v) : (u + KNOX_Q - v);
-            poly[PAD_IDX(start + j)]         = sum;
-            poly[PAD_IDX(start + j + len)]   = diff;
-        }
 
-        __syncwarp();               // warp‑level barrier (all lanes in the warp)
-        __syncthreads();            // **block‑wide** barrier – needed because the next stage
-                                    // reads data written by *all* warps.
+            poly[PAD_IDX(start + j)]       = sum;
+            poly[PAD_IDX(start + j + len)] = diff;
+        }
+        __syncwarp(); // Hardware-level sync, zero block stalling.
         len >>= 1;
         twiddle_base <<= 1;
     }
 }
 
-/********************************************************************
- *  Inverse Negacyclic NTT – warp‑synchronous, multi‑warp CTA
- *
- *  The forward NTT you already have uses:
- *      len          = N/2, N/4, …, 1
- *      twiddle_base = 1, 2, 4, …, 512
- *
- *  The inverse NTT runs the opposite way:
- *      len          = 1, 2, 4, …, N/2
- *      twiddle_base = 512, 256, 128, …, 1
- *
- *  Each stage processes the same total number of butterflies
- *  (KNOX_N/2 = 512).  The work is split among the warps in the CTA
- *  exactly as in the forward version, and a block‑wide barrier
- *  (`__syncthreads()`) is inserted after each stage because the next
- *  stage reads data written by *any* warp.
- *
- *  The routine assumes the following symbols are already defined
- *  in the translation unit (they are present in the PoW kernel you
- *  posted earlier):
- *
- *      #define KNOX_N          1024u
- *      #define KNOX_Q          12289u
- *      #define N_INV           12277u   // 1024⁻¹ mod 12289
- *      #define PAD_IDX(i)      ((i) + ((i) >> 5))   // one extra word every 32 entries
- *
- *  It also expects a fast modular‑multiply helper that uses Barrett
- *  reduction:
- *
- *      static __forceinline__ __device__ uint32_t mul_mod(uint32_t a, uint32_t b);
- *
- ********************************************************************/
-
+/* -----------------------------------------------------------------
+ * Inverse Negacyclic NTT (Warp-Synchronous: 32 Threads)
+ * ----------------------------------------------------------------- */
 static __device__ void ntt_inverse_shared(uint32_t *poly,
-                                          const uint32_t *twiddle_inv)
+                                          const uint32_t *twiddle,
+                                          int lane_id)
 {
-    /* -------------------------------------------------------------
-     *  0.  Shared‑memory layout (the same PAD_IDX macro is used for
-     *      every shared array in the kernel, so the padding is
-     *      consistent across forward/inverse transforms.
-     * ------------------------------------------------------------- */
-    // No extra shared memory is allocated here – the caller already
-    // placed `poly` and the twiddle tables in shared memory.
-
-    /* -------------------------------------------------------------
-     *  1.  Partition the 512 butterflies among the warps
-     * ------------------------------------------------------------- */
-    const int total_butterflies   = KNOX_N / 2;          // 512
-    const int warps_per_cta       = blockDim.x / 32;    // e.g. 8 for 256‑thread CTA
-    const int butterflies_per_warp = total_butterflies / warps_per_cta;
-
-    int lane_id = threadIdx.x & 31;                    // 0 … 31
-    int warp_id = threadIdx.x >> 5;                    // 0 … warps_per_cta‑1
-
-    /* -------------------------------------------------------------
-     *  2.  Stage loop – len grows from 1 to N/2
-     * ------------------------------------------------------------- */
-    int len = 1;                                       // 1,2,4,…,512
-    // The first (largest) block of inverse twiddles starts at 2^(log2(N)-1) = 512
-    int twiddle_base = 1 << ( (int)log2f((float)KNOX_N) - 1 );   // 512 for N=1024
+    int len = 1;
 
     while (len < KNOX_N) {
-        // Each warp works on a contiguous chunk of butterflies
-        int base = warp_id * butterflies_per_warp;     // first butterfly index for this warp
-
-        for (int idx = base + lane_id;
-             idx < base + butterflies_per_warp;
-             idx += 32) {
-
-            // -----------------------------------------------------------------
-            // 2a.  Map the linear butterfly index to (group, offset) for this stage
-            // -----------------------------------------------------------------
-            int group = idx / len;                     // which “start” block in this stage
-            int j     = idx % len;                     // offset inside the block
-
-            // The start of the 2‑len block for the *inverse* transform is
-            //   start = N - 2*len*(group+1)
+        // 32 threads, 16 butterflies each per stage.
+        for (int idx = lane_id; idx < KNOX_N / 2; idx += 32) {
+            int group = idx / len;
+            int j     = idx % len;
             int start = KNOX_N - 2 * len * (group + 1);
 
-            // -----------------------------------------------------------------
-            // 2b.  Load the appropriate twiddle factor (inverse)
-            // -----------------------------------------------------------------
-            uint32_t w = twiddle_inv[PAD_IDX(twiddle_base + group)];
+            // Deterministic twiddle index in the same order as sequential k--.
+            int stage_base = (KNOX_N / len) - 1;
+            int k = stage_base - group;
+            uint32_t w = twiddle[PAD_IDX(k)];
 
-            // -----------------------------------------------------------------
-            // 2c.  Perform the inverse butterfly
-            // -----------------------------------------------------------------
             uint32_t u = poly[PAD_IDX(start + j)];
             uint32_t v = poly[PAD_IDX(start + j + len)];
 
             uint32_t sum = u + v;
             if (sum >= KNOX_Q) sum -= KNOX_Q;
-
             uint32_t diff = (u >= v) ? (u - v) : (u + KNOX_Q - v);
-            // multiply the difference by the twiddle factor
-            uint32_t prod = mul_mod(diff, w);
 
             poly[PAD_IDX(start + j)]       = sum;
-            poly[PAD_IDX(start + j + len)] = prod;
+            poly[PAD_IDX(start + j + len)] = mul_mod(diff, w);
         }
-
-        // -------------------------------------------------------------
-        // 2d.  Synchronisation
-        // -------------------------------------------------------------
-        __syncwarp();          // all lanes of the warp have finished this stage
-        __syncthreads();       // next stage reads data written by any warp
-
-        // -------------------------------------------------------------
-        // 2e.  Advance to the next stage
-        // -------------------------------------------------------------
-        len <<= 1;                         // double the stride
-        twiddle_base >>= 1;                // move to the next (smaller) block of twiddles
+        __syncwarp();
+        len <<= 1;
     }
 
-    /* -------------------------------------------------------------
-     *  3.  Final scaling by N⁻¹ (mod Q)
-     * ------------------------------------------------------------- */
-    for (int i = threadIdx.x; i < KNOX_N; i += blockDim.x) {
+    // Scale by N^-1 (mod Q) cooperatively across the warp.
+    for (int i = lane_id; i < KNOX_N; i += 32) {
         poly[PAD_IDX(i)] = mul_mod(poly[PAD_IDX(i)], N_INV);
     }
-    __syncthreads();   // make the scaled values visible to the rest of the kernel
+    __syncwarp();
 }
 
 
@@ -209,12 +112,12 @@ static __device__ void ntt_inverse_shared(uint32_t *poly,
  * ----------------------------------------------------------------- */
 extern "C"
 __global__ void knox_full_offload(
-    const uint8_t  *header_hash,      // 32 bytes (block header)
-    const uint32_t *a_hat_constant,   // 1024 uint32_t (target polynomial)
-    const uint32_t *twiddle_fwd,      // 1024 uint32_t (pre‑computed ψ powers)
-    const uint32_t *twiddle_inv,      // 1024 uint32_t (pre‑computed ψ⁻¹ powers)
+    const uint8_t  *header_hash,      
+    const uint32_t *a_hat_constant,   
+    const uint32_t *twiddle_fwd,      
+    const uint32_t *twiddle_inv,      
     uint64_t        base_nonce,
-    uint32_t        steps,            // PoT iterations
+    uint32_t        steps,            
     uint32_t        difficulty_bits,
     uint64_t       *out_winning_nonce,
     uint32_t       *out_found_flag)
@@ -222,11 +125,11 @@ __global__ void knox_full_offload(
     /* -------------------------------------------------------------
      *  Shared memory (padded)
      * ------------------------------------------------------------- */
-    __shared__ uint32_t poly_sh[KNOX_N + 32];          // +32 for PAD_IDX safety
+    __shared__ uint32_t poly_sh[KNOX_N + 32];         
     __shared__ uint32_t tw_fwd_sh[KNOX_N + 32];
     __shared__ uint32_t tw_inv_sh[KNOX_N + 32];
     __shared__ uint32_t a_hat_sh[KNOX_N + 32];
-    __shared__ uint8_t  blake_xof_sh[KNOX_N];        // 1024‑byte XOF
+    __shared__ uint8_t  blake_xof_sh[KNOX_N];        
     __shared__ uint8_t  final_buf_sh[17 + 8 + 2*KNOX_N];
     __shared__ uint8_t  digest_sh[32];
 
@@ -255,65 +158,71 @@ __global__ void knox_full_offload(
         #pragma unroll
         for (int i = 0; i < 8; ++i) seed[32 + i] = (uint8_t)(nonce >> (8*i));
 
-        device_blake3_hash(seed, 40, blake_xof_sh, KNOX_N);   // 1024 bytes
+        device_blake3_hash(seed, 40, blake_xof_sh, KNOX_N);  
     }
-    __syncthreads();   // all threads now see the XOF
+    __syncthreads();   
 
     /* -------------------------------------------------------------
-     *  3. Centered‑Binomial Distribution (CBD) – **warp‑distributed**
+     *  3. Centered‑Binomial Distribution (CBD) – 
      * ------------------------------------------------------------- */
-    const int warps_per_cta   = blockDim.x / 32;          // e.g. 8 for 256‑thread block
-    const int lane_id        = threadIdx.x & 31;          // 0 … 31
-    const int warp_id        = threadIdx.x >> 5;          // 0 … warps_per_cta‑1
-    const int coeffs_per_warp = KNOX_N / warps_per_cta;   // 1024 / 8 = 128
-
-    // Each warp works on a contiguous chunk of coefficients.
+    const int warps_per_cta   = blockDim.x / 32;        
+    const int lane_id        = threadIdx.x & 31;          
+    const int warp_id        = threadIdx.x >> 5;          
+    const int coeffs_per_warp = KNOX_N / warps_per_cta;   
     for (int idx = warp_id * coeffs_per_warp + lane_id;
          idx < (warp_id + 1) * coeffs_per_warp;
          idx += 32) {
 
-        int byte_idx = idx >> 2;                 // idx / 4
-        int bit_off  = (idx & 3) << 1;           // (idx % 4) * 2
+        int byte_idx = idx >> 2;                
+        int bit_off  = (idx & 3) << 1;          
 
-        uint8_t byte1 = blake_xof_sh[byte_idx];          // first half (0‑511)
-        uint8_t byte2 = blake_xof_sh[512 + byte_idx];    // second half (512‑1023)
+        uint8_t byte1 = blake_xof_sh[byte_idx];          
+        uint8_t byte2 = blake_xof_sh[512 + byte_idx];    
 
-        // pop‑count of two bits → values 0‑2
+        
         int a = ((byte1 >> bit_off) & 1) + ((byte1 >> (bit_off + 1)) & 1);
         int b = ((byte2 >> bit_off) & 1) + ((byte2 >> (bit_off + 1)) & 1);
         int32_t coeff = a - b;                 // range [-2, 2]
 
-        // Map to field element [0, Q)
+        
         int32_t tmp = coeff + (int32_t)KNOX_Q;
-        poly_sh[PAD_IDX(idx)] = (uint32_t)(tmp % (int32_t)KNOX_Q);
+        if (tmp >= (int32_t)KNOX_Q) {
+            tmp -= (int32_t)KNOX_Q;
+        }
+        poly_sh[PAD_IDX(idx)] = (uint32_t)tmp;
     }
-    __syncthreads();   // ensure the whole polynomial is ready for NTT
+    __syncthreads();   
 
     /* -------------------------------------------------------------
      *  4. Forward NTT (already warp‑distributed)
      * ------------------------------------------------------------- */
-   ntt_forward_multiwarp(poly_sh, tw_fwd_sh);
+    if (threadIdx.x < 32) {
+        ntt_forward_shared(poly_sh, tw_fwd_sh, threadIdx.x);
+    }
+    __syncthreads();
 
     /* -------------------------------------------------------------
      *  5. Proof‑of‑Time loop – **warp‑distributed**
      * ------------------------------------------------------------- */
     for (uint32_t s = 0; s < steps; ++s) {
-        // Each warp processes the same chunk size as in the CBD step.
+        
         for (int i = warp_id * coeffs_per_warp + lane_id;
              i < (warp_id + 1) * coeffs_per_warp;
              i += 32) {
 
             uint32_t val = mul_mod(poly_sh[PAD_IDX(i)], a_hat_sh[PAD_IDX(i)]);
-            val ^= s;                                 // break homomorphism
+            val ^= s;                                 
             poly_sh[PAD_IDX(i)] = barrett_reduce(val);
         }
-        __syncthreads();   // all warps must see the updated polynomial before next step
+        __syncthreads();   
     }
 
     /* -------------------------------------------------------------
      *  6. Inverse NTT (already warp‑distributed)
      * ------------------------------------------------------------- */
-    ntt_inverse_shared(poly_sh, tw_inv_sh);
+    if (threadIdx.x < 32) {
+        ntt_inverse_shared(poly_sh, tw_inv_sh, threadIdx.x);
+    }
     __syncthreads();
 
     /* -------------------------------------------------------------
@@ -329,7 +238,7 @@ __global__ void knox_full_offload(
      *  8. Build final hash input: "ult7rock-block-v1" || nonce || poly
      * ------------------------------------------------------------- */
     if (threadIdx.x == 0) {
-        const char prefix[18] = "ult7rock-block-v1";   // 17 bytes, no NUL‑terminator
+        const char prefix[] = "ult7rock-block-v1";   
         #pragma unroll
         for (int i = 0; i < 17; ++i) final_buf_sh[i] = (uint8_t)prefix[i];
         #pragma unroll
@@ -342,7 +251,7 @@ __global__ void knox_full_offload(
      * ------------------------------------------------------------- */
     if (threadIdx.x == 0) {
         device_blake3_hash(final_buf_sh,
-                           17 + 8 + 2*KNOX_N,   // 2073 bytes total
+                           17 + 8 + 2*KNOX_N,  
                            digest_sh,
                            32);
     }
@@ -352,7 +261,7 @@ __global__ void knox_full_offload(
      * 10. Leading‑zero test & atomic win handling (only thread 0)
      * ------------------------------------------------------------- */
     if (threadIdx.x == 0) {
-        uint32_t zero_bits = count_leading_zeros(digest_sh);
+        uint32_t zero_bits = ::count_leading_zeros(digest_sh);
         if (zero_bits >= difficulty_bits) {
             if (atomicCAS(out_found_flag, 0, 1) == 0) {
                 *out_winning_nonce = nonce;

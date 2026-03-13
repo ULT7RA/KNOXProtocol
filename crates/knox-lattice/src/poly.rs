@@ -1,6 +1,6 @@
 use crate::params::{ETA, N, Q};
 use bincode::{Decode, Encode};
-use knox_crypto::os_random_bytes;
+use getrandom::getrandom;
 
 // ---------------------------------------------------------------------------
 // NTT constants for Z_q[x]/(x^N + 1), N=1024, Q=12289.
@@ -338,7 +338,7 @@ impl Poly {
 
     pub fn random_short_checked() -> Result<Self, String> {
         let mut bytes = [0u8; N];
-        os_random_bytes(&mut bytes).map_err(|e| format!("rng failure: {e}"))?;
+        getrandom(&mut bytes).map_err(|e| format!("rng failure: {e}"))?;
         let mut coeffs = [0i64; N];
         for i in 0..N {
             let span = (ETA * 2 + 1) as u8;
@@ -354,7 +354,7 @@ impl Poly {
 
     pub fn random_uniform_checked() -> Result<Self, String> {
         let mut bytes = [0u8; N * 2];
-        os_random_bytes(&mut bytes).map_err(|e| format!("rng failure: {e}"))?;
+        getrandom(&mut bytes).map_err(|e| format!("rng failure: {e}"))?;
         let mut coeffs = [0i64; N];
         for (idx, chunk) in bytes.chunks_exact(2).enumerate() {
             let val = u16::from_le_bytes([chunk[0], chunk[1]]) as u64;

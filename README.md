@@ -88,6 +88,15 @@ powershell.exe -File scripts\build-installer.ps1
 cargo zigbuild -p knox-node --target x86_64-unknown-linux-musl --profile release-lite
 ```
 
+### Docker (Linux node + GUI)
+
+```bash
+docker build -f docker/Dockerfile.node -t knox/node:linux .
+docker build -f docker/Dockerfile.gui -t knox/gui:linux .
+```
+
+For full run commands (node, GUI, and compose), see [docker/README.md](./docker/README.md).
+
 ---
 
 ## Run a Node (CLI)

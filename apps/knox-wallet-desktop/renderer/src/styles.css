@@ -158,9 +158,36 @@ body,
 
 .version {
   margin-top: auto;
-  color: #6788a8;
-  font-size: 15px;
-  line-height: 1.5;
+  display: grid;
+  gap: 2px;
+  color: #c7f3ff;
+  font-size: 14px;
+  line-height: 1.25;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.version-tagline {
+  color: #9fd8e9;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.9px;
+}
+
+.version-email {
+  color: #e3fbff;
+  font-size: 13px;
+  margin-top: 2px;
+  word-break: break-word;
+}
+
+.version-build {
+  color: #a8bfd6;
+  font-size: 12px;
+  margin-top: 2px;
+  text-shadow:
+    0 0 10px rgba(0, 229, 255, 0.42),
+    0 0 18px rgba(255, 53, 210, 0.25);
 }
 
 .main {

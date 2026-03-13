@@ -4,7 +4,7 @@ use crate::commitment::{
 use crate::params::Q;
 use crate::poly::Poly;
 use bincode::{Decode, Encode};
-use knox_crypto::os_random_bytes;
+use getrandom::getrandom;
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct BitOrProof {
@@ -240,7 +240,7 @@ fn linear_challenge_poly(
 
 fn random_challenge_poly(domain: &[u8]) -> Result<Poly, String> {
     let mut seed = [0u8; 32];
-    os_random_bytes(&mut seed).map_err(|e| format!("rng failure: {e}"))?;
+    getrandom(&mut seed).map_err(|e| format!("rng failure: {e}"))?;
     Ok(Poly::from_hash(domain, &seed))
 }
 

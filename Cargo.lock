@@ -1102,7 +1102,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "knox-consensus"
-version = "1.2.2"
+version = "1.3.1"
 dependencies = [
  "bincode",
  "blake3",
@@ -1112,12 +1112,12 @@ dependencies = [
 
 [[package]]
 name = "knox-core"
-version = "1.2.2"
+version = "1.3.1"
 dependencies = [
  "bincode",
- "curve25519-dalek",
+ "blake3",
+ "getrandom 0.2.17",
  "knox-consensus",
- "knox-crypto",
  "knox-lattice",
  "knox-ledger",
  "knox-p2p",
@@ -1126,46 +1126,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "knox-crypto"
-version = "1.2.2"
-dependencies = [
- "bincode",
- "blake3",
- "curve25519-dalek",
- "getrandom 0.2.17",
- "rand_chacha",
- "rand_core",
- "zeroize",
-]
-
-[[package]]
 name = "knox-keygen"
-version = "1.2.2"
+version = "1.3.1"
 dependencies = [
- "knox-crypto",
+ "blake3",
+ "getrandom 0.2.17",
  "knox-lattice",
  "knox-types",
 ]
 
 [[package]]
 name = "knox-lattice"
-version = "1.2.2"
+version = "1.3.1"
 dependencies = [
- "argon2",
  "bincode",
  "blake3",
- "curve25519-dalek",
- "knox-crypto",
+ "getrandom 0.2.17",
  "knox-types",
 ]
 
 [[package]]
 name = "knox-ledger"
-version = "1.2.2"
+version = "1.3.1"
 dependencies = [
  "bincode",
- "curve25519-dalek",
- "knox-crypto",
  "knox-lattice",
  "knox-storage",
  "knox-types",
@@ -1173,12 +1157,13 @@ dependencies = [
 
 [[package]]
 name = "knox-node"
-version = "1.2.2"
+version = "1.3.1"
 dependencies = [
  "bincode",
+ "blake3",
+ "getrandom 0.2.17",
  "knox-consensus",
  "knox-core",
- "knox-crypto",
  "knox-lattice",
  "knox-ledger",
  "knox-p2p",
@@ -1188,24 +1173,23 @@ dependencies = [
 
 [[package]]
 name = "knox-p2p"
-version = "1.2.2"
+version = "1.3.1"
 dependencies = [
  "bincode",
  "blake3",
- "chacha20poly1305",
- "knox-crypto",
+ "getrandom 0.2.17",
  "knox-lattice",
  "knox-types",
+ "subtle",
  "tokio",
 ]
 
 [[package]]
 name = "knox-smoke"
-version = "1.2.2"
+version = "1.3.1"
 dependencies = [
  "knox-consensus",
  "knox-core",
- "knox-crypto",
  "knox-ledger",
  "knox-p2p",
  "knox-types",
@@ -1214,17 +1198,16 @@ dependencies = [
 
 [[package]]
 name = "knox-storage"
-version = "1.2.2"
+version = "1.3.1"
 dependencies = [
  "blake3",
- "chacha20poly1305",
  "getrandom 0.2.17",
  "subtle",
 ]
 
 [[package]]
 name = "knox-types"
-version = "1.2.2"
+version = "1.3.1"
 dependencies = [
  "bincode",
  "blake3",
@@ -1232,14 +1215,14 @@ dependencies = [
 
 [[package]]
 name = "knox-wallet"
-version = "1.2.2"
+version = "1.3.1"
 dependencies = [
  "argon2",
  "bincode",
  "blake3",
  "chacha20poly1305",
  "curve25519-dalek",
- "knox-crypto",
+ "getrandom 0.2.17",
  "knox-lattice",
  "knox-types",
  "subtle",
@@ -1248,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "knox-wallet-gui"
-version = "1.2.2"
+version = "1.3.1"
 dependencies = [
  "eframe",
  "knox-types",
@@ -1751,15 +1734,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ppv-lite86"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
-dependencies = [
- "zerocopy",
-]
-
-[[package]]
 name = "proc-macro-crate"
 version = "1.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1792,16 +1766,6 @@ name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
-
-[[package]]
-name = "rand_chacha"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
-dependencies = [
- "ppv-lite86",
- "rand_core",
-]
 
 [[package]]
 name = "rand_core"
