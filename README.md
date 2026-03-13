@@ -1,3 +1,6 @@
+> [!WARNING]
+> Working out bugs in wallet.MSI/Docker releases live, dont use.
+
 # KNOX Protocol
 
 **The world's first fully end-to-end lattice-based privacy blockchain.**
@@ -150,3 +153,4 @@ bash scripts/testnet-bench.sh
 ## License
 
 Apache-2.0 — see [LICENSE](./LICENSE)
+
