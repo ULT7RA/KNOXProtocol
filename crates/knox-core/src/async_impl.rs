@@ -915,6 +915,49 @@ impl Node {
                                             );
                                             last_chain_continuity_log_ms = now;
                                         }
+                                        // When the mismatch is at or near the tip, the local
+                                        // chain has diverged.  Clear and resync immediately
+                                        // rather than waiting for 5+ P2P conflict hits.
+                                        if sync_auto_reset_on_conflict
+                                            && status.shared_height >= status.local_tip.saturating_sub(1)
+                                        {
+                                            eprintln!(
+                                                "[knox-node] chain continuity recovery: tip diverged at h={} — clearing ledger for full resync",
+                                                status.shared_height
+                                            );
+                                            let cleared = match ledger.lock() {
+                                                Ok(l) => l.clear_chain(),
+                                                Err(_) => Err("ledger lock poisoned".to_string()),
+                                            };
+                                            match cleared {
+                                                Ok(()) => {
+                                                    last_sync_progress_height = 0;
+                                                    last_sync_progress_ms = now_ms();
+                                                    last_blocks_response_ms = now_ms();
+                                                    bootstrap_genesis_stall_count = 0;
+                                                    genesis_mismatch_hits = 0;
+                                                    sync_conflict_hits = 0;
+                                                    sync_conflict_height = 0;
+                                                    fork_oo_stall_count = 0;
+                                                    fork_oo_peer_max_h = 0;
+                                                    chain_continuity_ok = false;
+                                                    chain_continuity_checked_once = false;
+                                                    pending_mining = None;
+                                                    network
+                                                        .try_send(Message::GetBlocks {
+                                                            from_height: 0,
+                                                            max_count: SYNC_GETBLOCKS_MAX_COUNT,
+                                                        });
+                                                    last_sync_request_ms = now_ms();
+                                                }
+                                                Err(err) => {
+                                                    eprintln!(
+                                                        "[knox-node] chain continuity recovery failed: {}",
+                                                        err
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 Ok(None) => {}
