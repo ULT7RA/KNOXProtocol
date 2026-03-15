@@ -10,7 +10,8 @@ services:
       KNOX_NODE_P2P_BIND: 0.0.0.0:9735
       KNOX_NODE_RPC_BIND: 0.0.0.0:9736
       KNOX_NODE_RPC_ALLOW_REMOTE: "1"
-      KNOX_NODE_PEERS: ${KNOX_NODE_PEERS:-}
+      KNOX_NODE_PEERS: ${KNOX_NODE_PEERS:-}  # empty = entrypoint uses ForgeTitan defaults
+      KNOX_NODE_NO_MINE: ${KNOX_NODE_NO_MINE:-1}  # relay-only by default
       KNOX_NODE_MINER_ADDRESS: ${KNOX_NODE_MINER_ADDRESS:-}
     ports:
       - "9735:9735"

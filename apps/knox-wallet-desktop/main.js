@@ -50,14 +50,24 @@ const NETWORK_ENV_OVERRIDE_REQUESTED = /^(1|true|yes)$/i.test(
 const ALLOW_NETWORK_ENV_OVERRIDES = !app.isPackaged && !MAINNET_LOCKED && NETWORK_ENV_OVERRIDE_REQUESTED;
 
 const HARDCODED_P2P_SEEDS = [
+  // ForgeTitan node-a (:9735)
   '129.146.133.68:9735',
   '129.146.140.173:9735',
   '161.153.118.97:9735',
+  // ForgeTitan node-b (:9745)
+  '129.146.133.68:9745',
+  '129.146.140.173:9745',
+  '161.153.118.97:9745',
 ];
 const HARDCODED_RPC_CANDIDATES = [
+  // ForgeTitan node-a (:9736)
   '129.146.133.68:9736',
   '129.146.140.173:9736',
-  // 161.153.118.97 is P2P-only (no RPC listener on 9736)
+  '161.153.118.97:9736',
+  // ForgeTitan node-b (:9746)
+  '129.146.133.68:9746',
+  '129.146.140.173:9746',
+  '161.153.118.97:9746',
 ];
 const DEFAULT_PUBLIC_P2P_SEEDS = (() => {
   const env = String(process.env.KNOX_DEFAULT_PUBLIC_P2P_SEEDS || '')

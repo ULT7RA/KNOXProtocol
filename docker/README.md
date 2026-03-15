@@ -16,12 +16,15 @@ docker build -f docker/Dockerfile.gui -t knox/gui:linux .
 
 ## Run Node Container
 
+The entrypoint auto-connects to all 6 ForgeTitan seed peers. Override `KNOX_NODE_PEERS` to
+customize. Mining is **off** by default (`KNOX_NODE_NO_MINE=1`); set it to `0` to mine.
+
 ```bash
 docker run -d --name knox-node \
   -p 9735:9735 -p 9736:9736 \
   -e KNOX_NODE_RPC_ALLOW_REMOTE=1 \
+  -e KNOX_NODE_NO_MINE=0 \
   -e KNOX_NODE_MINER_ADDRESS="<your_knox1_address>" \
-  -e KNOX_NODE_PEERS="<peer1:9735,peer2:9735,peer3:9735>" \
   -v knox-node-data:/var/lib/knox/node \
   knox/node:linux
 ```
