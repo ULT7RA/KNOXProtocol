@@ -192,21 +192,21 @@ impl Ult7RockLattice {
 
         if block.header.height != self.height {
             eprintln!(
-                "[knox-node] reject proposal h={} r={}: expected height {}",
+                "[FORGERing] reject proposal h={} r={}: expected height {}",
                 block.header.height, block.header.round, self.height
             );
             return out;
         }
         if block.header.round != self.round {
             eprintln!(
-                "[knox-node] reject proposal h={} r={}: expected round {}",
+                "[FORGERing] reject proposal h={} r={}: expected round {}",
                 block.header.height, block.header.round, self.round
             );
             return out;
         }
         if self.validators.validators.is_empty() {
             eprintln!(
-                "[knox-node] reject proposal h={} r={}: validator set is empty",
+                "[FORGERing] reject proposal h={} r={}: validator set is empty",
                 block.header.height, block.header.round
             );
             return out;
@@ -214,14 +214,14 @@ impl Ult7RockLattice {
 
         let Some(proposer_idx) = self.validators.index_of_id(&block.header.proposer) else {
             eprintln!(
-                "[knox-node] reject proposal h={} r={}: proposer id not in validator set",
+                "[FORGERing] reject proposal h={} r={}: proposer id not in validator set",
                 block.header.height, block.header.round
             );
             return out;
         };
         let Some(proposer_pk) = self.validators.validators.get(proposer_idx as usize) else {
             eprintln!(
-                "[knox-node] reject proposal h={} r={}: proposer index missing",
+                "[FORGERing] reject proposal h={} r={}: proposer index missing",
                 block.header.height, block.header.round
             );
             return out;
@@ -229,7 +229,7 @@ impl Ult7RockLattice {
         let signer_msg = hash_header_for_signing(&block.header);
         if !verify_consensus(proposer_pk, &signer_msg.0, &block.proposer_sig) {
             eprintln!(
-                "[knox-node] reject proposal h={} r={}: invalid proposer signature",
+                "[FORGERing] reject proposal h={} r={}: invalid proposer signature",
                 block.header.height, block.header.round
             );
             return out;
@@ -238,14 +238,14 @@ impl Ult7RockLattice {
         let leader = self.leader_index(block.header.height, self.round);
         if proposer_idx != leader {
             eprintln!(
-                "[knox-node] reject proposal h={} r={}: proposer mismatch",
+                "[FORGERing] reject proposal h={} r={}: proposer mismatch",
                 block.header.height, block.header.round
             );
             return out;
         }
         if self.banned.contains(&leader) {
             eprintln!(
-                "[knox-node] reject proposal h={} r={}: block proposer is slashed",
+                "[FORGERing] reject proposal h={} r={}: block proposer is slashed",
                 block.header.height, block.header.round
             );
             return out;
@@ -253,7 +253,7 @@ impl Ult7RockLattice {
 
         if !verify_block_proof(&block.header, &block.lattice_proof) {
             eprintln!(
-                "[knox-node] reject proposal h={} r={}: invalid lattice proof",
+                "[FORGERing] reject proposal h={} r={}: invalid lattice proof",
                 block.header.height, block.header.round
             );
             return out;
@@ -264,7 +264,7 @@ impl Ult7RockLattice {
             .contains(&block.lattice_proof.clh_contribution)
         {
             eprintln!(
-                "[knox-node] reject proposal h={} r={}: duplicate lattice contribution",
+                "[FORGERing] reject proposal h={} r={}: duplicate lattice contribution",
                 block.header.height, block.header.round
             );
             return out;

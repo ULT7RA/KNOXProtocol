@@ -1004,7 +1004,7 @@ function parseRuntimeLine(key, line, win) {
       runtimeStats.node.lastProposeAtMs = Date.now();
       return;
     }
-    const ledgerTip = line.match(/\[knox-node\] ledger tip h=(\d+) hardening=(\d+)/);
+    const ledgerTip = line.match(/\[FORGERing\] ledger tip h=(\d+) hardening=(\d+)/);
     if (ledgerTip) {
       const h = Number(ledgerTip[1]);
       const hard = Number(ledgerTip[2]);

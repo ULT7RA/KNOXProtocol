@@ -27,14 +27,14 @@ struct PublicKey([u8; 32]);
 
 fn main() {
     if std::env::var("KNOX_NODE_EXIT_IMMEDIATELY").is_ok() {
-        eprintln!("[knox-node] immediate exit");
+        eprintln!("[FORGERing] immediate exit");
         return;
     }
-    eprintln!("[knox-node] entered");
+    eprintln!("[FORGERing] entered");
     if std::env::var("KNOX_NODE_SMOKE").is_ok() {
         return;
     }
-    eprintln!("[knox-node] building runtime");
+    eprintln!("[FORGERing] building runtime");
     // Run the async runtime on a dedicated large-stack thread so mining paths
     // cannot exhaust the default process main-thread stack on Windows.
     let handle = std::thread::Builder::new()
@@ -48,17 +48,17 @@ fn main() {
                 .enable_time()
                 .build()
                 .expect("tokio runtime");
-            eprintln!("[knox-node] runtime built");
+            eprintln!("[FORGERing] runtime built");
             rt.block_on(async_main());
         })
         .expect("spawn runtime thread");
     if let Err(err) = handle.join() {
-        eprintln!("[knox-node] runtime thread panicked: {:?}", err);
+        eprintln!("[FORGERing] runtime thread panicked: {:?}", err);
     }
 }
 
 async fn async_main() {
-    eprintln!("[knox-node] starting");
+    eprintln!("[FORGERing] starting");
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "./data".to_string());
     let bind = args.next().unwrap_or_else(|| "0.0.0.0:9735".to_string());
@@ -101,7 +101,7 @@ async fn async_main() {
         }
     }
 
-    eprintln!("[knox-node] loading keypair");
+    eprintln!("[FORGERing] loading keypair");
     let keypair = load_or_create_keypair(&data_dir).unwrap_or_else(|e| {
         eprintln!("key error: {e}");
         std::process::exit(1);
@@ -122,7 +122,7 @@ async fn async_main() {
     let diamond_auth_endpoints = load_diamond_auth_endpoints();
     if !diamond_authenticators.is_empty() {
         eprintln!(
-            "[knox-node] diamond auth enabled authenticators={} quorum={} endpoints={}",
+            "[FORGERing] diamond auth enabled authenticators={} quorum={} endpoints={}",
             diamond_authenticators.len(),
             diamond_auth_quorum,
             diamond_auth_endpoints.len()
@@ -174,7 +174,7 @@ async fn async_main() {
             let hardening: u64 = (0..=tip)
                 .map(|h| knox_lattice::difficulty_bits(h) as u64)
                 .sum();
-            eprintln!("[knox-node] ledger tip h={} hardening={}", tip, hardening);
+            eprintln!("[FORGERing] ledger tip h={} hardening={}", tip, hardening);
         }
     }
 
@@ -238,7 +238,7 @@ async fn async_main() {
         diamond_auth_endpoints,
     };
 
-    eprintln!("[knox-node] starting node");
+    eprintln!("[FORGERing] starting node");
     match Node::new(cfg).await {
         Ok(node) => node.run().await,
         Err(err) => {
@@ -263,7 +263,7 @@ fn seed_embedded_genesis(data_dir: &str) -> Result<(), String> {
     ledger
         .append_block(&block)
         .map_err(|e| format!("embedded genesis append failed: {e}"))?;
-    eprintln!("[knox-node] seeded embedded genesis h=0");
+    eprintln!("[FORGERing] seeded embedded genesis h=0");
     Ok(())
 }
 
@@ -291,7 +291,7 @@ fn derive_address_from_node_key(sk: &SecretKey) -> Address {
 
 fn load_or_create_keypair(data_dir: &str) -> Result<(SecretKey, PublicKey), String> {
     if std::env::var("KNOX_NODE_EPHEMERAL_KEY").is_ok() {
-        eprintln!("[knox-node] ephemeral keypair (no file IO)");
+        eprintln!("[FORGERing] ephemeral keypair (no file IO)");
         let sk = SecretKey(random_secret_bytes()?);
         let pk = public_from_secret(&sk);
         return Ok((sk, pk));
@@ -304,7 +304,7 @@ fn load_or_create_keypair(data_dir: &str) -> Result<(SecretKey, PublicKey), Stri
                 let mut sk = [0u8; 32];
                 sk.copy_from_slice(&raw);
                 let pk = public_from_secret(&SecretKey(sk));
-                eprintln!("[knox-node] key loaded from env");
+                eprintln!("[FORGERing] key loaded from env");
                 return Ok((SecretKey(sk), pk));
             }
         }
@@ -312,7 +312,7 @@ fn load_or_create_keypair(data_dir: &str) -> Result<(SecretKey, PublicKey), Stri
     }
 
     let path = Path::new(data_dir).join("node.key");
-    eprintln!("[knox-node] key file: {}", path.display());
+    eprintln!("[FORGERing] key file: {}", path.display());
     #[cfg(unix)]
     if let Ok(meta) = fs::metadata(&path) {
         let mode = meta.permissions().mode() & 0o777;
@@ -324,32 +324,32 @@ fn load_or_create_keypair(data_dir: &str) -> Result<(SecretKey, PublicKey), Stri
         }
     }
     if let Ok(bytes) = fs::read(&path) {
-        eprintln!("[knox-node] key bytes: {}", bytes.len());
+        eprintln!("[FORGERing] key bytes: {}", bytes.len());
         if bytes.len() == 64 {
             let mut sk = [0u8; 32];
             sk.copy_from_slice(&bytes[..32]);
             let pk = public_from_secret(&SecretKey(sk));
-            eprintln!("[knox-node] key loaded (raw)");
+            eprintln!("[FORGERing] key loaded (raw)");
             return Ok((SecretKey(sk), pk));
         }
         if let Some(text) = decode_text(&bytes) {
             let text = text.trim();
-            eprintln!("[knox-node] key text len: {}", text.len());
+            eprintln!("[FORGERing] key text len: {}", text.len());
             if text.len() == 128 {
                 let raw = hex_decode(text)?;
                 if raw.len() == 64 {
                     let mut sk = [0u8; 32];
                     sk.copy_from_slice(&raw[..32]);
                     let pk = public_from_secret(&SecretKey(sk));
-                    eprintln!("[knox-node] key loaded (hex)");
+                    eprintln!("[FORGERing] key loaded (hex)");
                     return Ok((SecretKey(sk), pk));
                 }
             }
         } else {
-            eprintln!("[knox-node] key text decode failed");
+            eprintln!("[FORGERing] key text decode failed");
         }
     }
-    eprintln!("[knox-node] generating keypair");
+    eprintln!("[FORGERing] generating keypair");
     fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
     let sk = SecretKey(random_secret_bytes()?);
     let pk = public_from_secret(&sk);
@@ -371,7 +371,7 @@ fn load_or_create_keypair(data_dir: &str) -> Result<(SecretKey, PublicKey), Stri
     {
         fs::write(path, bytes).map_err(|e| e.to_string())?;
     }
-    eprintln!("[knox-node] key generated and saved");
+    eprintln!("[FORGERing] key generated and saved");
     Ok((sk, pk))
 }
 

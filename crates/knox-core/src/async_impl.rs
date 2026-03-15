@@ -249,10 +249,10 @@ impl Node {
                     .await;
                     match res {
                         Ok(()) => {
-                            eprintln!("[knox-node] rpc server exited; restarting");
+                            eprintln!("[FORGERing] rpc server exited; restarting");
                         }
                         Err(err) => {
-                            eprintln!("[knox-node] rpc server error: {}", err);
+                            eprintln!("[FORGERing] rpc server error: {}", err);
                         }
                     }
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -324,7 +324,7 @@ impl Node {
         let forger_self_index: Option<usize> = forger_set.iter().position(|id| *id == proposer_id);
         if !forger_set.is_empty() {
             eprintln!(
-                "[knox-node] forger election enabled: {} forgers, self_index={:?} grace_ms={}",
+                "[FORGERing] forger election enabled: {} forgers, self_index={:?} grace_ms={}",
                 forger_set.len(),
                 forger_self_index,
                 FORGER_GRACE_MS
@@ -362,7 +362,7 @@ impl Node {
             chain_continuity_checked_once = true;
         }
         eprintln!(
-            "[knox-node] upstream sync config batch={} timeout_ms={} rpc={}",
+            "[FORGERing] upstream sync config batch={} timeout_ms={} rpc={}",
             upstream_sync_batch_count,
             upstream_sync_timeout.as_millis(),
             upstream_sync_rpc.as_deref().unwrap_or("<disabled>")
@@ -410,7 +410,7 @@ impl Node {
                 let sync_sender = network.sender();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(5)).await;
-                    eprintln!("[knox-node] ledger empty at boot — requesting sync from h=0");
+                    eprintln!("[FORGERing] ledger empty at boot — requesting sync from h=0");
                     sync_sender
                         .try_send(knox_p2p::Message::GetBlocks {
                             from_height: 0,
@@ -437,13 +437,13 @@ impl Node {
                         let (lattice_proof, backend_line) = match result {
                             Ok(v) => v,
                             Err(err) => {
-                                eprintln!("[knox-node] mining_runtime_error {}", err);
+                                eprintln!("[FORGERing] mining_runtime_error {}", err);
                                 tokio::time::sleep(Duration::from_millis(1200)).await;
                                 continue;
                             }
                         };
                         if backend_line != last_backend_line {
-                            eprintln!("[knox-node] mining_runtime {}", backend_line);
+                            eprintln!("[FORGERing] mining_runtime {}", backend_line);
                             last_backend_line = backend_line;
                         }
                         let mut block = Block {
@@ -467,7 +467,7 @@ impl Node {
                                 }
                                 Err(err) => {
                                     eprintln!(
-                                        "[knox-node] diamond auth quorum unmet h={}: {}",
+                                        "[FORGERing] diamond auth quorum unmet h={}: {}",
                                         block.header.height, err
                                     );
                                     continue;
@@ -486,7 +486,7 @@ impl Node {
                     Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
                     Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                         pending_mining = None;
-                        eprintln!("[knox-node] mining worker closed before delivering proof");
+                        eprintln!("[FORGERing] mining worker closed before delivering proof");
                     }
                 }
             }
@@ -503,7 +503,7 @@ impl Node {
                         }
                     }
                     if pending_msgs.len() > 1 {
-                        eprintln!("[knox-node] inbound batch-drain: {} messages", pending_msgs.len());
+                        eprintln!("[FORGERing] inbound batch-drain: {} messages", pending_msgs.len());
                     }
                     for env in pending_msgs {
                     match env.msg {
@@ -565,7 +565,7 @@ impl Node {
                                         match replaced {
                                             Ok(()) => {
                                                 eprintln!(
-                                                    "[knox-node] tip replaced h={} with peer block (fork choice)",
+                                                    "[FORGERing] tip replaced h={} with peer block (fork choice)",
                                                     block.header.height
                                                 );
                                                 // Cancel any pending mining for the old tip
@@ -580,7 +580,7 @@ impl Node {
                                 }
                                 Err(err) => {
                                     eprintln!(
-                                        "[knox-node] reject proposal h={} r={}: {}",
+                                        "[FORGERing] reject proposal h={} r={}: {}",
                                         block.header.height, block.header.round, err
                                     );
                                     if err.contains("missing parent") || err.contains("prev hash mismatch") {
@@ -605,12 +605,12 @@ impl Node {
                                                 fork_guard_pause_until_ms = guard_until;
                                             }
                                             eprintln!(
-                                                "[knox-node] fork guard active ({} ms) — requesting sync from h={}",
+                                                "[FORGERing] fork guard active ({} ms) — requesting sync from h={}",
                                                 fork_guard_pause_ms, from
                                             );
                                         } else {
                                             eprintln!(
-                                                "[knox-node] ignoring far-ahead proposal h={} (local_tip={}, gap={}) — requesting forward sync from h={}",
+                                                "[FORGERing] ignoring far-ahead proposal h={} (local_tip={}, gap={}) — requesting forward sync from h={}",
                                                 block.header.height, our_tip, height_gap, from
                                             );
                                         }
@@ -666,13 +666,13 @@ impl Node {
                                 last_getblocks_served_up_to = served_end;
                                 last_getblocks_served_ms = now_ms();
                                 eprintln!(
-                                    "[knox-node] serving {} blocks from h={}",
+                                    "[FORGERing] serving {} blocks from h={}",
                                     blocks.len(),
                                     from_height
                                 );
                                 let sent = network.try_send(Message::Blocks(blocks));
                                 if !sent {
-                                    eprintln!("[knox-node] WARN: Blocks try_send failed (outbound full) for h={}", from_height);
+                                    eprintln!("[FORGERing] WARN: Blocks try_send failed (outbound full) for h={}", from_height);
                                 }
                             }
                         }
@@ -682,7 +682,7 @@ impl Node {
                                 let first_h = blocks.first().map(|b| b.header.height).unwrap_or(0);
                                 let last_h = blocks.last().map(|b| b.header.height).unwrap_or(0);
                                 eprintln!(
-                                    "[knox-node] sync batch received count={} range={}..{}",
+                                    "[FORGERing] sync batch received count={} range={}..{}",
                                     blocks.len(),
                                     first_h,
                                     last_h
@@ -691,7 +691,7 @@ impl Node {
                             let batch_result = match ledger.lock() {
                                 Ok(l) => l.append_sync_batch(&blocks),
                                 Err(_) => {
-                                    eprintln!("[knox-node] sync stop: ledger lock poisoned");
+                                    eprintln!("[FORGERing] sync stop: ledger lock poisoned");
                                     continue;
                                 }
                             };
@@ -701,7 +701,7 @@ impl Node {
                             let already_exists_count = batch_result.already_exists_count;
                             if let Some(last_height) = batch_result.last_progress_height {
                                 eprintln!(
-                                    "[knox-node] sync progressed {} block(s) (new={} existing={}) through h={}",
+                                    "[FORGERing] sync progressed {} block(s) (new={} existing={}) through h={}",
                                     progressed_count,
                                     applied_count,
                                     already_exists_count,
@@ -730,11 +730,11 @@ impl Node {
                                         sync_conflict_hits = 1;
                                     }
                                     eprintln!(
-                                        "[knox-node] sync conflict h={} hit={}",
+                                        "[FORGERing] sync conflict h={} hit={}",
                                         stop_height, sync_conflict_hits
                                     );
                                 }
-                                eprintln!("[knox-node] sync stop h={}: {}", stop_height, e);
+                                eprintln!("[FORGERing] sync stop h={}: {}", stop_height, e);
                                 let low_height = stop_height <= 1;
                                 let likely_mismatch = e.contains("prev hash mismatch")
                                     || e.contains("missing parent")
@@ -744,7 +744,7 @@ impl Node {
                                         genesis_mismatch_hits.saturating_add(1);
                                     if genesis_mismatch_hits >= 3 {
                                         eprintln!(
-                                            "[knox-node] sync blocked at low height; likely genesis mismatch between local embedded genesis and peer network"
+                                            "[FORGERing] sync blocked at low height; likely genesis mismatch between local embedded genesis and peer network"
                                         );
                                     }
                                 }
@@ -753,7 +753,7 @@ impl Node {
                                 let first_h = blocks.first().map(|b| b.header.height).unwrap_or(0);
                                 let last_h = blocks.last().map(|b| b.header.height).unwrap_or(0);
                                 eprintln!(
-                                    "[knox-node] sync batch made no progress range={}..{} already_exists={} skipped_out_of_order={}",
+                                    "[FORGERing] sync batch made no progress range={}..{} already_exists={} skipped_out_of_order={}",
                                     first_h,
                                     last_h,
                                     already_exists_count,
@@ -768,7 +768,7 @@ impl Node {
                                     // ask forward again instead of waiting for the stall ticker.
                                     let from = local_tip.saturating_add(1);
                                     eprintln!(
-                                        "[knox-node] sync stale batch behind tip (local_tip={}) — requesting sync from h={}",
+                                        "[FORGERing] sync stale batch behind tip (local_tip={}) — requesting sync from h={}",
                                         local_tip, from
                                     );
                                     network
@@ -790,7 +790,7 @@ impl Node {
                                     && sync_conflict_hits >= 3
                                 {
                                     eprintln!(
-                                        "[knox-node] sync conflict persists at h={} (hits={}); clearing local ledger for full resync",
+                                        "[FORGERing] sync conflict persists at h={} (hits={}); clearing local ledger for full resync",
                                         sync_conflict_height, sync_conflict_hits
                                     );
                                     let cleared = match ledger.lock() {
@@ -817,7 +817,7 @@ impl Node {
                                         }
                                         Err(err) => {
                                             eprintln!(
-                                                "[knox-node] sync auto-reset failed: {}",
+                                                "[FORGERing] sync auto-reset failed: {}",
                                                 err
                                             );
                                         }
@@ -853,7 +853,7 @@ impl Node {
                                     fork_oo_peer_max_h = fork_oo_peer_max_h.max(last_h);
                                     if fork_oo_stall_count % 5 == 0 {
                                         eprintln!(
-                                            "[knox-node] fork detector: {} consecutive out-of-order stalls (peer chain up to h={}, local tip h={})",
+                                            "[FORGERing] fork detector: {} consecutive out-of-order stalls (peer chain up to h={}, local tip h={})",
                                             fork_oo_stall_count, fork_oo_peer_max_h, local_tip
                                         );
                                     }
@@ -861,7 +861,7 @@ impl Node {
                                         && fork_oo_stall_count >= FORK_OO_RECOVERY_THRESHOLD
                                     {
                                         eprintln!(
-                                            "[knox-node] FORK RECOVERY: {} consecutive out-of-order stalls, \
+                                            "[FORGERing] FORK RECOVERY: {} consecutive out-of-order stalls, \
                                              peer chain at h={} vs local h={}; clearing chain for full resync",
                                             fork_oo_stall_count, fork_oo_peer_max_h, local_tip
                                         );
@@ -889,7 +889,7 @@ impl Node {
                                             }
                                             Err(err) => {
                                                 eprintln!(
-                                                    "[knox-node] FORK RECOVERY failed: {}",
+                                                    "[FORGERing] FORK RECOVERY failed: {}",
                                                     err
                                                 );
                                             }
@@ -908,7 +908,7 @@ impl Node {
                                     Err(_) => 0,
                                 };
                                 eprintln!(
-                                    "[knox-node] sync continue from h={} after progressing {} block(s)",
+                                    "[FORGERing] sync continue from h={} after progressing {} block(s)",
                                     next_from,
                                     progressed_count
                                 );
@@ -957,7 +957,7 @@ impl Node {
                                         );
                                         if now.saturating_sub(last_chain_continuity_log_ms) >= 10_000 {
                                             eprintln!(
-                                                "[knox-node] chain continuity mismatch at h={} (local_tip={} upstream_tip={}) local={} upstream={} — mining disabled until chain realigns",
+                                                "[FORGERing] chain continuity mismatch at h={} (local_tip={} upstream_tip={}) local={} upstream={} — mining disabled until chain realigns",
                                                 status.shared_height,
                                                 status.local_tip,
                                                 status.upstream_tip,
@@ -973,7 +973,7 @@ impl Node {
                                             && status.shared_height >= status.local_tip.saturating_sub(1)
                                         {
                                             eprintln!(
-                                                "[knox-node] chain continuity recovery: tip diverged at h={} — clearing ledger for full resync",
+                                                "[FORGERing] chain continuity recovery: tip diverged at h={} — clearing ledger for full resync",
                                                 status.shared_height
                                             );
                                             let cleared = match ledger.lock() {
@@ -1003,7 +1003,7 @@ impl Node {
                                                 }
                                                 Err(err) => {
                                                     eprintln!(
-                                                        "[knox-node] chain continuity recovery failed: {}",
+                                                        "[FORGERing] chain continuity recovery failed: {}",
                                                         err
                                                     );
                                                 }
@@ -1017,7 +1017,7 @@ impl Node {
                                     // we haven't yet proven a mismatch — only an actual
                                     // mismatch (detected above) should disable mining.
                                     if now.saturating_sub(last_chain_continuity_log_ms) >= 10_000 {
-                                        eprintln!("[knox-node] chain continuity check unavailable: {}", err);
+                                        eprintln!("[FORGERing] chain continuity check unavailable: {}", err);
                                         last_chain_continuity_log_ms = now;
                                     }
                                 }
@@ -1064,7 +1064,7 @@ impl Node {
                                         let last_h =
                                             blocks.last().map(|b| b.header.height).unwrap_or(0);
                                         eprintln!(
-                                            "[knox-node] upstream sync batch received count={} range={}..{}",
+                                            "[FORGERing] upstream sync batch received count={} range={}..{}",
                                             blocks.len(),
                                             first_h,
                                             last_h
@@ -1073,7 +1073,7 @@ impl Node {
                                             Ok(l) => l.append_sync_batch(&blocks),
                                             Err(_) => {
                                                 eprintln!(
-                                                    "[knox-node] upstream sync stop: ledger lock poisoned"
+                                                    "[FORGERing] upstream sync stop: ledger lock poisoned"
                                                 );
                                                 break;
                                             }
@@ -1084,7 +1084,7 @@ impl Node {
                                             batch_result.last_progress_height
                                         {
                                             eprintln!(
-                                                "[knox-node] upstream sync progressed {} block(s) (new={} existing={}) through h={}",
+                                                "[FORGERing] upstream sync progressed {} block(s) (new={} existing={}) through h={}",
                                                 progressed_count,
                                                 applied_count,
                                                 batch_result.already_exists_count,
@@ -1102,7 +1102,7 @@ impl Node {
                                                 Err(_) => 0,
                                             };
                                             eprintln!(
-                                                "[knox-node] upstream sync skipped {} out-of-order block(s) at local_tip={}",
+                                                "[FORGERing] upstream sync skipped {} out-of-order block(s) at local_tip={}",
                                                 batch_result.skipped_out_of_order,
                                                 local_tip
                                             );
@@ -1125,13 +1125,13 @@ impl Node {
                                                     sync_conflict_hits = 1;
                                                 }
                                                 eprintln!(
-                                                    "[knox-node] sync conflict h={} hit={}",
+                                                    "[FORGERing] sync conflict h={} hit={}",
                                                     stop_height,
                                                     sync_conflict_hits
                                                 );
                                             }
                                             eprintln!(
-                                                "[knox-node] upstream sync stop h={}: {}",
+                                                "[FORGERing] upstream sync stop h={}: {}",
                                                 stop_height,
                                                 e
                                             );
@@ -1152,7 +1152,7 @@ impl Node {
                                                     .min(upstream_sync_batch_count)
                                                     .max(1);
                                             eprintln!(
-                                                "[knox-node] upstream sync batch size increased to {}",
+                                                "[FORGERing] upstream sync batch size increased to {}",
                                                 current_upstream_sync_batch_count
                                             );
                                         }
@@ -1183,13 +1183,13 @@ impl Node {
                                                 current_upstream_sync_batch_count = next_batch;
                                                 should_retry_smaller_batch = true;
                                                 eprintln!(
-                                                    "[knox-node] upstream sync batch size reduced to {} after error: {}",
+                                                    "[FORGERing] upstream sync batch size reduced to {} after error: {}",
                                                     current_upstream_sync_batch_count, err
                                                 );
                                             }
                                         }
                                         eprintln!(
-                                            "[knox-node] upstream sync request from h={} failed (batch={}): {}",
+                                            "[FORGERing] upstream sync request from h={} failed (batch={}): {}",
                                             next_from, rpc_limit, err
                                         );
                                         if should_retry_smaller_batch {
@@ -1242,7 +1242,7 @@ impl Node {
                                 "stalled"
                             };
                             eprintln!(
-                                "[knox-node] sync request from h={} (tip={}, peers={}, reason={})",
+                                "[FORGERing] sync request from h={} (tip={}, peers={}, reason={})",
                                 from, tip, active_peers, reason
                             );
                             network
@@ -1255,7 +1255,7 @@ impl Node {
                                 // have tip blocks but not an explicit h=0 genesis entry (or vice versa).
                                 let probe_from = if from == 0 { 1 } else { 0 };
                                 eprintln!(
-                                    "[knox-node] sync probe from h={} (tip=0, peers={}, reason=bootstrap-dual-probe)",
+                                    "[FORGERing] sync probe from h={} (tip=0, peers={}, reason=bootstrap-dual-probe)",
                                     probe_from, active_peers
                                 );
                                 network
@@ -1280,7 +1280,7 @@ impl Node {
                         if active_peers < min_peers_for_mining {
                             if now.saturating_sub(last_peer_gate_log_ms) > 10_000 {
                                 eprintln!(
-                                    "[knox-node] mining paused: active peers {} below required {}",
+                                    "[FORGERing] mining paused: active peers {} below required {}",
                                     active_peers, min_peers_for_mining
                                 );
                                 last_peer_gate_log_ms = now;
@@ -1296,7 +1296,7 @@ impl Node {
                         if local_tip < min_local_height_for_mining {
                             if now.saturating_sub(last_peer_gate_log_ms) > 10_000 {
                                 eprintln!(
-                                    "[knox-node] mining paused: local tip {} below required startup height {}",
+                                    "[FORGERing] mining paused: local tip {} below required startup height {}",
                                     local_tip, min_local_height_for_mining
                                 );
                                 last_peer_gate_log_ms = now;
@@ -1307,7 +1307,7 @@ impl Node {
                     if now < fork_guard_pause_until_ms {
                         if now.saturating_sub(last_fork_guard_log_ms) > 10_000 {
                             eprintln!(
-                                "[knox-node] mining paused by fork guard for {} ms",
+                                "[FORGERing] mining paused by fork guard for {} ms",
                                 fork_guard_pause_until_ms.saturating_sub(now)
                             );
                             last_fork_guard_log_ms = now;
@@ -1317,7 +1317,7 @@ impl Node {
                     if !chain_continuity_ok {
                         if now.saturating_sub(last_chain_continuity_log_ms) > 10_000 {
                             eprintln!(
-                                "[knox-node] mining paused: chain continuity not verified ({})",
+                                "[FORGERing] mining paused: chain continuity not verified ({})",
                                 if chain_continuity_reason.is_empty() {
                                     "waiting for trusted chain confirmation"
                                 } else {
@@ -1339,7 +1339,7 @@ impl Node {
                                 let rules = match l.mining_rules_for_height(height, now) {
                                     Ok(r) => r,
                                     Err(err) => {
-                                        eprintln!("[knox-node] mining rules failed: {}", err);
+                                        eprintln!("[FORGERing] mining rules failed: {}", err);
                                         continue;
                                     }
                                 };
@@ -1392,7 +1392,7 @@ impl Node {
                         let mut txs = take_mempool(&mempool, knox_types::MAX_BLOCK_TX);
                         let slashes = take_slashes(&slash_pool, MAX_SLASHES_PER_BLOCK);
                         eprintln!(
-                            "[knox-node] propose attempt h={} r=0 txs={} slashes={}",
+                            "[FORGERing] propose attempt h={} r=0 txs={} slashes={}",
                             height,
                             txs.len(),
                             slashes.len()
@@ -1400,7 +1400,7 @@ impl Node {
                         let coinbase = match build_coinbase(height, proposer_streak, &miner_address, &treasury_address, &dev_address, &premine_address, &txs) {
                             Ok(cb) => cb,
                             Err(err) => {
-                                eprintln!("[knox-node] coinbase build failed: {}", err);
+                                eprintln!("[FORGERing] coinbase build failed: {}", err);
                                 continue;
                             }
                         };
@@ -1442,7 +1442,7 @@ impl Node {
                         let sig = match sign_consensus(&secret, &hash.0) {
                             Ok(sig) => sig,
                             Err(err) => {
-                                eprintln!("[knox-node] proposer sign failed: {}", err);
+                                eprintln!("[FORGERing] proposer sign failed: {}", err);
                                 continue;
                             }
                         };
@@ -1496,7 +1496,7 @@ async fn build_diamond_auth_bundle(
             Ok(sig) => sig,
             Err(err) => {
                 eprintln!(
-                    "[knox-node] diamond auth endpoint {} failed: {}",
+                    "[FORGERing] diamond auth endpoint {} failed: {}",
                     endpoint, err
                 );
                 continue;
@@ -1529,7 +1529,7 @@ async fn build_diamond_auth_bundle(
         ));
     }
     eprintln!(
-        "[knox-node] diamond auth cert collected {}/{} for h={}",
+        "[FORGERing] diamond auth cert collected {}/{} for h={}",
         matched.len(),
         quorum,
         block.header.height
@@ -1728,13 +1728,13 @@ fn append_finalized_block(
             let reward_log = coinbase_reward_log(block);
             if height == 0 {
                 eprintln!(
-                    "[knox-node] sealed genesis block (premine minted) txs={}{}",
+                    "[FORGERing] sealed genesis block (premine minted) txs={}{}",
                     block.txs.len(),
                     reward_log
                 );
             } else {
                 eprintln!(
-                    "[knox-node] sealed block {} txs={}{}",
+                    "[FORGERing] sealed block {} txs={}{}",
                     height,
                     block.txs.len(),
                     reward_log
@@ -1760,7 +1760,7 @@ fn append_finalized_block(
         }
         Err(err) if err.contains("already exists") => false,
         Err(err) => {
-            eprintln!("[knox-node] append block {} failed: {}", height, err);
+            eprintln!("[FORGERing] append block {} failed: {}", height, err);
             false
         }
     }
@@ -1814,7 +1814,7 @@ async fn run_rpc(
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind).await?;
     if let Ok(addr) = listener.local_addr() {
-        eprintln!("[knox-node] rpc listening on {}", addr);
+        eprintln!("[FORGERing] rpc listening on {}", addr);
     }
     let allow_remote_rpc = std::env::var("KNOX_NODE_RPC_ALLOW_REMOTE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -1839,7 +1839,7 @@ async fn run_rpc(
             let mut len_buf = [0u8; 4];
             if let Err(err) = stream.read_exact(&mut len_buf).await {
                 if is_remote {
-                    eprintln!("[knox-node] rpc read len failed from {addr}: {err}");
+                    eprintln!("[FORGERing] rpc read len failed from {addr}: {err}");
                 }
                 return;
             }
@@ -1847,7 +1847,7 @@ async fn run_rpc(
             if len == 0 || len > MAX_RPC_BYTES {
                 if is_remote {
                     eprintln!(
-                        "[knox-node] rpc reject oversize request from {addr}: len={len} max={MAX_RPC_BYTES}"
+                        "[FORGERing] rpc reject oversize request from {addr}: len={len} max={MAX_RPC_BYTES}"
                     );
                 }
                 return;
@@ -1855,7 +1855,7 @@ async fn run_rpc(
             let mut buf = vec![0u8; len];
             if let Err(err) = stream.read_exact(&mut buf).await {
                 if is_remote {
-                    eprintln!("[knox-node] rpc read body failed from {addr}: {err}");
+                    eprintln!("[FORGERing] rpc read body failed from {addr}: {err}");
                 }
                 return;
             }
@@ -1867,7 +1867,7 @@ async fn run_rpc(
                 Err(err) => {
                     if is_remote {
                         eprintln!(
-                            "[knox-node] rpc decode failed from {addr}: len={len} err={err}"
+                            "[FORGERing] rpc decode failed from {addr}: len={len} err={err}"
                         );
                     }
                     return;
@@ -1879,7 +1879,7 @@ async fn run_rpc(
                 && !allow_remote_rpc
                 && !matches!(&request, WalletRequest::SignDiamondCert(_))
             {
-                eprintln!("[knox-node] rpc rejected remote request from {addr}");
+                eprintln!("[FORGERing] rpc rejected remote request from {addr}");
                 return;
             }
             let response = match request {
@@ -1925,7 +1925,7 @@ async fn run_rpc(
                 WalletRequest::SubmitTx(tx) => {
                     let allowed = limiter.allow(addr.ip(), RATE_LIMIT_SUBMIT_PER_SEC, now_ms());
                     if !allowed {
-                        eprintln!("[knox-node] submit tx rejected: rate limit");
+                        eprintln!("[FORGERing] submit tx rejected: rate limit");
                         WalletResponse::SubmitResult(false)
                     } else {
                         let verify = match ledger.lock() {
@@ -1934,7 +1934,7 @@ async fn run_rpc(
                         };
                         let ok = verify.is_ok();
                         if let Err(e) = verify {
-                            eprintln!("[knox-node] submit tx rejected: {e}");
+                            eprintln!("[FORGERing] submit tx rejected: {e}");
                         }
                         let mut accepted = false;
                         let mut broadcast_tx = None;
@@ -1942,7 +1942,7 @@ async fn run_rpc(
                             {
                                 if let Ok(mut mp) = mempool.lock() {
                                     if mempool_has_conflict(&mp, &tx) {
-                                        eprintln!("[knox-node] submit tx rejected: key image conflict in mempool");
+                                        eprintln!("[FORGERing] submit tx rejected: key image conflict in mempool");
                                     } else {
                                         if mp.len() >= MAX_MEMPOOL_TX {
                                             evict_one(&mut mp);
@@ -2039,7 +2039,7 @@ async fn run_rpc(
                 WalletRequest::SignDiamondCert(block) => {
                     if is_remote {
                         eprintln!(
-                            "[knox-node] diamond sign rpc from {} h={} r={} txs={}",
+                            "[FORGERing] diamond sign rpc from {} h={} r={} txs={}",
                             addr,
                             block.header.height,
                             block.header.round,
@@ -2074,7 +2074,7 @@ async fn run_rpc(
                                     let sig = sign_consensus(&rpc_secret, &signer_msg.0).ok();
                                     if sig.is_some() {
                                         eprintln!(
-                                            "[knox-node] diamond sign accepted h={} r={}",
+                                            "[FORGERing] diamond sign accepted h={} r={}",
                                             block.header.height, block.header.round
                                         );
                                     }
@@ -2082,14 +2082,14 @@ async fn run_rpc(
                                 }
                                 Some(false) => {
                                     eprintln!(
-                                        "[knox-node] diamond sign rejected h={} r={}: already signed different candidate at this height",
+                                        "[FORGERing] diamond sign rejected h={} r={}: already signed different candidate at this height",
                                         block.header.height, block.header.round
                                     );
                                     WalletResponse::DiamondCert(None)
                                 }
                                 None => {
                                     eprintln!(
-                                        "[knox-node] diamond sign rejected h={} r={}: signer lock poisoned",
+                                        "[FORGERing] diamond sign rejected h={} r={}: signer lock poisoned",
                                         block.header.height, block.header.round
                                     );
                                     WalletResponse::DiamondCert(None)
@@ -2098,7 +2098,7 @@ async fn run_rpc(
                         }
                         Err(err) => {
                             eprintln!(
-                                "[knox-node] diamond sign rejected h={} r={}: {}",
+                                "[FORGERing] diamond sign rejected h={} r={}: {}",
                                 block.header.height, block.header.round, err
                             );
                             WalletResponse::DiamondCert(None)
@@ -2115,7 +2115,7 @@ async fn run_rpc(
             out.extend_from_slice(&bytes);
             if let Err(err) = stream.write_all(&out).await {
                 if is_remote {
-                    eprintln!("[knox-node] rpc write response failed to {addr}: {err}");
+                    eprintln!("[FORGERing] rpc write response failed to {addr}: {err}");
                 }
             }
         });
