@@ -228,7 +228,8 @@ impl Ledger {
         Ok(())
     }
 
-    /// Replace the block at the current tip with `new_block`.
+    /// Replace the block at the current tip with `new_block` if the new block
+    /// wins the deterministic fork-choice tiebreaker (lower block hash wins).
     /// Only succeeds when `new_block.header.height == self.height()` and the
     /// new block passes full verification.  Existing UTXO / decoy state for
     /// the replaced block is NOT rolled back — the next sync-reset will
@@ -240,6 +241,16 @@ impl Ledger {
         if h != tip {
             return Err(format!(
                 "replace_tip_block: height {h} != current tip {tip}"
+            ));
+        }
+        // Deterministic tiebreaker: lower block hash wins.
+        let existing = self.get_block(h)?
+            .ok_or_else(|| format!("replace_tip: no existing block at h={h}"))?;
+        let existing_hash = hash_header_for_link(&existing.header);
+        let incoming_hash = hash_header_for_link(&new_block.header);
+        if incoming_hash.0 >= existing_hash.0 {
+            return Err(format!(
+                "replace_tip: incoming hash >= existing (tiebreaker lost)"
             ));
         }
         self.verify_block_for_sync(new_block)

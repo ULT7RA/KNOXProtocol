@@ -962,10 +962,9 @@ impl Node {
                                 }
                                 Ok(None) => {}
                                 Err(err) => {
-                                    if !chain_continuity_checked_once {
-                                        chain_continuity_ok = false;
-                                        chain_continuity_reason = format!("validation unavailable: {}", err);
-                                    }
+                                    // RPC timeouts/errors should NOT block mining when
+                                    // we haven't yet proven a mismatch — only an actual
+                                    // mismatch (detected above) should disable mining.
                                     if now.saturating_sub(last_chain_continuity_log_ms) >= 10_000 {
                                         eprintln!("[knox-node] chain continuity check unavailable: {}", err);
                                         last_chain_continuity_log_ms = now;
