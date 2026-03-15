@@ -228,6 +228,31 @@ impl Ledger {
         Ok(())
     }
 
+    /// Replace the block at the current tip with `new_block`.
+    /// Only succeeds when `new_block.header.height == self.height()` and the
+    /// new block passes full verification.  Existing UTXO / decoy state for
+    /// the replaced block is NOT rolled back — the next sync-reset will
+    /// rebuild it.  This is safe because the only caller is the conflict
+    /// handler which expects a full resync shortly after.
+    pub fn replace_tip_block(&self, new_block: &Block) -> Result<(), String> {
+        let tip = self.height()?;
+        let h = new_block.header.height;
+        if h != tip {
+            return Err(format!(
+                "replace_tip_block: height {h} != current tip {tip}"
+            ));
+        }
+        self.verify_block_for_sync(new_block)
+            .map_err(|e| format!("replace_tip verify: {e}"))?;
+        let key = block_key(h);
+        let bytes = bincode::encode_to_vec(new_block, bincode::config::standard())
+            .map_err(|e| format!("replace_tip encode: {e}"))?;
+        self.db
+            .put(&key, &bytes)
+            .map_err(|e| format!("replace_tip db-put: {e}"))?;
+        Ok(())
+    }
+
     fn append_block_with_meta(
         &self,
         block: &Block,

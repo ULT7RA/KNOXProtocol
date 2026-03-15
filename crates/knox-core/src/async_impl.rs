@@ -497,6 +497,34 @@ impl Node {
                                             last_sync_progress_ms = now_ms();
                                         }
                                         network.try_send(Message::Block(block));
+                                    } else if block.header.height > 0 {
+                                        // append failed with "already exists" — check if we need
+                                        // to replace a conflicting tip block (fork choice).
+                                        let replaced = match ledger.lock() {
+                                            Ok(l) => {
+                                                let tip = l.height().unwrap_or(0);
+                                                if block.header.height == tip {
+                                                    l.replace_tip_block(&block)
+                                                } else {
+                                                    Err("not at tip".to_string())
+                                                }
+                                            }
+                                            Err(_) => Err("lock poisoned".to_string()),
+                                        };
+                                        match replaced {
+                                            Ok(()) => {
+                                                eprintln!(
+                                                    "[knox-node] tip replaced h={} with peer block (fork choice)",
+                                                    block.header.height
+                                                );
+                                                // Cancel any pending mining for the old tip
+                                                pending_mining = None;
+                                                sync_conflict_hits = 0;
+                                                sync_conflict_height = 0;
+                                                network.try_send(Message::Block(block));
+                                            }
+                                            Err(_) => {} // Not at tip or verification failed — ignore
+                                        }
                                     }
                                 }
                                 Err(err) => {
