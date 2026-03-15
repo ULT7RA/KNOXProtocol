@@ -11,6 +11,7 @@ cryptography. No elliptic curves. No classical assumptions. No forks. Built from
 - Whitepaper: [WHITEPAPER.md](./WHITEPAPER.md)
 - Threat Model: [security.md](./security.md)
 - Inquiries: KNOXULT7Rock@proton.me
+- https://patreon.com/ULT7ROCK?utm_medium=unknown&utm_source=join_link&utm_campaign=creatorshare_creator&utm_content=copyLink
 
 ---
 
