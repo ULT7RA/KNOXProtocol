@@ -17,7 +17,7 @@ const useUiStore = create((set) => ({
 }));
 
 const views = ['dashboard', 'mining', 'send', 'logs', 'settings'];
-const CURRENT_DESKTOP_VERSION = '1.3.17';
+const CURRENT_DESKTOP_VERSION = '1.3.19';
 
 function compareSemverLike(a, b) {
   const left = String(a || '').split('.').map((v) => Number(v || 0));
@@ -1082,7 +1082,7 @@ export default function App() {
           <div className="version-tagline">suggestions</div>
           <div className="version-tagline">feedback</div>
           <div className="version-email">KNOXULT7Rock@proton.me</div>
-          <div className="version-build">KNOX Wallet v1.3.17</div>
+          <div className="version-build">KNOX Wallet v1.3.19</div>
         </div>
       </aside>
 

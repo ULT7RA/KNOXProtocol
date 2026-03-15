@@ -239,6 +239,7 @@ impl Node {
         }
 
         let mut ticker = interval(Duration::from_millis(self.mine_tick_ms));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut network = self.network;
         let ledger = self.ledger.clone();
         let mempool = self.mempool.clone();
@@ -341,7 +342,12 @@ impl Node {
         let mut genesis_mismatch_hits: u32 = 0;
         let mut sync_conflict_hits: u32 = 0;
         let mut sync_conflict_height: u64 = 0;
+        let mut fork_oo_stall_count: u32 = 0;
+        let mut fork_oo_peer_max_h: u64 = 0;
+        const FORK_OO_RECOVERY_THRESHOLD: u32 = 5;
         let mut pending_mining: Option<PendingMiningProposal> = None;
+        let mut last_getblocks_served_up_to: u64 = 0;
+        let mut last_getblocks_served_ms: u64 = 0;
 
         // If ledger is empty (no genesis yet), proactively request from h=0
         // after peers have had time to connect.
@@ -355,11 +361,10 @@ impl Node {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     eprintln!("[knox-node] ledger empty at boot — requesting sync from h=0");
                     sync_sender
-                        .send(knox_p2p::Message::GetBlocks {
+                        .try_send(knox_p2p::Message::GetBlocks {
                             from_height: 0,
                             max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                        })
-                        .await;
+                        });
                 });
             }
         }
@@ -423,7 +428,7 @@ impl Node {
                                 last_sync_progress_height = block.header.height;
                                 last_sync_progress_ms = now_ms();
                             }
-                            network.send(Message::Block(block)).await;
+                            network.try_send(Message::Block(block));
                         }
                         continue;
                     }
@@ -435,7 +440,21 @@ impl Node {
                 }
             }
             tokio::select! {
-                Some(env) = network.inbound.recv() => {
+                biased;
+                Some(first_env) = network.inbound.recv() => {
+                    // Batch-drain: collect this message + all queued messages
+                    // to avoid per-message select! overhead starving inbound.
+                    let mut pending_msgs = vec![first_env];
+                    while pending_msgs.len() < 128 {
+                        match network.inbound.try_recv() {
+                            Ok(env) => pending_msgs.push(env),
+                            Err(_) => break,
+                        }
+                    }
+                    if pending_msgs.len() > 1 {
+                        eprintln!("[knox-node] inbound batch-drain: {} messages", pending_msgs.len());
+                    }
+                    for env in pending_msgs {
                     match env.msg {
                         Message::Tx(tx) => {
                             let tx_ok = match ledger.lock() {
@@ -460,7 +479,7 @@ impl Node {
                                     }
                                 }
                                 if accepted {
-                                    network.send(Message::Tx(tx)).await;
+                                    network.try_send(Message::Tx(tx));
                                 }
                             }
                         }
@@ -477,7 +496,7 @@ impl Node {
                                             last_sync_progress_height = block.header.height;
                                             last_sync_progress_ms = now_ms();
                                         }
-                                        network.send(Message::Block(block)).await;
+                                        network.try_send(Message::Block(block));
                                     }
                                 }
                                 Err(err) => {
@@ -517,19 +536,26 @@ impl Node {
                                             );
                                         }
                                         network
-                                            .send(Message::GetBlocks {
+                                            .try_send(Message::GetBlocks {
                                                 from_height: from,
                                                 max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                                            })
-                                            .await;
+                                            });
                                     }
                                 }
                             }
                         }
                         Message::GetBlocks { from_height, max_count } => {
-                            // Serve one batch per request. This preserves requester-to-response
-                            // routing under concurrent peers and avoids cross-delivering
-                            // streamed ranges to the wrong node.
+                            // Dedup: skip stale requests if we recently served
+                            // blocks covering this range (prevents queue buildup
+                            // from flooding peers).
+                            {
+                                let now_dedup = now_ms();
+                                if from_height < last_getblocks_served_up_to
+                                    && now_dedup.saturating_sub(last_getblocks_served_ms) < 3_000
+                                {
+                                    continue;
+                                }
+                            }
                             let per_batch_cap =
                                 (max_count as u64).clamp(1, SYNC_GETBLOCKS_MAX_COUNT as u64);
                             let max_bytes = sync_blocks_response_max_bytes();
@@ -557,12 +583,18 @@ impl Node {
                                 Vec::new()
                             };
                             if !blocks.is_empty() {
+                                let served_end = from_height.saturating_add(blocks.len() as u64);
+                                last_getblocks_served_up_to = served_end;
+                                last_getblocks_served_ms = now_ms();
                                 eprintln!(
                                     "[knox-node] serving {} blocks from h={}",
                                     blocks.len(),
                                     from_height
                                 );
-                                network.send(Message::Blocks(blocks)).await;
+                                let sent = network.try_send(Message::Blocks(blocks));
+                                if !sent {
+                                    eprintln!("[knox-node] WARN: Blocks try_send failed (outbound full) for h={}", from_height);
+                                }
                             }
                         }
                         Message::Blocks(blocks) => {
@@ -661,11 +693,10 @@ impl Node {
                                         local_tip, from
                                     );
                                     network
-                                        .send(Message::GetBlocks {
+                                        .try_send(Message::GetBlocks {
                                             from_height: from,
                                             max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                                        })
-                                        .await;
+                                        });
                                     last_sync_request_ms = now_ms();
                                 }
                                 let allow_mining_node_reset = min_local_height_for_mining > 0
@@ -692,12 +723,13 @@ impl Node {
                                             genesis_mismatch_hits = 0;
                                             sync_conflict_hits = 0;
                                             sync_conflict_height = 0;
+                                            fork_oo_stall_count = 0;
+                                            fork_oo_peer_max_h = 0;
                                             network
-                                                .send(Message::GetBlocks {
+                                                .try_send(Message::GetBlocks {
                                                     from_height: 0,
                                                     max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                                                })
-                                                .await;
+                                                });
                                             last_sync_request_ms = now_ms();
                                         }
                                         Err(err) => {
@@ -708,10 +740,69 @@ impl Node {
                                         }
                                     }
                                 }
+                                // Fork recovery: when peers consistently send blocks
+                                // that we can't apply (out-of-order), it means we're
+                                // likely on a different fork. This covers two cases:
+                                // (a) peer blocks AHEAD of our tip (first_h > local_tip)
+                                // (b) peer blocks OVERLAP our chain but don't match
+                                //     (all out-of-order, none applied — diverged fork)
+                                let fork_signal = skipped_out_of_order > 0
+                                    && (first_h > local_tip
+                                        || (already_exists_count == 0 && first_h <= local_tip));
+                                if fork_signal {
+                                    fork_oo_stall_count = fork_oo_stall_count.saturating_add(1);
+                                    fork_oo_peer_max_h = fork_oo_peer_max_h.max(last_h);
+                                    if fork_oo_stall_count % 5 == 0 {
+                                        eprintln!(
+                                            "[knox-node] fork detector: {} consecutive out-of-order stalls (peer chain up to h={}, local tip h={})",
+                                            fork_oo_stall_count, fork_oo_peer_max_h, local_tip
+                                        );
+                                    }
+                                    if sync_auto_reset_on_conflict
+                                        && fork_oo_stall_count >= FORK_OO_RECOVERY_THRESHOLD
+                                    {
+                                        eprintln!(
+                                            "[knox-node] FORK RECOVERY: {} consecutive out-of-order stalls, \
+                                             peer chain at h={} vs local h={}; clearing chain for full resync",
+                                            fork_oo_stall_count, fork_oo_peer_max_h, local_tip
+                                        );
+                                        let cleared = match ledger.lock() {
+                                            Ok(l) => l.clear_chain(),
+                                            Err(_) => Err("ledger lock poisoned".to_string()),
+                                        };
+                                        match cleared {
+                                            Ok(()) => {
+                                                last_sync_progress_height = 0;
+                                                last_sync_progress_ms = now_ms();
+                                                last_blocks_response_ms = now_ms();
+                                                bootstrap_genesis_stall_count = 0;
+                                                genesis_mismatch_hits = 0;
+                                                sync_conflict_hits = 0;
+                                                sync_conflict_height = 0;
+                                                fork_oo_stall_count = 0;
+                                                fork_oo_peer_max_h = 0;
+                                                network
+                                                    .try_send(Message::GetBlocks {
+                                                        from_height: 0,
+                                                        max_count: SYNC_GETBLOCKS_MAX_COUNT,
+                                                    });
+                                                last_sync_request_ms = now_ms();
+                                            }
+                                            Err(err) => {
+                                                eprintln!(
+                                                    "[knox-node] FORK RECOVERY failed: {}",
+                                                    err
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             if progressed_count > 0 {
                                 sync_conflict_hits = 0;
                                 sync_conflict_height = 0;
+                                fork_oo_stall_count = 0;
+                                fork_oo_peer_max_h = 0;
                                 // Keep draining forward without waiting for the stall timer.
                                 let next_from = match ledger.lock() {
                                     Ok(l) => l.height().unwrap_or(0).saturating_add(1),
@@ -723,11 +814,10 @@ impl Node {
                                     progressed_count
                                 );
                                 network
-                                    .send(Message::GetBlocks {
+                                    .try_send(Message::GetBlocks {
                                         from_height: next_from,
                                         max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                                    })
-                                    .await;
+                                    });
                                 last_sync_request_ms = now_ms();
                             }
                         }
@@ -740,10 +830,11 @@ impl Node {
                             }
                         }
                         Message::Ping(nonce) => {
-                            network.send(Message::Pong(nonce)).await;
+                            network.try_send(Message::Pong(nonce));
                         }
                         _ => {}
                     }
+                    } // end for env in pending_msgs
                 }
                 _ = ticker.tick() => {
                     let now = now_ms();
@@ -900,6 +991,8 @@ impl Node {
                                         }
                                         sync_conflict_hits = 0;
                                         sync_conflict_height = 0;
+                                        fork_oo_stall_count = 0;
+                                        fork_oo_peer_max_h = 0;
                                         if applied_count as u32 >= rpc_limit
                                             && current_upstream_sync_batch_count
                                                 < upstream_sync_batch_count
@@ -1003,11 +1096,10 @@ impl Node {
                                 from, tip, active_peers, reason
                             );
                             network
-                                .send(Message::GetBlocks {
+                                .try_send(Message::GetBlocks {
                                     from_height: from,
                                     max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                                })
-                                .await;
+                                });
                             if dual_probe {
                                 // Probe the opposite bootstrap lane to avoid deadlock when peers
                                 // have tip blocks but not an explicit h=0 genesis entry (or vice versa).
@@ -1017,11 +1109,10 @@ impl Node {
                                     probe_from, active_peers
                                 );
                                 network
-                                    .send(Message::GetBlocks {
+                                    .try_send(Message::GetBlocks {
                                         from_height: probe_from,
                                         max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                                    })
-                                    .await;
+                                    });
                             }
                             last_sync_request_ms = now;
                             if bootstrap_has_genesis {
@@ -1553,7 +1644,7 @@ async fn run_rpc(
     }
     let allow_remote_rpc = std::env::var("KNOX_NODE_RPC_ALLOW_REMOTE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .unwrap_or(true);
     let limiter = RateLimiter::default();
     let decoy_cache = DecoyCache::default();
     // Per-height anti-equivocation guard for Diamond Auth signatures.
@@ -1695,7 +1786,7 @@ async fn run_rpc(
                             }
                         }
                         if let Some(tx) = broadcast_tx {
-                            let _ = network.send(Message::Tx(tx)).await;
+                            let _ = network.try_send(Message::Tx(tx));
                         }
                         WalletResponse::SubmitResult(accepted)
                     }

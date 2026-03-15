@@ -208,8 +208,8 @@ impl Network {
         }
 
         let listener = TcpListener::bind(&cfg.bind).await?;
-        let (tx_in, rx_in) = mpsc::channel(1024);
-        let (tx_out, mut rx_out) = mpsc::channel(1024);
+        let (tx_in, rx_in) = mpsc::channel(4096);
+        let (tx_out, mut rx_out) = mpsc::channel(4096);
         let peers: Arc<Mutex<HashMap<String, mpsc::Sender<Envelope>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let block_requesters: Arc<Mutex<VecDeque<BlockRequester>>> =
@@ -360,6 +360,18 @@ impl Network {
         let _ = self.outbound.send(env).await;
     }
 
+    /// Non-blocking send: drops the message if the outbound channel is full.
+    /// Use for idempotent messages (GetBlocks) that will be retried next tick.
+    pub fn try_send(&self, msg: Message) -> bool {
+        let env = Envelope {
+            msg,
+            session_id: self.session_id,
+            sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
+            padding: Vec::new(),
+        };
+        self.outbound.try_send(env).is_ok()
+    }
+
     pub fn active_peer_count(&self) -> usize {
         self.active_peers.load(Ordering::Relaxed) as usize
     }
@@ -382,6 +394,16 @@ impl NetworkSender {
             padding: Vec::new(),
         };
         let _ = self.outbound.send(env).await;
+    }
+
+    pub fn try_send(&self, msg: Message) -> bool {
+        let env = Envelope {
+            msg,
+            session_id: self.session_id,
+            sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
+            padding: Vec::new(),
+        };
+        self.outbound.try_send(env).is_ok()
     }
 }
 

@@ -49,13 +49,26 @@ const NETWORK_ENV_OVERRIDE_REQUESTED = /^(1|true|yes)$/i.test(
 // stale endpoint. Keep override support for local/dev runs only.
 const ALLOW_NETWORK_ENV_OVERRIDES = !app.isPackaged && !MAINNET_LOCKED && NETWORK_ENV_OVERRIDE_REQUESTED;
 
-const DEFAULT_PUBLIC_P2P_SEEDS = String(process.env.KNOX_DEFAULT_PUBLIC_P2P_SEEDS || '')
-  .split(/[,\s]+/)
-  .map((s) => s.trim())
-  .filter(Boolean);
+const HARDCODED_P2P_SEEDS = [
+  '129.146.133.68:9735',
+  '129.146.140.173:9735',
+  '161.153.118.97:9735',
+];
+const HARDCODED_RPC_CANDIDATES = [
+  '129.146.133.68:9736',
+  '129.146.140.173:9736',
+  // 161.153.118.97 is P2P-only (no RPC listener on 9736)
+];
+const DEFAULT_PUBLIC_P2P_SEEDS = (() => {
+  const env = String(process.env.KNOX_DEFAULT_PUBLIC_P2P_SEEDS || '')
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return env.length ? env : HARDCODED_P2P_SEEDS;
+})();
 const DEFAULT_RPC_FALLBACK = normalizeRpcEndpoint(
   process.env.KNOX_DEFAULT_PUBLIC_RPC || '',
-  '127.0.0.1:19736'
+  HARDCODED_RPC_CANDIDATES[0] || (MAINNET_LOCKED ? '' : '127.0.0.1:19736')
 );
 
 function splitRpcEndpoint(ep) {
@@ -88,12 +101,12 @@ const DEFAULT_PUBLIC_RPC_CANDIDATES = (() => {
     .split(/[,\s]+/)
     .map((s) => s.trim())
     .filter(Boolean);
-  return raw.length ? raw : [DEFAULT_RPC_FALLBACK];
+  return raw.length ? raw : (HARDCODED_RPC_CANDIDATES.length ? HARDCODED_RPC_CANDIDATES : (DEFAULT_RPC_FALLBACK ? [DEFAULT_RPC_FALLBACK] : []));
 })();
 const DEFAULT_MAINNET_GENESIS_HASH = 'd626848546f6511abd38a1ee89610a708d001d53e0c8a27dc509a1e65b964187';
-const DESKTOP_APP_VERSION = '1.3.17';
+const DESKTOP_APP_VERSION = '1.3.19';
 const MIN_SUPPORTED_INSTALLER_VERSION =
-  '1.3.17';
+  '1.3.19';
 const MIN_SUPPORTED_P2P_PROTOCOL_VERSION = 2;
 const RPC_UPSTREAM = normalizeRpcEndpoint(
   ALLOW_NETWORK_ENV_OVERRIDES ? process.env.KNOX_PUBLIC_RPC_ADDR : '',
@@ -227,9 +240,9 @@ const MAINNET_LOCK_STRIP_ENV_KEYS = [
 ];
 // Emergency override for remote-only wallet mode (disables local node start path).
 const FORCE_REMOTE_WALLET_MODE = /^(1|true|yes)$/i.test(String(process.env.KNOX_DESKTOP_FORCE_REMOTE_ONLY || '0'));
-// If upstream probes are flaky, allow node startup and let P2P catch up instead of hard-failing UX.
+// In mainnet-locked builds, fail closed if canonical upstream is unavailable.
 const ALLOW_DEGRADED_UPSTREAM_BOOT = !/^(0|false|no)$/i.test(
-  String(process.env.KNOX_ALLOW_DEGRADED_UPSTREAM_BOOT || '1')
+  String(process.env.KNOX_ALLOW_DEGRADED_UPSTREAM_BOOT || (MAINNET_LOCKED ? '0' : '1'))
 );
 const UPSTREAM_PROBE_TIMEOUT_MS = Math.max(
   3000,
@@ -357,6 +370,12 @@ const autoLedgerResetState = {
   lastAtMs: 0,
   hitCount: 0
 };
+const forkOoStallState = {
+  count: 0,
+  peerMaxH: 0,
+  firstAtMs: 0,
+};
+const FORK_OO_DESKTOP_THRESHOLD = 5;
 
 function resetRuntimeMiningSession() {
   runtimeStats.node.sealedCount = 0;
@@ -1038,6 +1057,52 @@ function parseRuntimeLine(key, line, win) {
       }
       return;
     }
+    // Fork recovery: detect node's own fork-recovery clear (new binary)
+    if (/FORK RECOVERY:.*clearing chain for full resync/i.test(line)) {
+      appendLog(win, '[repair] node detected fork and is auto-recovering via chain resync');
+      forkOoStallState.count = 0;
+      forkOoStallState.peerMaxH = 0;
+      forkOoStallState.firstAtMs = 0;
+      return;
+    }
+    // Fork recovery: detect persistent out-of-order stalls (old binary fallback)
+    const ooStall = line.match(/sync batch made no progress range=(\d+)\.\.(\d+) already_exists=(\d+) skipped_out_of_order=(\d+)/);
+    if (ooStall) {
+      const peerFirstH = Number(ooStall[1] || 0);
+      const peerLastH = Number(ooStall[2] || 0);
+      const skipped = Number(ooStall[4] || 0);
+      const localH = Number(runtimeStats.node.lastSealedHeight || 0);
+      if (skipped > 0 && peerFirstH > localH) {
+        const now = Date.now();
+        if (!forkOoStallState.firstAtMs || now - forkOoStallState.firstAtMs > 180000) {
+          forkOoStallState.count = 0;
+          forkOoStallState.peerMaxH = 0;
+          forkOoStallState.firstAtMs = now;
+        }
+        forkOoStallState.count += 1;
+        forkOoStallState.peerMaxH = Math.max(forkOoStallState.peerMaxH, peerLastH);
+        if (forkOoStallState.count >= FORK_OO_DESKTOP_THRESHOLD
+            && AUTO_LEDGER_RESET_ENABLED
+            && !autoLedgerResetInFlight
+            && Date.now() >= autoLedgerResetCooldownUntilMs) {
+          appendLog(win,
+            `[repair] fork detected: ${forkOoStallState.count} out-of-order stalls, ` +
+            `peer chain at h=${forkOoStallState.peerMaxH} vs local h=${localH}; resetting ledger`
+          );
+          forkOoStallState.count = 0;
+          forkOoStallState.peerMaxH = 0;
+          forkOoStallState.firstAtMs = 0;
+          setTimeout(() => {
+            resetLocalLedgerAndRestart(win, `fork-oo-stall@local${localH}-peer${peerLastH}`)
+              .then((res) => {
+                if (!res?.ok) appendLog(win, `[repair] fork auto reset failed: ${res?.error || 'unknown'}`);
+              })
+              .catch((err) => appendLog(win, `[repair] fork auto reset crashed: ${String(err?.message || err)}`));
+          }, 0);
+        }
+      }
+      return;
+    }
   }
   if (key === 'walletd') {
     if (/listening on/i.test(line)) {
@@ -1513,17 +1578,26 @@ async function walletdCall(pathname, body, options = {}) {
 
 function walletdRpcAddr() {
   if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.node) return LOCAL_NODE_RPC;
-  return RPC_UPSTREAM || LOCAL_NODE_RPC;
+  if (RPC_UPSTREAM) return RPC_UPSTREAM;
+  return MAINNET_LOCKED ? '' : LOCAL_NODE_RPC;
 }
 
 function walletSyncRpcAddr() {
   if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.node) return LOCAL_NODE_RPC;
-  return walletdRpcTarget || walletdRpcAddr() || LOCAL_NODE_RPC;
+  return walletdRpcTarget || walletdRpcAddr() || (MAINNET_LOCKED ? '' : LOCAL_NODE_RPC);
 }
 
 function startWalletdOnRpc(win, rpcAddr) {
   const walletBin = resolveBin('knox-wallet.exe');
-  const normalizedRpc = normalizeRpcEndpoint(rpcAddr, DEFAULT_PUBLIC_RPC_CANDIDATES[0]);
+  const normalizedRpc = normalizeRpcEndpoint(rpcAddr, DEFAULT_PUBLIC_RPC_CANDIDATES[0] || '');
+  if (!normalizedRpc) {
+    return {
+      ok: false,
+      error: MAINNET_LOCKED
+        ? 'no canonical upstream RPC configured; refusing local RPC fallback'
+        : 'no RPC target configured for walletd'
+    };
+  }
   if (service.walletd && normalizeRpcEndpoint(walletdRpcTarget || '', '') === normalizedRpc) {
     return { ok: true, result: `walletd already running on ${normalizedRpc}` };
   }
@@ -1601,6 +1675,50 @@ async function waitForRemoteTipVisible(win, minTip = 1, timeoutMs = 25000) {
     await waitMs(1000);
   }
   return { ok: false, error: `upstream tip not visible before timeout (${lastErr || 'unknown'})` };
+}
+
+function canonicalMinTipHeight() {
+  return MAINNET_LOCKED ? 1 : 0;
+}
+
+async function resolveCanonicalMiningGate(win, context = 'startup') {
+  const allowDegraded = !MAINNET_LOCKED && !FORCE_REMOTE_WALLET_MODE && ALLOW_DEGRADED_UPSTREAM_BOOT;
+  const walletStart = await ensureWalletdUpstreamConnected(win, UPSTREAM_PROBE_TIMEOUT_MS);
+  if (!walletStart.ok) {
+    if (!allowDegraded) {
+      return { ok: false, error: walletStart.error || `${context}: no reachable upstream RPC endpoint` };
+    }
+    appendLog(
+      win,
+      `[guard] ${context}: upstream RPC unavailable; forcing mining OFF (${walletStart.error || 'unknown'})`
+    );
+    return { ok: true, allowMining: false, minLocalHeightForMining: 0 };
+  }
+
+  const tipReady = await waitForRemoteTipVisible(win, canonicalMinTipHeight(), 25000);
+  if (!tipReady.ok) {
+    if (!allowDegraded) {
+      return { ok: false, error: tipReady.error || `${context}: canonical upstream tip not visible` };
+    }
+    appendLog(
+      win,
+      `[guard] ${context}: canonical upstream tip not visible; forcing mining OFF (${tipReady.error || 'unknown'})`
+    );
+    return { ok: true, allowMining: false, minLocalHeightForMining: 0 };
+  }
+
+  return {
+    ok: true,
+    allowMining: true,
+    minLocalHeightForMining: Math.max(0, Number(tipReady.result) || 0)
+  };
+}
+
+async function resolveRequestedMiningState(win, requestedMine, context = 'startup') {
+  if (!requestedMine) {
+    return { ok: true, allowMining: false, minLocalHeightForMining: 0 };
+  }
+  return resolveCanonicalMiningGate(win, context);
 }
 
 async function ensureWalletdUpstreamConnected(win, probeTimeoutMs = UPSTREAM_PROBE_TIMEOUT_MS, opts = {}) {
@@ -2102,8 +2220,20 @@ async function resetLocalLedgerAndRestart(win, reason = 'auto-ledger-reset') {
   autoLedgerResetCooldownUntilMs = Date.now() + 5 * 60 * 1000;
   try {
     const profile = miningProfileState || loadMiningConfig().profile;
-    const mine = nodeMineEnabled;
-    const minerAddress = await resolveMinerAddress({ requireWalletAddress: !!mine });
+    let requestedMine = !!nodeMineEnabled;
+    let minLocalHeightForMining = 0;
+    const gate = await resolveRequestedMiningState(win, requestedMine, 'auto-ledger-reset');
+    if (!gate.ok) {
+      appendLog(
+        win,
+        `[guard] auto-ledger-reset: restarting local node with mining OFF until canonical chain is visible (${gate.error || 'unknown'})`
+      );
+      requestedMine = false;
+    } else {
+      requestedMine = gate.allowMining;
+      minLocalHeightForMining = gate.minLocalHeightForMining;
+    }
+    const minerAddress = await resolveMinerAddress({ requireWalletAddress: !!requestedMine });
     if (!minerAddress.ok) return minerAddress;
 
     appendLog(win, `[repair] detected stale local ledger (${reason}); rebuilding local node chain cache`);
@@ -2127,7 +2257,7 @@ async function resetLocalLedgerAndRestart(win, reason = 'auto-ledger-reset') {
       'node',
       nodeBin,
       nodeArgs(validatorsPath, minerAddress.result),
-      nodeDesktopEnv(mine, profile, lastUpstreamTipSeen, minerAddress.result)
+      nodeDesktopEnv(requestedMine, profile, minLocalHeightForMining, minerAddress.result)
     );
     if (!nodeStart.ok) return nodeStart;
 
@@ -2143,6 +2273,9 @@ async function resetLocalLedgerAndRestart(win, reason = 'auto-ledger-reset') {
     autoLedgerResetState.firstAtMs = 0;
     autoLedgerResetState.lastAtMs = 0;
     autoLedgerResetState.hitCount = 0;
+    forkOoStallState.count = 0;
+    forkOoStallState.peerMaxH = 0;
+    forkOoStallState.firstAtMs = 0;
     appendLog(win, '[repair] local ledger reset complete');
     return { ok: true, result: 'local ledger reset complete' };
   } finally {
@@ -2282,27 +2415,6 @@ async function quickStart(win, profile = null) {
   if (quickStartBusy) return { ok: false, error: 'quick start already running' };
   quickStartBusy = true;
   try {
-    // Forced remote mode: do not start a local node; keep GUI height bound to upstream VM chain.
-    if (FORCE_REMOTE_WALLET_MODE) {
-      ensureDirs();
-      const tls = ensureTls();
-      if (!tls.ok) return tls;
-      const walletEnsure = await ensureWalletExists();
-      if (!walletEnsure.ok) return walletEnsure;
-      if (service.node) {
-        appendLog(win, '[startup] remote-rpc mode active; stopping local node');
-        stopSvc('node');
-        await waitMs(250);
-      }
-      const walletStart = await ensureWalletdUpstreamConnected(win, UPSTREAM_PROBE_TIMEOUT_MS);
-      if (!walletStart.ok) return walletStart;
-      await waitMs(800);
-      if (!service.walletd) return { ok: false, error: failedServiceStart('walletd') };
-      queueWalletAutoSync(win, 'quick-start-remote-rpc');
-      appendLog(win, `[startup] remote-rpc mode active; walletd bound to ${walletdRpcTarget || RPC_UPSTREAM}`);
-      return { ok: true, result: 'quick start complete (remote-rpc mode)' };
-    }
-
     ensureDirs();
     const validatorsPath = ensureValidatorsFile(win);
     const tls = ensureTls();
@@ -2311,30 +2423,10 @@ async function quickStart(win, profile = null) {
     const walletEnsure = await ensureWalletExists();
     if (!walletEnsure.ok) return walletEnsure;
 
-    let allowMiningBoot = true;
-    const walletStart = await ensureWalletdUpstreamConnected(win, UPSTREAM_PROBE_TIMEOUT_MS);
-    if (!walletStart.ok) {
-      if (!ALLOW_DEGRADED_UPSTREAM_BOOT) return walletStart;
-      allowMiningBoot = false;
-      appendLog(
-        win,
-        `[startup] upstream RPC probe unavailable; node will start with mining OFF (${walletStart.error || 'unknown'})`
-      );
-    }
-
-    // Launch gate: do not mine until we can see remote chain tip.
-    const tipReady = await waitForRemoteTipVisible(win, 0, 25000);
-    let minLocalHeightForMining = 0;
-    if (!tipReady.ok) {
-      if (!ALLOW_DEGRADED_UPSTREAM_BOOT) return tipReady;
-      allowMiningBoot = false;
-      appendLog(
-        win,
-        `[startup] remote tip gate timed out; node will start with mining OFF (${tipReady.error || 'unknown'})`
-      );
-    } else {
-      minLocalHeightForMining = Math.max(0, Number(tipReady.result) || 0);
-    }
+    const gate = await resolveRequestedMiningState(win, true, 'quick-start');
+    if (!gate.ok) return gate;
+    const allowMiningBoot = gate.allowMining;
+    const minLocalHeightForMining = gate.minLocalHeightForMining;
 
     const minerAddress = await resolveMinerAddress({ requireWalletAddress: !!allowMiningBoot });
     if (!minerAddress.ok) return minerAddress;
@@ -2595,9 +2687,6 @@ function createWindow() {
 
   bindIpc('quick-start', 'quick-start', (_e, profile = null) => quickStart(win, profile));
   bindIpc('start-node', 'start-node', async (_e, mine = true, profile = null) => {
-    if (FORCE_REMOTE_WALLET_MODE) {
-      return { ok: false, error: 'local node is disabled in mainnet remote mode' };
-    }
     if (service.node) {
       nodeMineEnabled = !!mine;
       miningProfileState = profile || miningProfileState || loadMiningConfig().profile;
@@ -2609,31 +2698,10 @@ function createWindow() {
     const validatorsPath = ensureValidatorsFile(win);
     let requestedMine = !!mine;
     let minLocalHeightForMining = 0;
-    if (requestedMine) {
-      if (!service.walletd) {
-        const walletStart = await ensureWalletdUpstreamConnected(win, UPSTREAM_PROBE_TIMEOUT_MS);
-        if (!walletStart.ok) {
-          if (!ALLOW_DEGRADED_UPSTREAM_BOOT) return walletStart;
-          requestedMine = false;
-          appendLog(
-            win,
-            `[startup] walletd upstream probe unavailable; forcing mining OFF (${walletStart.error || 'unknown'})`
-          );
-        }
-        await waitMs(500);
-      }
-      const tipReady = await waitForRemoteTipVisible(win, 0, 25000);
-      if (!tipReady.ok) {
-        if (!ALLOW_DEGRADED_UPSTREAM_BOOT) return tipReady;
-        requestedMine = false;
-        appendLog(
-          win,
-          `[startup] remote tip gate timed out; forcing mining OFF (${tipReady.error || 'unknown'})`
-        );
-      } else {
-        minLocalHeightForMining = Math.max(0, Number(tipReady.result) || 0);
-      }
-    }
+    const gate = await resolveRequestedMiningState(win, requestedMine, 'start-node');
+    if (!gate.ok) return gate;
+    requestedMine = gate.allowMining;
+    minLocalHeightForMining = gate.minLocalHeightForMining;
     const nodeBin = resolveBin('knox-node.exe');
     const minerAddress = await resolveMinerAddress({ requireWalletAddress: !!requestedMine });
     if (!minerAddress.ok) return minerAddress;
@@ -2651,7 +2719,7 @@ function createWindow() {
     miningProfileState = effectiveProfile;
     appendLog(
       win,
-      `[config] node mining=${requestedMine ? 'on' : 'off'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'} cpu_util=${effectiveProfile?.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile?.gpuUtil ?? 'auto'} upstream_batch=${env.KNOX_NODE_UPSTREAM_SYNC_BATCH_COUNT} upstream_timeout_ms=${env.KNOX_NODE_UPSTREAM_SYNC_TIMEOUT_MS}`
+      `[config] node mining=${requestedMine ? 'on' : 'off'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'} cpu_util=${effectiveProfile?.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile?.gpuUtil ?? 'auto'} upstream_batch=${DESKTOP_UPSTREAM_SYNC_BATCH} upstream_timeout_ms=${DESKTOP_UPSTREAM_SYNC_TIMEOUT_MS}`
     );
 
     if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.walletd && walletdRpcTarget !== LOCAL_NODE_RPC) {
@@ -2700,7 +2768,20 @@ function createWindow() {
       await waitMs(300);
       const validatorsPath = ensureValidatorsFile(win);
       const nodeBin = resolveBin('knox-node.exe');
-      const minerAddress = await resolveMinerAddress({ requireWalletAddress: !!nodeMineEnabled });
+      let requestedMine = !!nodeMineEnabled;
+      let minLocalHeightForMining = 0;
+      const gate = await resolveRequestedMiningState(win, requestedMine, 'wallet-create');
+      if (!gate.ok) {
+        appendLog(
+          win,
+          `[guard] wallet-create: restarting local node with mining OFF until canonical chain is visible (${gate.error || 'unknown'})`
+        );
+        requestedMine = false;
+      } else {
+        requestedMine = gate.allowMining;
+        minLocalHeightForMining = gate.minLocalHeightForMining;
+      }
+      const minerAddress = await resolveMinerAddress({ requireWalletAddress: !!requestedMine });
       if (!minerAddress.ok) return minerAddress;
       const effectiveProfile = miningProfileState || loadMiningConfig().profile;
       primeRuntimeNodeForStart(effectiveProfile);
@@ -2709,9 +2790,10 @@ function createWindow() {
         'node',
         nodeBin,
         nodeArgs(validatorsPath, minerAddress.result),
-        nodeDesktopEnv(nodeMineEnabled, effectiveProfile, lastUpstreamTipSeen, minerAddress.result)
+        nodeDesktopEnv(requestedMine, effectiveProfile, minLocalHeightForMining, minerAddress.result)
       );
       if (!restarted.ok) return restarted;
+      nodeMineEnabled = !!requestedMine;
       appendLog(win, '[config] node restarted to apply new wallet mining address');
     }
     return out;
@@ -2748,15 +2830,29 @@ function createWindow() {
     const validatorsPath = ensureValidatorsFile(win);
     const nodeBin = resolveBin('knox-node.exe');
     const effectiveProfile = miningProfileState || loadMiningConfig().profile;
+    let requestedMine = !!nodeMineEnabled;
+    let minLocalHeightForMining = 0;
+    const gate = await resolveRequestedMiningState(win, requestedMine, 'miner-address-set');
+    if (!gate.ok) {
+      appendLog(
+        win,
+        `[guard] miner-address-set: restarting local node with mining OFF until canonical chain is visible (${gate.error || 'unknown'})`
+      );
+      requestedMine = false;
+    } else {
+      requestedMine = gate.allowMining;
+      minLocalHeightForMining = gate.minLocalHeightForMining;
+    }
     primeRuntimeNodeForStart(effectiveProfile);
     const restarted = spawnSvc(
       win,
       'node',
       nodeBin,
       nodeArgs(validatorsPath, parsed),
-      nodeDesktopEnv(nodeMineEnabled, effectiveProfile, lastUpstreamTipSeen, parsed)
+      nodeDesktopEnv(requestedMine, effectiveProfile, minLocalHeightForMining, parsed)
     );
     if (!restarted.ok) return restarted;
+    nodeMineEnabled = !!requestedMine;
     queueWalletAutoSync(win, 'miner-address-changed');
     return { ok: true, result: `mining address set and node restarted` };
   });
@@ -3130,32 +3226,53 @@ function createWindow() {
     const effectiveProfile = profile || miningProfileState || loadMiningConfig().profile;
     miningProfileState = effectiveProfile;
     if (!service.node) return { ok: true, result: 'saved (node not running)' };
+
+    let requestedMine = !!nodeMineEnabled;
+    let minLocalHeightForMining = 0;
+    const gate = await resolveRequestedMiningState(win, requestedMine, 'mining-apply-live');
+    if (!gate.ok) {
+      appendLog(
+        win,
+        `[guard] mining-apply-live: restarting local node with mining OFF until canonical chain is visible (${gate.error || 'unknown'})`
+      );
+      requestedMine = false;
+    } else {
+      requestedMine = gate.allowMining;
+      minLocalHeightForMining = gate.minLocalHeightForMining;
+    }
+
     // Detect whether the running node was using a GPU backend before stopping it.
     // CUDA/OpenCL drivers on Windows need extra time to release the GPU context
     // after a forced kill; 300ms is not sufficient for high-end GPUs (e.g. RTX 4090).
     const wasGpu = ['cuda', 'opencl'].includes(
       String(runtimeStats.node.activeBackend || runtimeStats.node.configuredBackend || '').toLowerCase()
     );
-    stopSvc('node');
-    await waitMs(wasGpu ? 2000 : 400);
     const validatorsPath = ensureValidatorsFile(win);
     const nodeBin = resolveBin('knox-node.exe');
-    const minerAddress = await resolveMinerAddress({ requireWalletAddress: !!nodeMineEnabled });
+    const minerAddress = await resolveMinerAddress({ requireWalletAddress: !!requestedMine });
     if (!minerAddress.ok) return minerAddress;
+    stopSvc('node');
+    await waitMs(wasGpu ? 2000 : 400);
     primeRuntimeNodeForStart(effectiveProfile);
     const restarted = spawnSvc(
       win,
       'node',
       nodeBin,
       nodeArgs(validatorsPath, minerAddress.result),
-      nodeDesktopEnv(nodeMineEnabled, effectiveProfile, lastUpstreamTipSeen, minerAddress.result)
+      nodeDesktopEnv(requestedMine, effectiveProfile, minLocalHeightForMining, minerAddress.result)
     );
     if (!restarted.ok) return restarted;
+    nodeMineEnabled = !!requestedMine;
     appendLog(
       win,
-      `[config] live apply mining profile mode=${effectiveProfile.mode || 'hybrid'} backend=${effectiveProfile.backend || 'auto'} diff=${effectiveProfile.difficultyBits} seq=${effectiveProfile.seqSteps} mem=${effectiveProfile.memoryBytes} cpu_util=${effectiveProfile.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile.gpuUtil ?? 'auto'}`
+      `[config] live apply mining profile mode=${effectiveProfile.mode || 'hybrid'} backend=${effectiveProfile.backend || 'auto'} diff=${effectiveProfile.difficultyBits} seq=${effectiveProfile.seqSteps} mem=${effectiveProfile.memoryBytes} cpu_util=${effectiveProfile.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile.gpuUtil ?? 'auto'} mining=${requestedMine ? 'on' : 'off'}`
     );
-    return { ok: true, result: 'applied live' };
+    return {
+      ok: true,
+      result: requestedMine
+        ? 'applied live'
+        : 'applied live (mining held OFF until canonical chain is visible)'
+    };
   });
 }
 
