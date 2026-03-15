@@ -179,7 +179,7 @@ async fn main() {
     let limiter = RateLimiter::default();
 
     eprintln!(
-        "[knox-wallet] listening on {bind_addr}{}",
+        "[StarForge-wallet] listening on {bind_addr}{}",
         if tls_config.is_some() {
             " (tls)"
         } else {

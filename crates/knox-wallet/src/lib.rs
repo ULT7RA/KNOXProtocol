@@ -28,6 +28,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
@@ -1979,9 +1980,62 @@ fn streak_bonus_ppm(streak: u64) -> u64 {
         .saturating_sub(1_000_000)
 }
 
+/// Index of the last-successful endpoint for sticky routing.
+static PREFERRED_ENDPOINT: AtomicUsize = AtomicUsize::new(0);
+
 fn rpc_request(
     addr: &str,
     req: knox_types::WalletRequest,
+) -> Result<knox_types::WalletResponse, String> {
+    let encoded =
+        bincode::encode_to_vec(req, bincode::config::standard()).map_err(|e| e.to_string())?;
+
+    let endpoints: Vec<&str> = addr
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if endpoints.is_empty() {
+        return Err("no upstream RPC endpoints configured".to_string());
+    }
+
+    // Single endpoint — no failover overhead.
+    if endpoints.len() == 1 {
+        return rpc_send_encoded(endpoints[0], &encoded, None);
+    }
+
+    // Multi-endpoint: try preferred first, then the rest.
+    // Cap connect timeout at 5s per endpoint so full failover stays under 30s.
+    let cap = Some(Duration::from_millis(5000));
+    let preferred = PREFERRED_ENDPOINT.load(Ordering::Relaxed) % endpoints.len();
+    let order: Vec<usize> = std::iter::once(preferred)
+        .chain((0..endpoints.len()).filter(|&i| i != preferred))
+        .collect();
+
+    let mut last_err = String::new();
+    for &idx in &order {
+        match rpc_send_encoded(endpoints[idx], &encoded, cap) {
+            Ok(resp) => {
+                PREFERRED_ENDPOINT.store(idx, Ordering::Relaxed);
+                return Ok(resp);
+            }
+            Err(e) => {
+                eprintln!("[walletd-failover] {}: {e}", endpoints[idx]);
+                last_err = format!("{}: {e}", endpoints[idx]);
+            }
+        }
+    }
+    Err(format!(
+        "all {} upstream endpoints failed; last: {last_err}",
+        endpoints.len()
+    ))
+}
+
+fn rpc_send_encoded(
+    addr: &str,
+    encoded_req: &[u8],
+    connect_timeout_cap: Option<Duration>,
 ) -> Result<knox_types::WalletResponse, String> {
     const MAX_RPC_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
     let connect_timeout_ms = std::env::var("KNOX_RPC_CONNECT_TIMEOUT_MS")
@@ -1994,7 +2048,10 @@ fn rpc_request(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(120000)
         .clamp(200, 120000);
-    let connect_timeout = Duration::from_millis(connect_timeout_ms);
+    let mut connect_timeout = Duration::from_millis(connect_timeout_ms);
+    if let Some(cap) = connect_timeout_cap {
+        connect_timeout = connect_timeout.min(cap);
+    }
     let io_timeout = Duration::from_millis(io_timeout_ms);
 
     let mut stream = connect_with_timeout(addr, connect_timeout)?;
@@ -2004,11 +2061,9 @@ fn rpc_request(
     stream
         .set_write_timeout(Some(io_timeout))
         .map_err(|e| format!("set write timeout failed: {e}"))?;
-    let bytes =
-        bincode::encode_to_vec(req, bincode::config::standard()).map_err(|e| e.to_string())?;
-    let mut out = Vec::with_capacity(4 + bytes.len());
-    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(&bytes);
+    let mut out = Vec::with_capacity(4 + encoded_req.len());
+    out.extend_from_slice(&(encoded_req.len() as u32).to_le_bytes());
+    out.extend_from_slice(encoded_req);
     stream.write_all(&out).map_err(|e| e.to_string())?;
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).map_err(|e| e.to_string())?;

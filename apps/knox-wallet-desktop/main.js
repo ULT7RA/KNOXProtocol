@@ -1603,7 +1603,19 @@ function walletSyncRpcAddr() {
 
 function startWalletdOnRpc(win, rpcAddr) {
   const walletBin = resolveBin('knox-wallet.exe');
-  const normalizedRpc = normalizeRpcEndpoint(rpcAddr, DEFAULT_PUBLIC_RPC_CANDIDATES[0] || '');
+  const isMultiEndpoint = String(rpcAddr || '').includes(',');
+  let normalizedRpc;
+  if (isMultiEndpoint) {
+    // Multi-endpoint mode: normalize each endpoint individually, join with commas.
+    // walletd handles internal failover across all endpoints.
+    normalizedRpc = String(rpcAddr)
+      .split(',')
+      .map((e) => normalizeRpcEndpoint(e.trim(), ''))
+      .filter(Boolean)
+      .join(',');
+  } else {
+    normalizedRpc = normalizeRpcEndpoint(rpcAddr, DEFAULT_PUBLIC_RPC_CANDIDATES[0] || '');
+  }
   if (!normalizedRpc) {
     return {
       ok: false,
@@ -1612,17 +1624,20 @@ function startWalletdOnRpc(win, rpcAddr) {
         : 'no RPC target configured for walletd'
     };
   }
-  if (service.walletd && normalizeRpcEndpoint(walletdRpcTarget || '', '') === normalizedRpc) {
-    return { ok: true, result: `walletd already running on ${normalizedRpc}` };
+  if (service.walletd) {
+    // If already running, skip restart — walletd handles failover internally.
+    if (isMultiEndpoint) return { ok: true, result: 'walletd already running (multi-endpoint)' };
+    if (normalizeRpcEndpoint(walletdRpcTarget || '', '') === normalizedRpc) {
+      return { ok: true, result: `walletd already running on ${normalizedRpc}` };
+    }
   }
-  if (String(rpcAddr || '').trim() !== normalizedRpc) {
+  if (!isMultiEndpoint && String(rpcAddr || '').trim() !== normalizedRpc) {
     appendLog(win, `[config] normalized wallet RPC target "${String(rpcAddr || '').trim()}" -> "${normalizedRpc}"`);
   }
   return spawnSvc(win, 'walletd', walletBin, [WALLET_PATH, normalizedRpc, WALLETD_BIND], {
     KNOX_WALLETD_TOKEN: TOKEN,
     KNOX_WALLETD_TLS_CERT: CERT_PATH,
     KNOX_WALLETD_TLS_KEY: KEY_PATH,
-    // Give walletd->node RPC more headroom under mining load.
     KNOX_RPC_CONNECT_TIMEOUT_MS: String(UPSTREAM_RPC_CONNECT_TIMEOUT_MS),
     KNOX_RPC_IO_TIMEOUT_MS: String(UPSTREAM_RPC_IO_TIMEOUT_MS)
   });
@@ -1647,20 +1662,21 @@ async function waitForWalletdReady(timeoutMs = 5000, opts = {}) {
 async function recoverWalletdIfRefused(pathname = '/unknown') {
   if (walletdAutoRecoverPromise) return walletdAutoRecoverPromise;
   walletdAutoRecoverPromise = (async () => {
-    const target = normalizeRpcEndpoint(walletdRpcTarget || walletdRpcAddr(), DEFAULT_PUBLIC_RPC_CANDIDATES[0]);
     appendLog(
       mainWindow,
-      `[repair] walletd connection refused on ${pathname}; restarting wallet daemon on ${target}`
+      `[repair] walletd connection refused on ${pathname}; restarting wallet daemon`
     );
     if (service.walletd) {
       stopSvc('walletd');
-      await waitMs(300);
+      await waitMs(600);
     }
-    const started = startWalletdOnRpc(mainWindow, target);
+    // Restart with ALL endpoints — walletd handles internal failover.
+    const allEndpoints = rpcCandidateList().join(',');
+    const started = startWalletdOnRpc(mainWindow, allEndpoints || DEFAULT_PUBLIC_RPC_CANDIDATES[0]);
     if (!started.ok) return started;
     const ready = await waitForWalletdReady(6000, { suppressAutoRecover: true });
     if (!ready) return { ok: false, error: failedServiceStart('walletd') };
-    return { ok: true, result: target };
+    return { ok: true, result: 'walletd restarted (multi-endpoint)' };
   })();
   try {
     return await walletdAutoRecoverPromise;
@@ -1740,70 +1756,49 @@ async function ensureWalletdUpstreamConnected(win, probeTimeoutMs = UPSTREAM_PRO
     return walletdSwitchPromise;
   }
   walletdSwitchPromise = (async () => {
-    let candidates = rpcCandidateList();
-    const current = normalizeRpcEndpoint(walletdRpcTarget || '', '');
-    if (opts.excludeCurrent && current) {
-      candidates = candidates.filter((ep) => ep !== current);
-    }
-    if (opts.preferCurrent && current) {
-      candidates = [current, ...candidates.filter((ep) => ep !== current)];
-    }
-    if (!candidates.length && current) candidates = [current];
-    let lastErr = 'no rpc candidates';
-    let endpointIndex = 0;
-    for (const ep of candidates) {
-      endpointIndex += 1;
-      if (service.walletd) {
-        stopSvc('walletd');
-        await waitMs(300);
-      }
-      const started = startWalletdOnRpc(win, ep);
+    // ── Spawn walletd once with ALL endpoints (it handles internal failover) ──
+    if (!service.walletd) {
+      const allEndpoints = rpcCandidateList().join(',');
+      if (!allEndpoints) return { ok: false, error: 'no rpc candidates' };
+
+      // Kill any zombie port binding and give OS time to release it.
+      await waitMs(500);
+
+      const started = startWalletdOnRpc(win, allEndpoints);
       if (!started.ok) {
-        lastErr = String(started.error || `failed to start walletd on ${ep}`);
-        continue;
+        return { ok: false, error: String(started.error || 'failed to start walletd') };
       }
-      const ready = await waitForWalletdReady(5000);
+      const ready = await waitForWalletdReady(6000);
       if (!ready) {
-        lastErr = failedServiceStart('walletd');
-        continue;
+        return { ok: false, error: failedServiceStart('walletd') };
       }
-      let connected = false;
-      let connectedTip = 0;
-      for (let attempt = 1; attempt <= UPSTREAM_PROBE_ATTEMPTS; attempt++) {
-        const probe = await walletdCall('/upstream-tip', null, { timeoutMs: probeTimeoutMs });
-        if (probe.ok) {
-          connectedTip = Number(probe?.result?.tip_height ?? 0);
-          if (!Number.isFinite(connectedTip) || connectedTip < 0) connectedTip = 0;
-          connected = true;
-          break;
-        }
-        lastErr = String(probe.error || `probe failed on ${ep}`);
-        appendLog(
-          win,
-          `[sync] walletd upstream probe failed on ${ep} (endpoint ${endpointIndex}/${candidates.length}, attempt ${attempt}/${UPSTREAM_PROBE_ATTEMPTS}): ${lastErr}`
-        );
-        await waitMs(1200);
-      }
-      if (connected) {
-        if (
-          lastUpstreamTipSeen > 0
-          && connectedTip > 0
-          && connectedTip + UPSTREAM_TIP_REGRESSION_TOLERANCE < lastUpstreamTipSeen
-        ) {
-          appendLog(
-            win,
-            `[sync] upstream ${ep} rejected as stale (tip=${connectedTip}, last_seen=${lastUpstreamTipSeen}, tolerance=${UPSTREAM_TIP_REGRESSION_TOLERANCE})`
-          );
-          lastErr = `stale endpoint tip=${connectedTip} < last_seen=${lastUpstreamTipSeen}`;
-          continue;
+    }
+
+    // ── Probe upstream through walletd (walletd tries all endpoints internally) ──
+    let lastErr = 'probe not attempted';
+    for (let attempt = 1; attempt <= UPSTREAM_PROBE_ATTEMPTS; attempt++) {
+      const probe = await walletdCall('/upstream-tip', null, { timeoutMs: probeTimeoutMs });
+      if (probe.ok) {
+        const connectedTip = Number(probe?.result?.tip_height ?? 0);
+        if (!Number.isFinite(connectedTip) || connectedTip < 0) {
+          // Treat as success with tip 0 — endpoint answered, just empty chain.
         }
         if (connectedTip > 0) {
           lastUpstreamTipSeen = Math.max(lastUpstreamTipSeen, connectedTip);
         }
-        appendLog(win, `[sync] walletd upstream connected via ${ep}`);
-        return { ok: true, result: ep };
+        appendLog(win, `[sync] walletd upstream connected (tip=${connectedTip})`);
+        return { ok: true, result: walletdRpcTarget || 'multi-endpoint' };
       }
+      lastErr = String(probe.error || `probe failed`);
+      appendLog(
+        win,
+        `[sync] walletd upstream probe (attempt ${attempt}/${UPSTREAM_PROBE_ATTEMPTS}): ${lastErr}`
+      );
+      if (attempt < UPSTREAM_PROBE_ATTEMPTS) await waitMs(2000);
     }
+
+    // All probes failed. If walletd is still alive, leave it running —
+    // the upstream may recover, and walletd will failover internally.
     return { ok: false, error: `no reachable upstream RPC endpoint (${lastErr})` };
   })();
   try {
@@ -3035,58 +3030,19 @@ function createWindow() {
       if (!upstreamFailureFirstAtMs) upstreamFailureFirstAtMs = now;
       if (upstreamFailureStreak >= UPSTREAM_FAILOVER_STREAK && now >= walletdFailoverCooldownUntilMs) {
         walletdFailoverCooldownUntilMs = now + WALLETD_FAILOVER_COOLDOWN_MS;
-        if (!WALLETD_RUNTIME_FAILOVER_ENABLED) {
-          if (!service.walletd) {
-            appendLog(win, '[network] walletd is down; restarting on sticky RPC endpoint');
-            const restarted = await ensureWalletdUpstreamConnected(win, UPSTREAM_PROBE_TIMEOUT_MS, {
-              preferCurrent: true
-            });
-            if (restarted.ok) {
-              appendLog(win, `[network] walletd upstream restored -> ${restarted.result}`);
-              out = await walletdCall('/network', null, { timeoutMs: WALLETD_NETWORK_TIMEOUT_MS });
-              if (out.ok) resetUpstreamFailureState();
-            } else {
-              appendLog(win, `[network] walletd restart on sticky endpoint failed: ${restarted.error || 'unknown'}`);
-            }
+        // walletd handles endpoint failover internally — only restart if it died.
+        if (!service.walletd) {
+          appendLog(win, '[network] walletd is down; restarting with all endpoints');
+          const restarted = await ensureWalletdUpstreamConnected(win, UPSTREAM_PROBE_TIMEOUT_MS);
+          if (restarted.ok) {
+            appendLog(win, `[network] walletd upstream restored -> ${restarted.result}`);
+            out = await walletdCall('/network', null, { timeoutMs: WALLETD_NETWORK_TIMEOUT_MS });
+            if (out.ok) resetUpstreamFailureState();
           } else {
-            appendLog(win, '[network] upstream unstable; sticky RPC mode enabled (rotation disabled)');
+            appendLog(win, `[network] walletd restart failed: ${restarted.error || 'unknown'}`);
           }
         } else {
-          const currentEp = normalizeRpcEndpoint(walletdRpcTarget || '', '');
-          const allCandidates = rpcCandidateList();
-          const alternateCandidates = allCandidates.filter((ep) => ep && ep !== currentEp);
-          if (alternateCandidates.length === 0) {
-            if (!service.walletd) {
-              appendLog(win, '[network] walletd is down; restarting on sole configured RPC endpoint');
-              const restarted = await ensureWalletdUpstreamConnected(win, UPSTREAM_PROBE_TIMEOUT_MS, {
-                preferCurrent: true
-              });
-              if (restarted.ok) {
-                appendLog(win, `[network] walletd upstream restored -> ${restarted.result}`);
-                out = await walletdCall('/network', null, { timeoutMs: WALLETD_NETWORK_TIMEOUT_MS });
-                if (out.ok) resetUpstreamFailureState();
-              } else {
-                appendLog(win, `[network] walletd restart on sole endpoint failed: ${restarted.error || 'unknown'}`);
-              }
-            } else {
-              appendLog(
-                win,
-                '[network] upstream unstable; only one RPC endpoint configured, skipping walletd restart'
-              );
-            }
-          } else {
-            appendLog(win, '[network] upstream unstable; rotating walletd RPC endpoint');
-            const switched = await ensureWalletdUpstreamConnected(win, UPSTREAM_PROBE_TIMEOUT_MS, {
-              excludeCurrent: true
-            });
-            if (switched.ok) {
-              appendLog(win, `[network] walletd upstream failover -> ${switched.result}`);
-              out = await walletdCall('/network', null, { timeoutMs: WALLETD_NETWORK_TIMEOUT_MS });
-              if (out.ok) resetUpstreamFailureState();
-            } else {
-              appendLog(win, `[network] walletd upstream failover failed: ${switched.error || 'unknown'}`);
-            }
-          }
+          appendLog(win, '[network] upstream temporarily unstable; walletd failover in progress');
         }
       }
       const sustainedFailureMs = upstreamFailureFirstAtMs > 0 ? (Date.now() - upstreamFailureFirstAtMs) : 0;
