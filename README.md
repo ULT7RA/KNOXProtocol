@@ -116,7 +116,7 @@ KNOX_NODE_NO_MINE=1 cargo run -p knox-node -- ./data 0.0.0.0:9735 0.0.0.0:9736 1
 
 ---
 
-## Network Architecture — The FORGERing
+## Network Architecture — The StarForge
 
 KNOX mainnet is anchored by **ForgeTitans** — dedicated Oracle Cloud relay nodes that serve
 RPC and relay blocks across the P2P mesh. ForgeTitans do not mine. Desktop nodes are the
@@ -149,7 +149,7 @@ Desktop wallets automatically discover and failover across all 6 endpoints.
 | `knox-consensus` | Lattice consensus primitives (open-mining with Forger slot election and optional Diamond Auth) |
 | `knox-ledger` | Block and UTXO validation and storage |
 | `knox-p2p` | Lattice two-round KEM handshake, authenticated encrypted transport, cover traffic |
-| `knox-core` | Node runtime: mempool, RPC server, block production, FORGERing relay |
+| `knox-core` | Node runtime: mempool, RPC server, block production, StarForge relay |
 | `knox-node` | Node binary |
 | `knox-wallet` | Wallet library: UTXO scanning, transaction building |
 | `knox-walletd` | HTTP/TLS wallet daemon (JSON API for desktop UI) |

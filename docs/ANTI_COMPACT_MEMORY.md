@@ -72,7 +72,7 @@
 
 ---
 
-## Infrastructure — The FORGERing (3 ForgeTitans, 6 RPC Endpoints)
+## Infrastructure — The StarForge (3 ForgeTitans, 6 RPC Endpoints)
 
 KNOX mainnet infrastructure runs on 3 Oracle Cloud (OCI) ForgeTitan nodes.
 Each ForgeTitan runs **two** relay/RPC instances (node-a and node-b) for a

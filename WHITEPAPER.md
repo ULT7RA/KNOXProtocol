@@ -235,13 +235,13 @@ Post-Handshake Encryption:
     recover the session key because the hardness of the key exchange rests on the lattice
     Shortest Vector Problem, not on discrete logarithm or elliptic curve assumptions.
 
-6. Open Mining Consensus — The FORGERing (Lattice-PoW)
+6. Open Mining Consensus — The StarForge (Lattice-PoW)
 
 KNOX runs open mining: any node can propose a block by solving ULT7Rock Lattice-PoW.
 Block producers are called **Forgers**. The mainnet P2P mesh is anchored by
 **ForgeTitans** — dedicated relay/RPC infrastructure nodes that do not mine but serve
 upstream sync and block propagation across the network. Together, Forgers and ForgeTitans
-form **the FORGERing**.
+form **The StarForge**.
 
     Open Participation: There is no fixed validator committee and no BFT voting rounds.
     Any Forger can propose a block. When multiple Forgers are active, deterministic slot
