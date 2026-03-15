@@ -702,8 +702,12 @@ impl Node {
                                 let allow_mining_node_reset = min_local_height_for_mining > 0
                                     && local_tip.saturating_add(1) < min_local_height_for_mining;
                                 let allow_sync_reset = no_mine_node || allow_mining_node_reset;
+                                // Mining nodes stuck at the same conflict height 5+ times
+                                // are definitively on a fork — override the mining guard.
+                                let force_reset = sync_conflict_hits >= 5
+                                    && sync_conflict_height == local_tip.saturating_add(1);
                                 if sync_auto_reset_on_conflict
-                                    && allow_sync_reset
+                                    && (allow_sync_reset || force_reset)
                                     && sync_conflict_hits >= 3
                                 {
                                     eprintln!(
@@ -742,13 +746,29 @@ impl Node {
                                 }
                                 // Fork recovery: when peers consistently send blocks
                                 // that we can't apply (out-of-order), it means we're
-                                // likely on a different fork. This covers two cases:
+                                // likely on a different fork. This covers three cases:
                                 // (a) peer blocks AHEAD of our tip (first_h > local_tip)
                                 // (b) peer blocks OVERLAP our chain but don't match
                                 //     (all out-of-order, none applied — diverged fork)
-                                let fork_signal = skipped_out_of_order > 0
+                                // (c) batch at local_tip+1 rejected with prev hash mismatch
+                                //     (zero OO skips, zero progress — classic chain split)
+                                let oo_fork_signal = skipped_out_of_order > 0
                                     && (first_h > local_tip
                                         || (already_exists_count == 0 && first_h <= local_tip));
+                                let tip_mismatch_signal = progressed_count == 0
+                                    && skipped_out_of_order == 0
+                                    && already_exists_count == 0
+                                    && first_h == local_tip.saturating_add(1)
+                                    && batch_result
+                                        .stop_error
+                                        .as_deref()
+                                        .map(|e| {
+                                            let l = e.to_ascii_lowercase();
+                                            l.contains("prev hash mismatch")
+                                                || l.contains("missing parent")
+                                        })
+                                        .unwrap_or(false);
+                                let fork_signal = oo_fork_signal || tip_mismatch_signal;
                                 if fork_signal {
                                     fork_oo_stall_count = fork_oo_stall_count.saturating_add(1);
                                     fork_oo_peer_max_h = fork_oo_peer_max_h.max(last_h);

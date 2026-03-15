@@ -1058,7 +1058,8 @@ function parseRuntimeLine(key, line, win) {
       return;
     }
     // Fork recovery: detect node's own fork-recovery clear (new binary)
-    if (/FORK RECOVERY:.*clearing chain for full resync/i.test(line)) {
+    if (/FORK RECOVERY:.*clearing chain for full resync/i.test(line)
+        || /sync conflict persists at h=.*clearing local ledger/i.test(line)) {
       appendLog(win, '[repair] node detected fork and is auto-recovering via chain resync');
       forkOoStallState.count = 0;
       forkOoStallState.peerMaxH = 0;
@@ -1070,9 +1071,12 @@ function parseRuntimeLine(key, line, win) {
     if (ooStall) {
       const peerFirstH = Number(ooStall[1] || 0);
       const peerLastH = Number(ooStall[2] || 0);
+      const exists = Number(ooStall[3] || 0);
       const skipped = Number(ooStall[4] || 0);
       const localH = Number(runtimeStats.node.lastSealedHeight || 0);
-      if (skipped > 0 && peerFirstH > localH) {
+      // Trigger on OO skips ahead of tip OR zero-progress batch at tip+1 (chain split)
+      if ((skipped > 0 && peerFirstH > localH)
+          || (skipped === 0 && exists === 0 && peerFirstH === localH + 1)) {
         const now = Date.now();
         if (!forkOoStallState.firstAtMs || now - forkOoStallState.firstAtMs > 180000) {
           forkOoStallState.count = 0;
