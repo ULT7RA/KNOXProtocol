@@ -1375,11 +1375,11 @@ impl Node {
                                 }
                             }
                         }
-                        let propose_interval_ms = if mining_rules.min_spacing_ms == 0 {
-                            0
-                        } else {
-                            knox_types::TARGET_BLOCK_TIME_MS
-                        };
+                        // The block timestamp spacing rule (min_spacing_ms check below)
+                        // enforces minimum block intervals at the consensus layer.
+                        // No additional propose-attempt cooldown needed — PoW solve
+                        // time naturally spaces proposals.
+                        let propose_interval_ms: u64 = 0;
                         if pending_mining.is_some() {
                             // A proof is already being generated; keep the loop responsive
                             // for inbound sync traffic until that proposal resolves.
