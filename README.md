@@ -114,7 +114,28 @@ cargo run -p knox-node -- ./data 0.0.0.0:9735 0.0.0.0:9736 127.0.0.1:9735 <miner
 KNOX_NODE_NO_MINE=1 cargo run -p knox-node -- ./data 0.0.0.0:9735 0.0.0.0:9736 127.0.0.1:9735 <miner_knox1_address>
 ```
 
-`validators.txt` is only a legacy/back-compat argument slot; current runtime is open-mining and does not require a validator file.
+---
+
+## Network Architecture — The FORGERing
+
+KNOX mainnet is anchored by **ForgeTitans** — dedicated Oracle Cloud relay nodes that serve
+RPC and relay blocks across the P2P mesh. ForgeTitans do not mine. Desktop nodes are the
+block producers (**Forgers**).
+
+| Role | What it does |
+|---|---|
+| **ForgeTitan** | Relay-only infrastructure node. Serves upstream RPC, relays blocks between peers. Runs on OCI. |
+| **Forger** | Desktop node that solves ULT7Rock Lattice-PoW and proposes blocks to the network. |
+
+There are currently **3 ForgeTitans** running **6 RPC endpoints** (2 per machine):
+
+| ForgeTitan | Public IP | RPC Ports |
+|---|---|---|
+| `knoxmine` | `161.153.118.97` | 9736, 9746 |
+| `knoxsync` | `129.146.133.68` | 9736, 9746 |
+| `knoxrpc` | `129.146.140.173` | 9736, 9746 |
+
+Desktop wallets automatically discover and failover across all 6 endpoints.
 
 ---
 
@@ -125,10 +146,10 @@ KNOX_NODE_NO_MINE=1 cargo run -p knox-node -- ./data 0.0.0.0:9735 0.0.0.0:9736 1
 | `knox-types` | Wire types and protocol constants |
 | `knox-lattice` | ULT7Rock lattice core: ring sigs, commitments, range proofs, stealth, PoW, surge |
 | `knox-storage` | Encrypted flat-file key-value store |
-| `knox-consensus` | Lattice consensus primitives (runtime currently uses open-mining with optional Diamond Auth) |
+| `knox-consensus` | Lattice consensus primitives (open-mining with Forger slot election and optional Diamond Auth) |
 | `knox-ledger` | Block and UTXO validation and storage |
 | `knox-p2p` | Lattice two-round KEM handshake, authenticated encrypted transport, cover traffic |
-| `knox-core` | Node runtime: mempool, RPC server, block production |
+| `knox-core` | Node runtime: mempool, RPC server, block production, FORGERing relay |
 | `knox-node` | Node binary |
 | `knox-wallet` | Wallet library: UTXO scanning, transaction building |
 | `knox-walletd` | HTTP/TLS wallet daemon (JSON API for desktop UI) |
@@ -142,9 +163,6 @@ KNOX_NODE_NO_MINE=1 cargo run -p knox-node -- ./data 0.0.0.0:9735 0.0.0.0:9736 1
 ```sh
 # Generate Docker testnet (50-100 nodes)
 bash scripts/gen-testnet.sh
-
-# Regenerate validators.txt from existing node keys
-bash scripts/regenerate-lattice-validators.sh <key_root> <validator_count>
 
 # 24h load test
 bash scripts/testnet-bench.sh

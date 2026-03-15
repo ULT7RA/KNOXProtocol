@@ -235,11 +235,19 @@ Post-Handshake Encryption:
     recover the session key because the hardness of the key exchange rests on the lattice
     Shortest Vector Problem, not on discrete logarithm or elliptic curve assumptions.
 
-6. Open Mining Consensus (Lattice-PoW)
+6. Open Mining Consensus — The FORGERing (Lattice-PoW)
 
 KNOX runs open mining: any node can propose a block by solving ULT7Rock Lattice-PoW.
+Block producers are called **Forgers**. The mainnet P2P mesh is anchored by
+**ForgeTitans** — dedicated relay/RPC infrastructure nodes that do not mine but serve
+upstream sync and block propagation across the network. Together, Forgers and ForgeTitans
+form **the FORGERing**.
 
-    Open Participation: There is no fixed validator committee, no leader election, and no BFT voting rounds.
+    Open Participation: There is no fixed validator committee and no BFT voting rounds.
+    Any Forger can propose a block. When multiple Forgers are active, deterministic slot
+    assignment (hash of previous block hash and height) selects the primary Forger for
+    each slot. Non-primary Forgers defer briefly before proposing, giving the network
+    time to converge on a single canonical tip.
 
     Deterministic Admission Rules: A candidate block must pass the same checks on every node:
     valid parent linkage, valid timestamp spacing, valid lattice proof-of-work target, and valid
@@ -248,8 +256,9 @@ KNOX runs open mining: any node can propose a block by solving ULT7Rock Lattice-
     Finality Model: Practical finality is chainwork-based. Nodes converge on the heaviest valid
     chain under identical rule enforcement.
 
-    Fork Safety: Conflicting blocks are resolved by deterministic chainwork selection plus strict
-    parent/timestamp/proof validation. Invalid branches are rejected network-wide.
+    Fork Safety: Conflicting blocks at the same height are resolved by a deterministic
+    tiebreaker — the block with the lower hash wins. This ensures all nodes converge on the
+    same tip without coordination. Invalid branches are rejected network-wide.
 
 7. URK Ledger Model (Confidential UTXO)
 
