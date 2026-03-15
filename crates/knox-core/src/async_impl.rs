@@ -43,26 +43,160 @@ const MAX_UPSTREAM_SYNC_BATCH_LOOPS: usize = 8;
 const DEFAULT_UPSTREAM_SYNC_BATCH_COUNT: u32 = 64;
 const CHAIN_CONTINUITY_CHECK_MS: u64 = 5_000;
 
-/// Grace period (ms) that non-primary forgers must wait before proposing.
-/// Gives the deterministic slot-winner time to submit first.
-const FORGER_GRACE_MS: u64 = 90_000; // 2× TARGET_BLOCK_TIME_MS
+/// Grace period (ms) that non-elected miners must wait before proposing.
+/// Gives the ForgeTitan-elected leader time to submit first.
+const FORGE_GRACE_MS: u64 = 90_000; // 2× TARGET_BLOCK_TIME_MS
 
-/// Deterministic forger-slot election.
-/// Returns the index (0..forger_count) of the designated primary forger
-/// for the given height, derived from `hash(prev_block_hash || height)`.
-fn forger_slot_for_height(prev_hash: &Hash32, height: u64, forger_count: usize) -> usize {
-    if forger_count <= 1 {
-        return 0;
+/// Scan window for miner registry: only look at the last WINDOW blocks.
+/// 3840 blocks ≈ 48hrs at 45s target.  Keeps the scan bounded regardless
+/// of total chain length, and ensures stale/offline miners age out.
+const FORGE_REGISTRY_WINDOW: u64 = knox_types::FORGE_TENURE_BLOCKS;
+
+// ── ForgeTitan Election (stateless — computed purely from ledger) ────
+//
+// Every ForgeTitan (and every node) can compute the same election result
+// for any height because the inputs are:
+//   1. The block at (height - 1) → prev_hash  (chain state)
+//   2. The set of proposer IDs in the last WINDOW blocks  (chain state)
+//   3. Deterministic weight formula  (protocol constant)
+//   4. Deterministic hash-based random selection  (protocol constant)
+//
+// Adding a new ForgeTitan VM requires zero coordination — it syncs the
+// chain and immediately serves identical election results.  Miners query
+// ANY ForgeTitan (or multiple for redundancy) and get the same answer.
+
+/// Miner info tracked by the election registry.
+#[derive(Clone, Debug)]
+struct MinerInfo {
+    proposer_id: [u8; 32],
+    /// Earliest height this miner appeared in the scan window.
+    first_seen_height: u64,
+    /// Total blocks proposed within the scan window.
+    blocks_in_window: u64,
+}
+
+/// Build the active miner registry by scanning the last WINDOW blocks.
+/// This is O(WINDOW) — bounded at ~3840 blocks regardless of chain length.
+/// Returns a deterministically-sorted list of active miners.
+fn build_miner_registry(
+    ledger: &knox_ledger::Ledger,
+    tip_height: u64,
+) -> Vec<MinerInfo> {
+    use std::collections::HashMap;
+    let window_start = tip_height.saturating_sub(FORGE_REGISTRY_WINDOW);
+    let mut miners: HashMap<[u8; 32], MinerInfo> = HashMap::new();
+
+    let mut h = tip_height;
+    loop {
+        if h < window_start { break; }
+        if let Some(block) = ledger.get_block(h).ok().flatten() {
+            let pid = block.header.proposer;
+            let entry = miners.entry(pid).or_insert(MinerInfo {
+                proposer_id: pid,
+                first_seen_height: h,
+                blocks_in_window: 0,
+            });
+            entry.blocks_in_window += 1;
+            if h < entry.first_seen_height {
+                entry.first_seen_height = h;
+            }
+        }
+        if h == 0 { break; }
+        h -= 1;
     }
+
+    let mut result: Vec<MinerInfo> = miners.into_values().collect();
+    // Sort by proposer_id for deterministic ordering across all ForgeTitans
+    result.sort_by(|a, b| a.proposer_id.cmp(&b.proposer_id));
+    result
+}
+
+/// Compute election weights for each miner.
+///
+/// Weight model:
+///   - New miners (< 48hrs tenure): weight ramps linearly 10 → 1000
+///   - Veterans (≥ 48hrs): weight = 1000 (fair equal chance)
+///   - Top miner (most blocks in window): +2.5% bonus
+///
+/// All inputs are chain-derived → every node computes identical weights.
+fn compute_election_weights(miners: &[MinerInfo], tip_height: u64) -> Vec<u64> {
+    if miners.is_empty() { return vec![]; }
+
+    let max_blocks = miners.iter().map(|m| m.blocks_in_window).max().unwrap_or(0);
+
+    miners.iter().map(|m| {
+        let tenure = tip_height.saturating_sub(m.first_seen_height);
+        let base = if tenure >= knox_types::FORGE_TENURE_BLOCKS {
+            1000u64
+        } else {
+            (tenure * 1000) / knox_types::FORGE_TENURE_BLOCKS.max(1)
+        };
+        // Floor of 10 so brand-new miners still have a small chance
+        let base = base.max(10);
+        // Top miner bonus: 2.5%
+        if m.blocks_in_window == max_blocks && max_blocks > 0 {
+            base + (base * knox_types::FORGE_TOP_MINER_BONUS_PPM / 1_000_000)
+        } else {
+            base
+        }
+    }).collect()
+}
+
+/// Weighted deterministic election for a given height.
+///
+/// Entropy = hash(prev_block_hash || height), same on every node.
+/// Selection = weighted cumulative distribution over sorted miners.
+fn forge_elect_leader(
+    prev_hash: &Hash32,
+    height: u64,
+    miners: &[MinerInfo],
+    weights: &[u64],
+) -> Option<[u8; 32]> {
+    if miners.is_empty() || weights.is_empty() { return None; }
+    let total_weight: u64 = weights.iter().sum();
+    if total_weight == 0 { return None; }
+
     let mut data = Vec::with_capacity(40);
     data.extend_from_slice(&prev_hash.0);
     data.extend_from_slice(&height.to_le_bytes());
     let h = hash_bytes(&data);
-    // Use the first 8 bytes of the hash as a u64 index.
     let mut idx_bytes = [0u8; 8];
     idx_bytes.copy_from_slice(&h.0[..8]);
-    let idx = u64::from_le_bytes(idx_bytes);
-    (idx % forger_count as u64) as usize
+    let roll = u64::from_le_bytes(idx_bytes) % total_weight;
+
+    let mut cumulative = 0u64;
+    for (i, &w) in weights.iter().enumerate() {
+        cumulative += w;
+        if roll < cumulative {
+            return Some(miners[i].proposer_id);
+        }
+    }
+    Some(miners.last()?.proposer_id)
+}
+
+/// Full election query: build registry, compute weights, elect leader.
+/// Pure function of ledger state — any ForgeTitan produces the same result.
+fn forge_election_for_height(
+    ledger: &knox_ledger::Ledger,
+    height: u64,
+) -> Option<knox_types::ForgeElectionResult> {
+    let tip = ledger.height().ok()?;
+    if height == 0 { return None; }
+    let prev_height = height.saturating_sub(1);
+    let prev_block = ledger.get_block(prev_height).ok().flatten()?;
+    let prev_hash = hash_header_for_link(&prev_block.header);
+
+    let miners = build_miner_registry(ledger, tip);
+    if miners.is_empty() { return None; }
+    let weights = compute_election_weights(&miners, tip);
+    let leader = forge_elect_leader(&prev_hash, height, &miners, &weights)?;
+
+    Some(knox_types::ForgeElectionResult {
+        height,
+        leader,
+        active_miners: miners.len() as u32,
+        is_leader: false, // caller sets this based on their own proposer_id
+    })
 }
 
 fn sync_blocks_response_max_bytes() -> usize {
@@ -301,33 +435,18 @@ impl Node {
         let mut last_chain_continuity_check_ms = 0u64;
         let mut last_chain_continuity_log_ms = 0u64;
         let mut last_backend_line = String::new();
-        // Forger election: load the ordered set of known forger proposer-IDs
-        // from KNOX_FORGER_SET (comma-separated hex 32-byte IDs).  If the env
-        // var is empty or absent, forger election is disabled and every node
-        // proposes immediately (legacy behaviour).
-        let forger_set: Vec<[u8; 32]> = std::env::var("KNOX_FORGER_SET")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|s| {
-                let s = s.trim();
-                if s.len() != 64 { return None; }
-                let mut buf = [0u8; 32];
-                for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-                    if i >= 32 { return None; }
-                    buf[i] = u8::from_str_radix(
-                        std::str::from_utf8(chunk).ok()?, 16
-                    ).ok()?;
-                }
-                Some(buf)
-            })
-            .collect();
-        let forger_self_index: Option<usize> = forger_set.iter().position(|id| *id == proposer_id);
-        if !forger_set.is_empty() {
+        // ForgeTitan election: miners query upstream RPC for the elected
+        // leader before proposing.  The election is computed from chain state
+        // so all ForgeTitans (and local nodes) produce the same result.
+        // When KNOX_FORGE_ELECTION=1 (or unset with upstream RPC available),
+        // the node queries its upstream RPC for the election result.
+        let forge_election_enabled = std::env::var("KNOX_FORGE_ELECTION")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true); // enabled by default
+        if forge_election_enabled {
             eprintln!(
-                "[StarForge] forger election enabled: {} forgers, self_index={:?} grace_ms={}",
-                forger_set.len(),
-                forger_self_index,
-                FORGER_GRACE_MS
+                "[StarForge] ForgeTitan election enabled — grace_ms={}",
+                FORGE_GRACE_MS
             );
         }
         let sync_retry_ms = std::env::var("KNOX_SYNC_RETRY_MS")
@@ -1351,27 +1470,24 @@ impl Node {
                         if !mining_rules.allow_proposal {
                             continue;
                         }
-                        // ── Forger election gate ──
-                        // If a forger set is configured, only the primary forger
-                        // for this slot proposes immediately.  Others must wait
-                        // FORGER_GRACE_MS after the previous block's timestamp
-                        // so the primary has time to submit first.
-                        if !forger_set.is_empty() && height > 0 {
-                            let prev_hash = prev_block
-                                .as_ref()
-                                .map(|b| hash_header_for_link(&b.header))
-                                .unwrap_or(Hash32::ZERO);
-                            let primary_idx = forger_slot_for_height(&prev_hash, height, forger_set.len());
-                            let is_primary = forger_self_index == Some(primary_idx);
-                            if !is_primary {
-                                let parent_ts = prev_block
-                                    .as_ref()
-                                    .map(|b| b.header.timestamp_ms)
-                                    .unwrap_or(0);
-                                let grace_expires = parent_ts.saturating_add(FORGER_GRACE_MS);
-                                if ts_now < grace_expires {
-                                    // Not our slot yet — wait.
-                                    continue;
+                        // ── ForgeTitan election gate ──
+                        // Query the local ledger for the election result.
+                        // All nodes compute the same result from chain state,
+                        // so this works whether we're a ForgeTitan or a miner.
+                        if forge_election_enabled && height > 1 {
+                            if let Ok(l) = ledger.lock() {
+                                if let Some(election) = forge_election_for_height(&l, height) {
+                                    if election.leader != proposer_id {
+                                        // Not elected — wait FORGE_GRACE_MS from parent timestamp
+                                        let parent_ts = prev_block
+                                            .as_ref()
+                                            .map(|b| b.header.timestamp_ms)
+                                            .unwrap_or(0);
+                                        let grace_expires = parent_ts.saturating_add(FORGE_GRACE_MS);
+                                        if ts_now < grace_expires {
+                                            continue;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1877,7 +1993,7 @@ async fn run_rpc(
             // Diamond auth signing still needs to be reachable by peer nodes.
             if is_remote
                 && !allow_remote_rpc
-                && !matches!(&request, WalletRequest::SignDiamondCert(_))
+                && !matches!(&request, WalletRequest::SignDiamondCert(_) | WalletRequest::GetForgeElection(_))
             {
                 eprintln!("[StarForge] rpc rejected remote request from {addr}");
                 return;
@@ -2103,6 +2219,21 @@ async fn run_rpc(
                             );
                             WalletResponse::DiamondCert(None)
                         }
+                    }
+                }
+                WalletRequest::GetForgeElection(height) => {
+                    let result = match ledger.lock() {
+                        Ok(l) => forge_election_for_height(&l, height),
+                        Err(_) => None,
+                    };
+                    match result {
+                        Some(r) => WalletResponse::ForgeElection(r),
+                        None => WalletResponse::ForgeElection(knox_types::ForgeElectionResult {
+                            height,
+                            leader: [0u8; 32],
+                            active_miners: 0,
+                            is_leader: false,
+                        }),
                     }
                 }
             };

@@ -252,6 +252,8 @@ pub enum WalletRequest {
     GetNetworkTelemetry,
     GetFibWall(u32),
     SignDiamondCert(Block),
+    /// ForgeTitan election query: returns the elected leader for the given height.
+    GetForgeElection(u64),
 }
 
 #[derive(Clone, Debug, Encode, Decode)]
@@ -264,7 +266,27 @@ pub enum WalletResponse {
     NetworkTelemetry(NetworkTelemetry),
     FibWall(Vec<FibWallEntry>),
     DiamondCert(Option<Vec<u8>>),
+    /// ForgeTitan election result.
+    ForgeElection(ForgeElectionResult),
 }
+
+/// Result of a ForgeTitan election query.
+#[derive(Clone, Debug, Encode, Decode)]
+pub struct ForgeElectionResult {
+    pub height: u64,
+    /// The elected leader's proposer ID for this height.
+    pub leader: [u8; 32],
+    /// Number of known active miners in the registry.
+    pub active_miners: u32,
+    /// True if the querying node should propose (always true for leader,
+    /// false for others until grace period expires).
+    pub is_leader: bool,
+}
+
+/// 48 hours of blocks at TARGET_BLOCK_TIME_MS (45s) = 3840 blocks.
+pub const FORGE_TENURE_BLOCKS: u64 = 48 * 3600 * 1000 / TARGET_BLOCK_TIME_MS;
+/// Top miner bonus: 2.5% increased election weight.
+pub const FORGE_TOP_MINER_BONUS_PPM: u64 = 25_000; // 2.5% in parts-per-million
 
 pub fn hash_bytes(data: &[u8]) -> Hash32 {
     let mut hasher = Hasher::new();
