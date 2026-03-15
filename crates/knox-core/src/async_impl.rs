@@ -43,6 +43,28 @@ const MAX_UPSTREAM_SYNC_BATCH_LOOPS: usize = 8;
 const DEFAULT_UPSTREAM_SYNC_BATCH_COUNT: u32 = 64;
 const CHAIN_CONTINUITY_CHECK_MS: u64 = 5_000;
 
+/// Grace period (ms) that non-primary forgers must wait before proposing.
+/// Gives the deterministic slot-winner time to submit first.
+const FORGER_GRACE_MS: u64 = 90_000; // 2× TARGET_BLOCK_TIME_MS
+
+/// Deterministic forger-slot election.
+/// Returns the index (0..forger_count) of the designated primary forger
+/// for the given height, derived from `hash(prev_block_hash || height)`.
+fn forger_slot_for_height(prev_hash: &Hash32, height: u64, forger_count: usize) -> usize {
+    if forger_count <= 1 {
+        return 0;
+    }
+    let mut data = Vec::with_capacity(40);
+    data.extend_from_slice(&prev_hash.0);
+    data.extend_from_slice(&height.to_le_bytes());
+    let h = hash_bytes(&data);
+    // Use the first 8 bytes of the hash as a u64 index.
+    let mut idx_bytes = [0u8; 8];
+    idx_bytes.copy_from_slice(&h.0[..8]);
+    let idx = u64::from_le_bytes(idx_bytes);
+    (idx % forger_count as u64) as usize
+}
+
 fn sync_blocks_response_max_bytes() -> usize {
     std::env::var("KNOX_SYNC_BLOCKS_RESPONSE_MAX_BYTES")
         .ok()
@@ -279,6 +301,35 @@ impl Node {
         let mut last_chain_continuity_check_ms = 0u64;
         let mut last_chain_continuity_log_ms = 0u64;
         let mut last_backend_line = String::new();
+        // Forger election: load the ordered set of known forger proposer-IDs
+        // from KNOX_FORGER_SET (comma-separated hex 32-byte IDs).  If the env
+        // var is empty or absent, forger election is disabled and every node
+        // proposes immediately (legacy behaviour).
+        let forger_set: Vec<[u8; 32]> = std::env::var("KNOX_FORGER_SET")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim();
+                if s.len() != 64 { return None; }
+                let mut buf = [0u8; 32];
+                for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+                    if i >= 32 { return None; }
+                    buf[i] = u8::from_str_radix(
+                        std::str::from_utf8(chunk).ok()?, 16
+                    ).ok()?;
+                }
+                Some(buf)
+            })
+            .collect();
+        let forger_self_index: Option<usize> = forger_set.iter().position(|id| *id == proposer_id);
+        if !forger_set.is_empty() {
+            eprintln!(
+                "[knox-node] forger election enabled: {} forgers, self_index={:?} grace_ms={}",
+                forger_set.len(),
+                forger_self_index,
+                FORGER_GRACE_MS
+            );
+        }
         let sync_retry_ms = std::env::var("KNOX_SYNC_RETRY_MS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -1299,6 +1350,30 @@ impl Node {
                         };
                         if !mining_rules.allow_proposal {
                             continue;
+                        }
+                        // ── Forger election gate ──
+                        // If a forger set is configured, only the primary forger
+                        // for this slot proposes immediately.  Others must wait
+                        // FORGER_GRACE_MS after the previous block's timestamp
+                        // so the primary has time to submit first.
+                        if !forger_set.is_empty() && height > 0 {
+                            let prev_hash = prev_block
+                                .as_ref()
+                                .map(|b| hash_header_for_link(&b.header))
+                                .unwrap_or(Hash32::ZERO);
+                            let primary_idx = forger_slot_for_height(&prev_hash, height, forger_set.len());
+                            let is_primary = forger_self_index == Some(primary_idx);
+                            if !is_primary {
+                                let parent_ts = prev_block
+                                    .as_ref()
+                                    .map(|b| b.header.timestamp_ms)
+                                    .unwrap_or(0);
+                                let grace_expires = parent_ts.saturating_add(FORGER_GRACE_MS);
+                                if ts_now < grace_expires {
+                                    // Not our slot yet — wait.
+                                    continue;
+                                }
+                            }
                         }
                         let propose_interval_ms = if mining_rules.min_spacing_ms == 0 {
                             0
