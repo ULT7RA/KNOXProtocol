@@ -8,10 +8,12 @@ Every layer of KNOX — transaction signing, output commitments, range proofs, s
 block proof-of-work, consensus signatures, and P2P session encryption — runs on ULT7Rock lattice
 cryptography. No elliptic curves. No classical assumptions. No forks. Built from the ground up.
 
+[![Support on Patreon](https://img.shields.io/badge/Patreon-F96854?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/ULT7ROCK)
+
 - Whitepaper: [WHITEPAPER.md](./WHITEPAPER.md)
 - Threat Model: [security.md](./security.md)
 - Inquiries: KNOXULT7Rock@proton.me
-- https://patreon.com/ULT7ROCK?utm_medium=unknown&utm_source=join_link&utm_campaign=creatorshare_creator&utm_content=copyLink
+ 
 
 ---
 
