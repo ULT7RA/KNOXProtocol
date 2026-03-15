@@ -712,7 +712,7 @@ function ensureValidatorsFile(win) {
           fs.copyFileSync(repoDefault, validatorsPath);
           appendLog(win, `[setup] seeded validators from: ${repoDefault}`);
         } else {
-          appendLog(win, `[setup] repo validators also invalid, node will self-generate`);
+          appendLog(win, `[setup] repo validators also invalid, StarForge will self-generate`);
         }
       }
     } catch (e) {
@@ -734,7 +734,7 @@ async function ensureWalletExists() {
 async function autoImportNodeKey(opts = {}) {
   const allowOverwrite = !!opts.allowOverwrite;
   const trigger = String(opts.trigger || 'auto').trim() || 'auto';
-  if (!fs.existsSync(NODE_KEY_PATH)) return { ok: false, error: 'node key not found' };
+  if (!fs.existsSync(NODE_KEY_PATH)) return { ok: false, error: 'StarForge key not found' };
   if (fs.existsSync(WALLET_PATH)) {
     const sz = Number(fs.statSync(WALLET_PATH).size || 0);
     if (sz > 0 && !allowOverwrite) {
@@ -1060,7 +1060,7 @@ function parseRuntimeLine(key, line, win) {
     // Fork recovery: detect node's own fork-recovery clear (new binary)
     if (/FORK RECOVERY:.*clearing chain for full resync/i.test(line)
         || /sync conflict persists at h=.*clearing local ledger/i.test(line)) {
-      appendLog(win, '[repair] node detected fork and is auto-recovering via chain resync');
+      appendLog(win, '[StarForge] detected fork and is auto-recovering via chain resync');
       forkOoStallState.count = 0;
       forkOoStallState.peerMaxH = 0;
       forkOoStallState.firstAtMs = 0;
@@ -1266,10 +1266,10 @@ function clearStaleNodeRpcPortOwner(win) {
       taskInfo = '';
     }
     if (!/knox-node\.exe/i.test(taskInfo)) {
-      appendLog(win, `[warn] rpc ${LOCAL_NODE_RPC} in use by pid=${pid}; not killing non-node process`);
+      appendLog(win, `[warn] rpc ${LOCAL_NODE_RPC} in use by pid=${pid}; not killing non-StarForge process`);
       continue;
     }
-    appendLog(win, `[setup] freeing stale knox-node pid=${pid} on rpc ${LOCAL_NODE_RPC}`);
+    appendLog(win, `[setup] freeing stale StarForge pid=${pid} on rpc ${LOCAL_NODE_RPC}`);
     try {
       execSync(`taskkill /F /T /PID ${pid}`, { stdio: 'pipe' });
     } catch (err) {
@@ -2230,7 +2230,7 @@ async function resetLocalLedgerAndRestart(win, reason = 'auto-ledger-reset') {
     if (!gate.ok) {
       appendLog(
         win,
-        `[guard] auto-ledger-reset: restarting local node with mining OFF until canonical chain is visible (${gate.error || 'unknown'})`
+        `[guard] auto-ledger-reset: restarting StarForge with mining OFF until canonical chain is visible (${gate.error || 'unknown'})`
       );
       requestedMine = false;
     } else {
@@ -2240,7 +2240,7 @@ async function resetLocalLedgerAndRestart(win, reason = 'auto-ledger-reset') {
     const minerAddress = await resolveMinerAddress({ requireWalletAddress: !!requestedMine });
     if (!minerAddress.ok) return minerAddress;
 
-    appendLog(win, `[repair] detected stale local ledger (${reason}); rebuilding local node chain cache`);
+    appendLog(win, `[StarForge] detected stale local ledger (${reason}); rebuilding local chain cache`);
     stopSvc('walletd');
     stopSvc('node');
     await waitMs(350);
@@ -2410,7 +2410,7 @@ async function forceMiningOffForSafety(win, reason = 'upstream connectivity lost
   if (restarted.ok) {
     nodeMineEnabled = false;
     miningSafetyTripped = true;
-    appendLog(win, '[safety] node restarted with mining OFF');
+    appendLog(win, '[StarForge] restarted with mining OFF');
   }
   return restarted;
 }
@@ -2445,13 +2445,13 @@ async function quickStart(win, profile = null) {
       nodeArgs(validatorsPath, minerAddress.result),
       nodeDesktopEnv(allowMiningBoot, effectiveProfile, minLocalHeightForMining, minerAddress.result)
     );
-    appendLog(win, `[node] spawning with miner_address=${minerAddress.result === '__derive__' ? '(derived from node key)' : safeShortAddress(minerAddress.result)}`);
+    appendLog(win, `[StarForge] spawning with miner_address=${minerAddress.result === '__derive__' ? '(derived from node key)' : safeShortAddress(minerAddress.result)}`);
     nodeMineEnabled = !!allowMiningBoot;
     miningProfileState = effectiveProfile;
     if (!nodeStart.ok) return nodeStart;
     appendLog(
       win,
-      `[config] node mining=${allowMiningBoot ? 'on' : 'off'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'} cpu_util=${effectiveProfile?.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile?.gpuUtil ?? 'auto'} upstream_batch=${process.env.KNOX_NODE_UPSTREAM_SYNC_BATCH_COUNT} upstream_timeout_ms=${process.env.KNOX_NODE_UPSTREAM_SYNC_TIMEOUT_MS}`
+      `[StarForge] mining=${allowMiningBoot ? 'on' : 'off'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'} cpu_util=${effectiveProfile?.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile?.gpuUtil ?? 'auto'} upstream_batch=${process.env.KNOX_NODE_UPSTREAM_SYNC_BATCH_COUNT} upstream_timeout_ms=${process.env.KNOX_NODE_UPSTREAM_SYNC_TIMEOUT_MS}`
     );
     if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.node && walletdRpcTarget !== LOCAL_NODE_RPC) {
       appendLog(win, `[sync] moving wallet daemon to local RPC: ${LOCAL_NODE_RPC}`);
@@ -2696,7 +2696,7 @@ function createWindow() {
       miningProfileState = profile || miningProfileState || loadMiningConfig().profile;
       return {
         ok: true,
-        result: 'node already running; use Apply Changes to reconfigure live'
+        result: 'StarForge already running; use Apply Changes to reconfigure live'
       };
     }
     const validatorsPath = ensureValidatorsFile(win);
@@ -2723,7 +2723,7 @@ function createWindow() {
     miningProfileState = effectiveProfile;
     appendLog(
       win,
-      `[config] node mining=${requestedMine ? 'on' : 'off'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'} cpu_util=${effectiveProfile?.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile?.gpuUtil ?? 'auto'} upstream_batch=${DESKTOP_UPSTREAM_SYNC_BATCH} upstream_timeout_ms=${DESKTOP_UPSTREAM_SYNC_TIMEOUT_MS}`
+      `[StarForge] mining=${requestedMine ? 'on' : 'off'} mode=${effectiveProfile?.mode || 'hybrid'} backend=${effectiveProfile?.backend || 'auto'} peers="${defaultPeerList() || '<none>'}" validators_mode=${USE_VALIDATORS_FILE_FOR_DESKTOP_NODE ? 'file' : 'local-solo'} diff=${effectiveProfile?.difficultyBits ?? 'auto'} seq=${effectiveProfile?.seqSteps ?? 'auto'} mem=${effectiveProfile?.memoryBytes ?? 'auto'} cpu_util=${effectiveProfile?.cpuUtil ?? 'auto'} gpu_util=${effectiveProfile?.gpuUtil ?? 'auto'} upstream_batch=${DESKTOP_UPSTREAM_SYNC_BATCH} upstream_timeout_ms=${DESKTOP_UPSTREAM_SYNC_TIMEOUT_MS}`
     );
 
     if (USE_LOCAL_RPC_WHEN_NODE_RUNNING && service.walletd && walletdRpcTarget !== LOCAL_NODE_RPC) {
@@ -2731,7 +2731,7 @@ function createWindow() {
       stopSvc('walletd');
       const restarted = startWalletdOnRpc(win, LOCAL_NODE_RPC);
       if (!restarted.ok) return restarted;
-      return { ok: true, result: 'node started; wallet daemon moved to local RPC' };
+      return { ok: true, result: 'StarForge started; wallet daemon moved to local RPC' };
     }
     return started;
   });
@@ -2778,7 +2778,7 @@ function createWindow() {
       if (!gate.ok) {
         appendLog(
           win,
-          `[guard] wallet-create: restarting local node with mining OFF until canonical chain is visible (${gate.error || 'unknown'})`
+          `[guard] wallet-create: restarting StarForge with mining OFF until canonical chain is visible (${gate.error || 'unknown'})`
         );
         requestedMine = false;
       } else {
@@ -2798,7 +2798,7 @@ function createWindow() {
       );
       if (!restarted.ok) return restarted;
       nodeMineEnabled = !!requestedMine;
-      appendLog(win, '[config] node restarted to apply new wallet mining address');
+      appendLog(win, '[StarForge] restarted to apply new wallet mining address');
     }
     return out;
   });
@@ -2840,7 +2840,7 @@ function createWindow() {
     if (!gate.ok) {
       appendLog(
         win,
-        `[guard] miner-address-set: restarting local node with mining OFF until canonical chain is visible (${gate.error || 'unknown'})`
+        `[guard] miner-address-set: restarting StarForge with mining OFF until canonical chain is visible (${gate.error || 'unknown'})`
       );
       requestedMine = false;
     } else {
@@ -2858,7 +2858,7 @@ function createWindow() {
     if (!restarted.ok) return restarted;
     nodeMineEnabled = !!requestedMine;
     queueWalletAutoSync(win, 'miner-address-changed');
-    return { ok: true, result: `mining address set and node restarted` };
+    return { ok: true, result: `mining address set and StarForge restarted` };
   });
   bindIpc('wallet-new-address', 'wallet-new-address', async () => {
     const backup = backupWalletSnapshot(win, 'new-address', { minIntervalMs: 60 * 1000 });
@@ -3237,7 +3237,7 @@ function createWindow() {
     if (!gate.ok) {
       appendLog(
         win,
-        `[guard] mining-apply-live: restarting local node with mining OFF until canonical chain is visible (${gate.error || 'unknown'})`
+        `[guard] mining-apply-live: restarting StarForge with mining OFF until canonical chain is visible (${gate.error || 'unknown'})`
       );
       requestedMine = false;
     } else {

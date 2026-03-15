@@ -786,7 +786,7 @@ export default function App() {
     { label: 'Hardening', value: numOrNa(telemetry.hardening), tone: 'amber' },
     { label: 'Bonus', value: numOrNa(telemetry.bonus), tone: 'amber' },
     { label: 'Surge', value: telemetry.surge, tone: telemetry.surge === 'Active' ? 'pink' : 'cyan' },
-    { label: 'Source', value: netQ.data?.ok ? 'Network' : (runtimeNode.running || Number.isFinite(Number(runtimeNode.lastSealedHeight)) ? 'Local Node' : 'N/A'), tone: netQ.data?.ok ? 'green' : 'amber' },
+    { label: 'Source', value: netQ.data?.ok ? 'Network' : (runtimeNode.running || Number.isFinite(Number(runtimeNode.lastSealedHeight)) ? 'Local StarForge' : 'N/A'), tone: netQ.data?.ok ? 'green' : 'amber' },
     { label: 'RPC', value: status.walletdRunning ? 'Online' : 'Offline', tone: status.walletdRunning ? 'green' : 'pink' },
   ];
 
@@ -976,9 +976,9 @@ export default function App() {
   const heroButtons = [
     ['Quick Start', () => window.knox.quickStart(miningProfileFromUi())],
     ['Generate TLS', () => window.knox.tlsGenerate()],
-    ['Start Node (Mining On)', () => window.knox.startNode(true, miningProfileFromUi())],
-    ['Start Node (Mining Off)', () => window.knox.startNode(false)],
-    ['Stop Node', () => window.knox.stopService('node')],
+    ['Start StarForge (Mining On)', () => window.knox.startNode(true, miningProfileFromUi())],
+    ['Start StarForge (Mining Off)', () => window.knox.startNode(false)],
+    ['Stop StarForge', () => window.knox.stopService('node')],
     ['Start Wallet', () => window.knox.startWalletd()],
     ['Stop Wallet', () => window.knox.stopService('walletd')],
     ['Create Wallet', () => window.knox.walletCreate()],
@@ -1328,7 +1328,7 @@ export default function App() {
                   <div><span>Configured Backend</span><b>{configuredBackendLabel}</b></div>
                   <div><span>Active Backend</span><b>{activeBackendLabel}</b></div>
                   <div><span>Backend Device</span><b>{String(runtimeNode.activeDevice || 'cpu-main')}</b></div>
-                  <div><span>Data Source</span><b>{netQ.data?.ok ? 'Network' : (runtimeNode.running ? 'Local Node' : 'N/A')}</b></div>
+                  <div><span>Data Source</span><b>{netQ.data?.ok ? 'Network' : (runtimeNode.running ? 'Local StarForge' : 'N/A')}</b></div>
                   <div><span>Last Sealed</span><b>{Number.isFinite(Number(runtimeNode.lastSealedHeight)) ? `#${runtimeNode.lastSealedHeight}` : 'N/A'}</b></div>
                 </div>
                 {(runtimeFallback || runtimeBackendError) && (
