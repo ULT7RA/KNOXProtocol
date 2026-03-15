@@ -902,16 +902,25 @@ impl Node {
                                 }
                             }
                         }
-                        let local_tip = match ledger.lock() {
-                            Ok(l) => l.height().unwrap_or(0),
-                            Err(_) => 0,
+                        let (local_tip, has_genesis) = match ledger.lock() {
+                            Ok(l) => (
+                                l.height().unwrap_or(0),
+                                l.get_block(0).unwrap_or(None).is_some(),
+                            ),
+                            Err(_) => (0, false),
                         };
                         let must_catch_up = min_local_height_for_mining > 0
                             && local_tip < min_local_height_for_mining;
                         let stalled_rpc = now.saturating_sub(last_sync_progress_ms) >= sync_retry_ms;
                         if must_catch_up && stalled_rpc {
                             let mut batch_loops = 0usize;
-                            let mut next_from = local_tip.saturating_add(1);
+                            // When genesis is missing, request from h=0 so the
+                            // upstream RPC sends the genesis block first.
+                            let mut next_from = if has_genesis {
+                                local_tip.saturating_add(1)
+                            } else {
+                                0
+                            };
                             while batch_loops < MAX_UPSTREAM_SYNC_BATCH_LOOPS {
                                 batch_loops = batch_loops.saturating_add(1);
                                 last_sync_request_ms = now_ms();
