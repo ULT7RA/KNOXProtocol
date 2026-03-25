@@ -224,8 +224,10 @@ if ($PublishRelease) {
 
   Write-Host ""
   Write-Host "[5/5] publishing GitHub release asset(s)"
-  & gh release view $Tag --repo $GhRepo *> $null
-  if ($LASTEXITCODE -eq 0) {
+  $releaseExists = $false
+  try { & gh release view $Tag --repo $GhRepo *> $null; $releaseExists = ($LASTEXITCODE -eq 0) }
+  catch { $releaseExists = $false }
+  if ($releaseExists) {
     & gh release upload $Tag $installer.FullName $installerSha --repo $GhRepo --clobber
   } else {
     if (Test-Path $notesFile) {
