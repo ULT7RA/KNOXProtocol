@@ -30,6 +30,7 @@ const MAX_REPLAY_SESSIONS: usize = 16_384;
 const REPLAY_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_BLOCK_REQUESTERS: usize = 4_096;
 const BLOCK_REQUESTER_TTL_MS: u64 = 30_000;
+const DEFAULT_RECONNECT_LOG_INTERVAL_MS: u64 = 30_000;
 
 #[derive(Clone, Debug)]
 struct BlockRequester {
@@ -48,6 +49,18 @@ fn unsafe_overrides_enabled() -> bool {
     std::env::var("KNOX_ALLOW_UNSAFE_OVERRIDES")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn verbose_sync_logs_enabled() -> bool {
+    std::env::var("KNOX_P2P_VERBOSE_SYNC_LOGS")
+        .ok()
+        .map(|v| {
+            let value = v.trim();
+            value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("yes")
+        })
         .unwrap_or(false)
 }
 
@@ -588,7 +601,8 @@ async fn send_to_peers(
             Vec::new()
         }
     };
-    if matches!(&env.msg, Message::GetBlocks { .. }) && !senders.is_empty() {
+    let verbose_sync_logs = verbose_sync_logs_enabled();
+    if verbose_sync_logs && matches!(&env.msg, Message::GetBlocks { .. }) && !senders.is_empty() {
         eprintln!("[p2p] DEBUG GetBlocks broadcast to {} peer(s)", senders.len());
     }
     if matches!(&env.msg, Message::Blocks(_)) {
@@ -599,10 +613,12 @@ async fn send_to_peers(
         // Consume exactly one queued requester per Blocks response so
         // concurrent sync requests do not cross-wire ranges across peers.
         if let Some(tx) = take_block_requester_sender(peers, block_requesters, first_h) {
-            eprintln!(
-                "[p2p] DEBUG Blocks routed to queued requester (first_h={})",
-                first_h.unwrap_or(0)
-            );
+            if verbose_sync_logs {
+                eprintln!(
+                    "[p2p] DEBUG Blocks routed to queued requester (first_h={})",
+                    first_h.unwrap_or(0)
+                );
+            }
             let env_clone = env.clone();
             tokio::spawn(async move {
                 let _ = tx.send(env_clone).await;
@@ -790,6 +806,13 @@ fn spawn_peer_writer(
     tokio::spawn(async move {
         let mut backoff = Duration::from_millis(500);
         let mut prng = LocalPrng::new(seed);
+        let reconnect_log_interval_ms = std::env::var("KNOX_P2P_RECONNECT_LOG_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_RECONNECT_LOG_INTERVAL_MS)
+            .clamp(1_000, 600_000);
+        let verbose_sync_logs = verbose_sync_logs_enabled();
+        let mut last_reconnect_log_ms = 0u64;
         loop {
             match TcpStream::connect(&peer).await {
                 Ok(mut stream) => {
@@ -903,7 +926,7 @@ fn spawn_peer_writer(
                         tokio::select! {
                             maybe_env = rx.recv() => {
                                 let Some(env_to_send) = maybe_env else { break; };
-                                if matches!(&env_to_send.msg, Message::GetBlocks { .. }) {
+                                if verbose_sync_logs && matches!(&env_to_send.msg, Message::GetBlocks { .. }) {
                                     eprintln!("[p2p] DEBUG writing GetBlocks to wire peer={}", peer);
                                 }
                                 if let Some(payload) = encode_envelope(&env_to_send, pad_bytes, &mut prng, session_key) {
@@ -918,21 +941,31 @@ fn spawn_peer_writer(
                                     note_block_requester(&block_requesters, &peer, *from_height);
                                 }
                                 if let Message::Blocks(ref blocks) = env.msg {
-                                    let first_h = blocks.first().map(|b| b.header.height).unwrap_or(0);
-                                    let last_h = blocks.last().map(|b| b.header.height).unwrap_or(0);
-                                    eprintln!(
-                                        "[p2p] DEBUG Blocks received from peer {} (count={}, first_h={}, last_h={}) (forwarding to core)",
-                                        peer,
-                                        blocks.len(),
-                                        first_h,
-                                        last_h
-                                    );
+                                    if verbose_sync_logs {
+                                        let first_h = blocks.first().map(|b| b.header.height).unwrap_or(0);
+                                        let last_h = blocks.last().map(|b| b.header.height).unwrap_or(0);
+                                        eprintln!(
+                                            "[p2p] DEBUG Blocks received from peer {} (count={}, first_h={}, last_h={}) (forwarding to core)",
+                                            peer,
+                                            blocks.len(),
+                                            first_h,
+                                            last_h
+                                        );
+                                    }
                                 }
                                 let _ = tx_in.send(env).await;
                             }
                         }
                     }
-                    eprintln!("[p2p] Reconnecting to {}", peer);
+                    let now = now_ms();
+                    if now.saturating_sub(last_reconnect_log_ms) >= reconnect_log_interval_ms {
+                        eprintln!(
+                            "[p2p] Reconnecting to {} (backoff={}ms)",
+                            peer,
+                            backoff.as_millis()
+                        );
+                        last_reconnect_log_ms = now;
+                    }
                     if let Ok(mut map) = peers.lock() {
                         map.remove(&peer);
                     }

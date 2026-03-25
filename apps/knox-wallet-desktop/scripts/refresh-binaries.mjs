@@ -9,6 +9,13 @@ const appRoot = path.resolve(__dirname, '..');
 const repoRoot = path.resolve(appRoot, '..', '..');
 const outDir = path.join(appRoot, 'bin');
 const exeExt = process.platform === 'win32' ? '.exe' : '';
+const defaultCargoTargetDir = path.join(repoRoot, 'target');
+const cargoTargetDir = (() => {
+  const raw = String(process.env.CARGO_TARGET_DIR || '').trim();
+  if (!raw) return defaultCargoTargetDir;
+  return path.isAbsolute(raw) ? raw : path.resolve(repoRoot, raw);
+})();
+const rustTarget = String(process.env.KNOX_RUST_TARGET || '').trim();
 const staleBuildDirs = [
   path.join(appRoot, 'dist'),
   path.join(appRoot, 'out'),
@@ -28,8 +35,37 @@ function run(cmd, args, cwd) {
   }
 }
 
+function cargoBuildArgs(t) {
+  const args = [
+    'build',
+    '-p', t.pkg,
+    '--bin', t.bin,
+    '--profile', 'release-lite',
+    '--target-dir', cargoTargetDir
+  ];
+  if (rustTarget) {
+    args.push('--target', rustTarget);
+  }
+  return args;
+}
+
 function resolveBuiltBinary(binName) {
+  if (rustTarget) {
+    const targetedCandidates = [
+      path.join(cargoTargetDir, rustTarget, 'release-lite', `${binName}${exeExt}`),
+      path.join(cargoTargetDir, rustTarget, 'release', `${binName}${exeExt}`)
+    ];
+    for (const c of targetedCandidates) {
+      if (fs.existsSync(c)) return c;
+    }
+    throw new Error(
+      `expected target-specific binary for ${binName} not found; looked in ${targetedCandidates.join(', ')}`
+    );
+  }
+
   const candidates = [
+    path.join(cargoTargetDir, 'release-lite', `${binName}${exeExt}`),
+    path.join(cargoTargetDir, 'release', `${binName}${exeExt}`),
     path.join(repoRoot, 'target', 'release-lite', `${binName}${exeExt}`),
     path.join(repoRoot, 'target', 'release', `${binName}${exeExt}`)
   ];
@@ -64,8 +100,12 @@ function purgeStaleOutputs() {
 purgeStaleOutputs();
 
 console.log('[binaries] building desktop runtime binaries...');
+console.log(`[binaries] cargo target dir: ${cargoTargetDir}`);
+if (rustTarget) {
+  console.log(`[binaries] rust target triple: ${rustTarget}`);
+}
 for (const t of targets) {
-  run('cargo', ['build', '-p', t.pkg, '--bin', t.bin, '--profile', 'release-lite'], repoRoot);
+  run('cargo', cargoBuildArgs(t), repoRoot);
 }
 
 console.log('[binaries] refreshing apps/knox-wallet-desktop/bin ...');

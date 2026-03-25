@@ -13,7 +13,7 @@ use knox_types::{
     hash_bytes, merkle_root, Address, Block, BlockHeader, Hash32, LatticeProof, SlashEvidence, Transaction,
     WalletRequest, WalletResponse,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,10 +38,17 @@ const DEFAULT_SYNC_BLOCKS_RESPONSE_MAX_BYTES: usize = 128 * 1024 * 1024;
 const SYNC_GETBLOCKS_MAX_COUNT: u32 = 512;
 const DEFAULT_SYNC_RETRY_MS: u64 = 1_000;
 const DEFAULT_SYNC_STALL_MS: u64 = 4_000;
+const SYNC_STALL_BACKOFF_CAP_MS: u64 = 30_000;
+const DEFAULT_SYNC_BOOTSTRAP_DORMANT_MS: u64 = 15_000;
+const SYNC_BOOTSTRAP_DORMANT_LOG_MS: u64 = 30_000;
+const SYNC_REQUEST_DEDUP_MS: u64 = 1_500;
+const MAX_RECENT_SYNC_REQUESTS: usize = 32;
 const DEFAULT_UPSTREAM_SYNC_TIMEOUT_MS: u64 = 120_000;
 const MAX_UPSTREAM_SYNC_BATCH_LOOPS: usize = 8;
 const DEFAULT_UPSTREAM_SYNC_BATCH_COUNT: u32 = 64;
 const CHAIN_CONTINUITY_CHECK_MS: u64 = 5_000;
+const DEFAULT_CHAIN_CONTINUITY_UNAVAILABLE_GRACE_MS: u64 = 20_000;
+const CHAIN_CONTINUITY_MISMATCH_RECOVERY_STREAK: u32 = 3;
 
 /// Grace period (ms) that non-elected miners must wait before proposing.
 /// Gives the ForgeTitan-elected leader time to submit first.
@@ -73,6 +80,190 @@ struct MinerInfo {
     first_seen_height: u64,
     /// Total blocks proposed within the scan window.
     blocks_in_window: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RecentSyncRequest {
+    from_height: u64,
+    sent_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChainCheckpoint {
+    height: u64,
+    hash: Hash32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalCheckpointStatus {
+    Pending,
+    Match,
+    Mismatch(Hash32),
+}
+
+fn parse_chain_checkpoint_env() -> Result<Option<ChainCheckpoint>, String> {
+    let combined = std::env::var("KNOX_CHAIN_CHECKPOINT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let height = std::env::var("KNOX_CHAIN_CHECKPOINT_HEIGHT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let hash = std::env::var("KNOX_CHAIN_CHECKPOINT_HASH")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    if let Some(spec) = combined {
+        if height.is_some() || hash.is_some() {
+            return Err(
+                "set either KNOX_CHAIN_CHECKPOINT or KNOX_CHAIN_CHECKPOINT_HEIGHT/KNOX_CHAIN_CHECKPOINT_HASH, not both"
+                    .to_string(),
+            );
+        }
+        return parse_chain_checkpoint_spec(&spec).map(Some);
+    }
+    match (height, hash) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            Err("both KNOX_CHAIN_CHECKPOINT_HEIGHT and KNOX_CHAIN_CHECKPOINT_HASH are required".to_string())
+        }
+        (Some(height), Some(hash)) => {
+            let parsed_height = height
+                .parse::<u64>()
+                .map_err(|_| format!("invalid KNOX_CHAIN_CHECKPOINT_HEIGHT '{}'", height))?;
+            let parsed_hash = parse_hash32_hex(&hash)
+                .map_err(|err| format!("invalid KNOX_CHAIN_CHECKPOINT_HASH: {}", err))?;
+            Ok(Some(ChainCheckpoint {
+                height: parsed_height,
+                hash: parsed_hash,
+            }))
+        }
+    }
+}
+
+fn parse_chain_checkpoint_spec(spec: &str) -> Result<ChainCheckpoint, String> {
+    let mut parts = spec.splitn(2, ':');
+    let height_part = parts.next().unwrap_or("").trim();
+    let hash_part = parts
+        .next()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "KNOX_CHAIN_CHECKPOINT must be '<height>:<64-hex-hash>'".to_string()
+        })?;
+    let parsed_height = height_part
+        .parse::<u64>()
+        .map_err(|_| format!("invalid checkpoint height '{}'", height_part))?;
+    let parsed_hash =
+        parse_hash32_hex(hash_part).map_err(|err| format!("invalid checkpoint hash: {}", err))?;
+    Ok(ChainCheckpoint {
+        height: parsed_height,
+        hash: parsed_hash,
+    })
+}
+
+fn parse_hash32_hex(input: &str) -> Result<Hash32, String> {
+    let hex = input
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| input.trim().strip_prefix("0X"))
+        .unwrap_or(input.trim());
+    if hex.len() != 64 {
+        return Err(format!("expected 64 hex chars, got {}", hex.len()));
+    }
+    let bytes = hex.as_bytes();
+    let mut out = [0u8; 32];
+    for idx in 0..32 {
+        let hi = decode_hex_nibble(bytes[idx * 2])?;
+        let lo = decode_hex_nibble(bytes[idx * 2 + 1])?;
+        out[idx] = (hi << 4) | lo;
+    }
+    Ok(Hash32(out))
+}
+
+fn decode_hex_nibble(ch: u8) -> Result<u8, String> {
+    match ch {
+        b'0'..=b'9' => Ok(ch - b'0'),
+        b'a'..=b'f' => Ok(ch - b'a' + 10),
+        b'A'..=b'F' => Ok(ch - b'A' + 10),
+        _ => Err(format!("invalid hex char '{}'", ch as char)),
+    }
+}
+
+fn checkpoint_mismatch_in_blocks(blocks: &[Block], checkpoint: ChainCheckpoint) -> Option<Hash32> {
+    blocks
+        .iter()
+        .find(|block| block.header.height == checkpoint.height)
+        .map(|block| hash_header_for_link(&block.header))
+        .filter(|hash| *hash != checkpoint.hash)
+}
+
+fn local_checkpoint_status(
+    ledger: &Ledger,
+    checkpoint: ChainCheckpoint,
+) -> Result<LocalCheckpointStatus, String> {
+    let local_tip = ledger.height().unwrap_or(0);
+    if local_tip < checkpoint.height {
+        return Ok(LocalCheckpointStatus::Pending);
+    }
+    let Some(block) = ledger.get_block(checkpoint.height)? else {
+        return Err(format!(
+            "local chain missing block at checkpoint height {}",
+            checkpoint.height
+        ));
+    };
+    let local_hash = hash_header_for_link(&block.header);
+    if local_hash == checkpoint.hash {
+        Ok(LocalCheckpointStatus::Match)
+    } else {
+        Ok(LocalCheckpointStatus::Mismatch(local_hash))
+    }
+}
+
+fn prune_recent_sync_requests(
+    recent_sync_requests: &mut VecDeque<RecentSyncRequest>,
+    now: u64,
+) {
+    while recent_sync_requests
+        .front()
+        .map(|req| now.saturating_sub(req.sent_at_ms) > SYNC_REQUEST_DEDUP_MS)
+        .unwrap_or(false)
+    {
+        recent_sync_requests.pop_front();
+    }
+}
+
+fn try_send_sync_getblocks(
+    network: &Network,
+    recent_sync_requests: &mut VecDeque<RecentSyncRequest>,
+    from_height: u64,
+    max_count: u32,
+    now: u64,
+    force: bool,
+) -> bool {
+    prune_recent_sync_requests(recent_sync_requests, now);
+    if !force
+        && recent_sync_requests
+            .iter()
+            .any(|req| req.from_height == from_height)
+    {
+        return false;
+    }
+    let sent = network.try_send(Message::GetBlocks {
+        from_height,
+        max_count,
+    });
+    if sent {
+        if recent_sync_requests.len() >= MAX_RECENT_SYNC_REQUESTS {
+            recent_sync_requests.pop_front();
+        }
+        recent_sync_requests.push_back(RecentSyncRequest {
+            from_height,
+            sent_at_ms: now,
+        });
+    }
+    sent
 }
 
 /// Build the active miner registry by scanning the last WINDOW blocks.
@@ -294,6 +485,54 @@ struct PendingMiningProposal {
         tokio::sync::oneshot::Receiver<Result<(LatticeProof, String), String>>,
 }
 
+fn proposal_target_matches_current_chain(
+    ledger: &Ledger,
+    proposal_height: u64,
+    proposal_prev: Hash32,
+) -> bool {
+    let has_genesis = ledger.get_block(0).ok().flatten().is_some();
+    let expected_height = if has_genesis {
+        ledger.height().unwrap_or(0).saturating_add(1)
+    } else {
+        0
+    };
+    if proposal_height != expected_height {
+        return false;
+    }
+    if proposal_height == 0 {
+        return true;
+    }
+    let Some(parent) = ledger
+        .get_block(proposal_height.saturating_sub(1))
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    hash_header_for_link(&parent.header) == proposal_prev
+}
+
+fn cancel_pending_mining_if_stale(
+    ledger: &Arc<Mutex<Ledger>>,
+    pending_mining: &mut Option<PendingMiningProposal>,
+    reason: &str,
+) {
+    let Some((height, prev)) = pending_mining
+        .as_ref()
+        .map(|pending| (pending.header.height, pending.header.prev))
+    else {
+        return;
+    };
+    let still_current = match ledger.lock() {
+        Ok(l) => proposal_target_matches_current_chain(&l, height, prev),
+        Err(_) => false,
+    };
+    if !still_current {
+        eprintln!("[StarForge] cancel pending mining h={} — {}", height, reason);
+        *pending_mining = None;
+    }
+}
+
 pub struct Node {
     ledger: Arc<Mutex<Ledger>>,
     network: Network,
@@ -413,11 +652,13 @@ impl Node {
         let diamond_auth_quorum = self.diamond_auth_quorum.max(1);
         let diamond_auth_endpoints = self.diamond_auth_endpoints.clone();
         let mut last_propose_ms = 0u64;
+        let mainnet_locked =
+            std::env::var("KNOX_MAINNET_LOCK").ok().as_deref() == Some("1");
         let min_peers_for_mining = std::env::var("KNOX_MIN_PEERS_FOR_MINING")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(1);
-        let min_local_height_for_mining = std::env::var("KNOX_MIN_LOCAL_HEIGHT_FOR_MINING")
+            .unwrap_or(0);
+        let mut min_local_height_for_mining = std::env::var("KNOX_MIN_LOCAL_HEIGHT_FOR_MINING")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(0);
@@ -434,6 +675,9 @@ impl Node {
         let mut chain_continuity_reason = String::new();
         let mut last_chain_continuity_check_ms = 0u64;
         let mut last_chain_continuity_log_ms = 0u64;
+        let mut last_chain_continuity_ok_ms = 0u64;
+        let mut chain_continuity_mismatch_streak = 0u32;
+        let mut last_chain_continuity_mismatch_signature = String::new();
         let mut last_backend_line = String::new();
         // ForgeTitan election: miners query upstream RPC for the elected
         // leader before proposing.  The election is computed from chain state
@@ -459,6 +703,11 @@ impl Node {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(DEFAULT_SYNC_STALL_MS)
             .max(sync_retry_ms);
+        let sync_bootstrap_dormant_ms = std::env::var("KNOX_SYNC_BOOTSTRAP_DORMANT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SYNC_BOOTSTRAP_DORMANT_MS)
+            .clamp(5_000, 3_600_000);
         let upstream_sync_timeout = Duration::from_millis(
             std::env::var("KNOX_NODE_UPSTREAM_SYNC_TIMEOUT_MS")
                 .ok()
@@ -472,13 +721,69 @@ impl Node {
             .unwrap_or(DEFAULT_UPSTREAM_SYNC_BATCH_COUNT)
             .clamp(1, MAX_RPC_BLOCKS);
         let mut current_upstream_sync_batch_count = upstream_sync_batch_count;
+        let chain_continuity_fail_closed = std::env::var("KNOX_CHAIN_CONTINUITY_FAIL_CLOSED")
+            .ok()
+            .map(|v| {
+                let value = v.trim().to_ascii_lowercase();
+                !matches!(value.as_str(), "0" | "false" | "no")
+            })
+            .unwrap_or(mainnet_locked);
+        let chain_continuity_unavailable_grace_ms = std::env::var(
+            "KNOX_CHAIN_CONTINUITY_UNAVAILABLE_GRACE_MS",
+        )
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CHAIN_CONTINUITY_UNAVAILABLE_GRACE_MS)
+        .clamp(5_000, 300_000);
         let upstream_sync_rpc = std::env::var("KNOX_NODE_UPSTREAM_RPC")
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        let mut chain_checkpoint_config_error: Option<String> = None;
+        let chain_checkpoint = match parse_chain_checkpoint_env() {
+            Ok(checkpoint) => checkpoint,
+            Err(err) => {
+                chain_checkpoint_config_error = Some(err.clone());
+                chain_continuity_ok = false;
+                chain_continuity_reason =
+                    format!("invalid checkpoint configuration: {}", err);
+                None
+            }
+        };
+        if let Some(checkpoint) = chain_checkpoint {
+            eprintln!(
+                "[StarForge] canonical checkpoint enabled h={} hash={}",
+                checkpoint.height,
+                hex_hash(checkpoint.hash)
+            );
+        }
+        if let Some(err) = chain_checkpoint_config_error.as_deref() {
+            eprintln!(
+                "[StarForge] checkpoint configuration error: {}",
+                err
+            );
+        }
         if upstream_sync_rpc.is_none() {
-            chain_continuity_ok = true;
-            chain_continuity_checked_once = true;
+            if chain_continuity_fail_closed {
+                chain_continuity_ok = false;
+                chain_continuity_reason =
+                    "canonical upstream RPC not configured".to_string();
+                eprintln!(
+                    "[StarForge] canonical chain enforcement active — KNOX_NODE_UPSTREAM_RPC is required in mainnet lock mode"
+                );
+            } else {
+                chain_continuity_ok = true;
+                chain_continuity_checked_once = true;
+                last_chain_continuity_ok_ms = now_ms();
+            }
+        } else if chain_continuity_fail_closed {
+            chain_continuity_ok = false;
+            chain_continuity_reason = "awaiting trusted chain continuity check".to_string();
+            eprintln!(
+                "[StarForge] canonical continuity fail-closed enabled — mining waits for verified continuity"
+            );
+        } else {
+            last_chain_continuity_ok_ms = now_ms();
         }
         eprintln!(
             "[StarForge] upstream sync config batch={} timeout_ms={} rpc={}",
@@ -501,6 +806,7 @@ impl Node {
             Some("1" | "true" | "yes")
         );
         let mut last_sync_request_ms = 0u64;
+        let mut consecutive_stall_syncs: u32 = 0;
         let mut last_sync_progress_ms = now_ms();
         let mut last_sync_progress_height = ledger
             .lock()
@@ -518,6 +824,13 @@ impl Node {
         let mut pending_mining: Option<PendingMiningProposal> = None;
         let mut last_getblocks_served_up_to: u64 = 0;
         let mut last_getblocks_served_ms: u64 = 0;
+        let mut last_getblocks_empty_height: u64 = 0;
+        let mut last_getblocks_empty_ms: u64 = 0;
+        let mut recent_sync_requests = VecDeque::with_capacity(8);
+        let mut bootstrap_sync_dormant = false;
+        let mut bootstrap_sync_dormant_since_ms = 0u64;
+        let mut last_bootstrap_dormant_log_ms = 0u64;
+        let mut last_active_peers = network.active_peer_count();
 
         // If ledger is empty (no genesis yet), proactively request from h=0
         // after peers have had time to connect.
@@ -561,6 +874,19 @@ impl Node {
                                 continue;
                             }
                         };
+                        let proposal_still_current = match ledger.lock() {
+                            Ok(l) => {
+                                proposal_target_matches_current_chain(&l, header.height, header.prev)
+                            }
+                            Err(_) => false,
+                        };
+                        if !proposal_still_current {
+                            eprintln!(
+                                "[StarForge] discard stale mined proposal h={} — chain changed while proof was running",
+                                header.height
+                            );
+                            continue;
+                        }
                         if backend_line != last_backend_line {
                             eprintln!("[StarForge] mining_runtime {}", backend_line);
                             last_backend_line = backend_line;
@@ -593,10 +919,38 @@ impl Node {
                                 }
                             }
                         }
+                        let proposal_still_current = match ledger.lock() {
+                            Ok(l) => {
+                                proposal_target_matches_current_chain(&l, block.header.height, block.header.prev)
+                            }
+                            Err(_) => false,
+                        };
+                        if !proposal_still_current {
+                            eprintln!(
+                                "[StarForge] discard stale mined proposal h={} — chain changed before finalize",
+                                block.header.height
+                            );
+                            continue;
+                        }
+                        if let Some(checkpoint) = chain_checkpoint {
+                            if block.header.height == checkpoint.height {
+                                let local_hash = hash_header_for_link(&block.header);
+                                if local_hash != checkpoint.hash {
+                                    eprintln!(
+                                        "[StarForge] reject local proposal h={} checkpoint mismatch expected={} got={}",
+                                        checkpoint.height,
+                                        hex_hash(checkpoint.hash),
+                                        hex_hash(local_hash)
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         if append_finalized_block(&block, &ledger, &mempool) {
                             if block.header.height > last_sync_progress_height {
                                 last_sync_progress_height = block.header.height;
                                 last_sync_progress_ms = now_ms();
+                                consecutive_stall_syncs = 0;
                             }
                             network.try_send(Message::Block(block));
                         }
@@ -654,6 +1008,39 @@ impl Node {
                             }
                         }
                         Message::Block(block) => {
+                            if bootstrap_sync_dormant {
+                                bootstrap_sync_dormant = false;
+                                bootstrap_sync_dormant_since_ms = 0;
+                                last_bootstrap_dormant_log_ms = 0;
+                                bootstrap_genesis_stall_count = 0;
+                                last_sync_request_ms = 0;
+                                eprintln!(
+                                    "[StarForge] waking sync from dormancy: received peer block h={}",
+                                    block.header.height
+                                );
+                            }
+                            if let Some(checkpoint) = chain_checkpoint {
+                                if block.header.height == checkpoint.height {
+                                    let peer_hash = hash_header_for_link(&block.header);
+                                    if peer_hash != checkpoint.hash {
+                                        if sync_conflict_height == checkpoint.height {
+                                            sync_conflict_hits =
+                                                sync_conflict_hits.saturating_add(1);
+                                        } else {
+                                            sync_conflict_height = checkpoint.height;
+                                            sync_conflict_hits = 1;
+                                        }
+                                        eprintln!(
+                                            "[StarForge] reject peer block h={} checkpoint mismatch expected={} got={} hit={}",
+                                            checkpoint.height,
+                                            hex_hash(checkpoint.hash),
+                                            hex_hash(peer_hash),
+                                            sync_conflict_hits
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
                             let verify = match ledger.lock() {
                                 Ok(l) => l.verify_block(&block),
                                 Err(_) => Err("ledger lock poisoned".to_string()),
@@ -666,6 +1053,11 @@ impl Node {
                                             last_sync_progress_height = block.header.height;
                                             last_sync_progress_ms = now_ms();
                                         }
+                                        cancel_pending_mining_if_stale(
+                                            &ledger,
+                                            &mut pending_mining,
+                                            "peer block advanced local chain",
+                                        );
                                         network.try_send(Message::Block(block));
                                     } else if block.header.height > 0 {
                                         // append failed with "already exists" — check if we need
@@ -723,21 +1115,36 @@ impl Node {
                                             if guard_until > fork_guard_pause_until_ms {
                                                 fork_guard_pause_until_ms = guard_until;
                                             }
-                                            eprintln!(
-                                                "[StarForge] fork guard active ({} ms) — requesting sync from h={}",
-                                                fork_guard_pause_ms, from
-                                            );
-                                        } else {
-                                            eprintln!(
-                                                "[StarForge] ignoring far-ahead proposal h={} (local_tip={}, gap={}) — requesting forward sync from h={}",
-                                                block.header.height, our_tip, height_gap, from
-                                            );
+                                            if pending_mining.is_some() {
+                                                eprintln!(
+                                                    "[StarForge] fork guard canceling pending mining at local tip {}",
+                                                    our_tip
+                                                );
+                                                pending_mining = None;
+                                            }
                                         }
-                                        network
-                                            .try_send(Message::GetBlocks {
-                                                from_height: from,
-                                                max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                                            });
+                                        let sent_at = now_ms();
+                                        if try_send_sync_getblocks(
+                                            &network,
+                                            &mut recent_sync_requests,
+                                            from,
+                                            SYNC_GETBLOCKS_MAX_COUNT,
+                                            sent_at,
+                                            false,
+                                        ) {
+                                            if height_gap <= 8 {
+                                                eprintln!(
+                                                    "[StarForge] fork guard active ({} ms) — requesting sync from h={}",
+                                                    fork_guard_pause_ms, from
+                                                );
+                                            } else {
+                                                eprintln!(
+                                                    "[StarForge] ignoring far-ahead proposal h={} (local_tip={}, gap={}) — requesting forward sync from h={}",
+                                                    block.header.height, our_tip, height_gap, from
+                                                );
+                                            }
+                                            last_sync_request_ms = sent_at;
+                                        }
                                     }
                                 }
                             }
@@ -750,6 +1157,14 @@ impl Node {
                                 let now_dedup = now_ms();
                                 if from_height < last_getblocks_served_up_to
                                     && now_dedup.saturating_sub(last_getblocks_served_ms) < 3_000
+                                {
+                                    continue;
+                                }
+                                // Also skip if we recently had nothing to serve for
+                                // this height — prevents empty-response flood.
+                                if from_height >= last_getblocks_empty_height
+                                    && last_getblocks_empty_height > 0
+                                    && now_dedup.saturating_sub(last_getblocks_empty_ms) < 5_000
                                 {
                                     continue;
                                 }
@@ -793,10 +1208,28 @@ impl Node {
                                 if !sent {
                                     eprintln!("[StarForge] WARN: Blocks try_send failed (outbound full) for h={}", from_height);
                                 }
+                            } else {
+                                // Nothing to serve — record so we can skip duplicate
+                                // requests for this height for a few seconds.
+                                last_getblocks_empty_height = from_height;
+                                last_getblocks_empty_ms = now_ms();
                             }
                         }
                         Message::Blocks(blocks) => {
                             if !blocks.is_empty() {
+                                if bootstrap_sync_dormant {
+                                    let first_h =
+                                        blocks.first().map(|b| b.header.height).unwrap_or(0);
+                                    bootstrap_sync_dormant = false;
+                                    bootstrap_sync_dormant_since_ms = 0;
+                                    last_bootstrap_dormant_log_ms = 0;
+                                    bootstrap_genesis_stall_count = 0;
+                                    last_sync_request_ms = 0;
+                                    eprintln!(
+                                        "[StarForge] waking sync from dormancy: received block batch from h={}",
+                                        first_h
+                                    );
+                                }
                                 last_blocks_response_ms = now_ms();
                                 let first_h = blocks.first().map(|b| b.header.height).unwrap_or(0);
                                 let last_h = blocks.last().map(|b| b.header.height).unwrap_or(0);
@@ -806,6 +1239,41 @@ impl Node {
                                     first_h,
                                     last_h
                                 );
+                                // Raise the mining gate if peers are ahead of our initial tip.
+                                if min_local_height_for_mining > 0 && last_h > min_local_height_for_mining {
+                                    eprintln!(
+                                        "[StarForge] raising mining gate {} -> {} (peer blocks ahead)",
+                                        min_local_height_for_mining, last_h
+                                    );
+                                    min_local_height_for_mining = last_h;
+                                }
+                            }
+                            if let Some(checkpoint) = chain_checkpoint {
+                                if let Some(peer_hash) =
+                                    checkpoint_mismatch_in_blocks(&blocks, checkpoint)
+                                {
+                                    let first_h =
+                                        blocks.first().map(|b| b.header.height).unwrap_or(0);
+                                    let last_h =
+                                        blocks.last().map(|b| b.header.height).unwrap_or(0);
+                                    if sync_conflict_height == checkpoint.height {
+                                        sync_conflict_hits =
+                                            sync_conflict_hits.saturating_add(1);
+                                    } else {
+                                        sync_conflict_height = checkpoint.height;
+                                        sync_conflict_hits = 1;
+                                    }
+                                    eprintln!(
+                                        "[StarForge] reject sync batch range={}..{} checkpoint mismatch h={} expected={} got={} hit={}",
+                                        first_h,
+                                        last_h,
+                                        checkpoint.height,
+                                        hex_hash(checkpoint.hash),
+                                        hex_hash(peer_hash),
+                                        sync_conflict_hits
+                                    );
+                                    continue;
+                                }
                             }
                             let batch_result = match ledger.lock() {
                                 Ok(l) => l.append_sync_batch(&blocks),
@@ -831,6 +1299,11 @@ impl Node {
                                     last_sync_progress_ms = now_ms();
                                 }
                                 genesis_mismatch_hits = 0;
+                                cancel_pending_mining_if_stale(
+                                    &ledger,
+                                    &mut pending_mining,
+                                    "sync batch advanced local chain",
+                                );
                             }
                             if let (Some(stop_height), Some(e)) =
                                 (batch_result.stop_height, batch_result.stop_error.as_deref())
@@ -886,16 +1359,21 @@ impl Node {
                                     // If the entire batch is already behind local tip, immediately
                                     // ask forward again instead of waiting for the stall ticker.
                                     let from = local_tip.saturating_add(1);
-                                    eprintln!(
-                                        "[StarForge] sync stale batch behind tip (local_tip={}) — requesting sync from h={}",
-                                        local_tip, from
-                                    );
-                                    network
-                                        .try_send(Message::GetBlocks {
-                                            from_height: from,
-                                            max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                                        });
-                                    last_sync_request_ms = now_ms();
+                                    let sent_at = now_ms();
+                                    if try_send_sync_getblocks(
+                                        &network,
+                                        &mut recent_sync_requests,
+                                        from,
+                                        SYNC_GETBLOCKS_MAX_COUNT,
+                                        sent_at,
+                                        false,
+                                    ) {
+                                        eprintln!(
+                                            "[StarForge] sync stale batch behind tip (local_tip={}) — requesting sync from h={}",
+                                            local_tip, from
+                                        );
+                                        last_sync_request_ms = sent_at;
+                                    }
                                 }
                                 let allow_mining_node_reset = min_local_height_for_mining > 0
                                     && local_tip.saturating_add(1) < min_local_height_for_mining;
@@ -927,12 +1405,18 @@ impl Node {
                                             sync_conflict_height = 0;
                                             fork_oo_stall_count = 0;
                                             fork_oo_peer_max_h = 0;
-                                            network
-                                                .try_send(Message::GetBlocks {
-                                                    from_height: 0,
-                                                    max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                                                });
-                                            last_sync_request_ms = now_ms();
+                                            recent_sync_requests.clear();
+                                            let sent_at = now_ms();
+                                            if try_send_sync_getblocks(
+                                                &network,
+                                                &mut recent_sync_requests,
+                                                0,
+                                                SYNC_GETBLOCKS_MAX_COUNT,
+                                                sent_at,
+                                                true,
+                                            ) {
+                                                last_sync_request_ms = sent_at;
+                                            }
                                         }
                                         Err(err) => {
                                             eprintln!(
@@ -999,12 +1483,18 @@ impl Node {
                                                 sync_conflict_height = 0;
                                                 fork_oo_stall_count = 0;
                                                 fork_oo_peer_max_h = 0;
-                                                network
-                                                    .try_send(Message::GetBlocks {
-                                                        from_height: 0,
-                                                        max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                                                    });
-                                                last_sync_request_ms = now_ms();
+                                                recent_sync_requests.clear();
+                                                let sent_at = now_ms();
+                                                if try_send_sync_getblocks(
+                                                    &network,
+                                                    &mut recent_sync_requests,
+                                                    0,
+                                                    SYNC_GETBLOCKS_MAX_COUNT,
+                                                    sent_at,
+                                                    true,
+                                                ) {
+                                                    last_sync_request_ms = sent_at;
+                                                }
                                             }
                                             Err(err) => {
                                                 eprintln!(
@@ -1026,20 +1516,38 @@ impl Node {
                                     Ok(l) => l.height().unwrap_or(0).saturating_add(1),
                                     Err(_) => 0,
                                 };
-                                eprintln!(
-                                    "[StarForge] sync continue from h={} after progressing {} block(s)",
+                                let sent_at = now_ms();
+                                if try_send_sync_getblocks(
+                                    &network,
+                                    &mut recent_sync_requests,
                                     next_from,
-                                    progressed_count
-                                );
-                                network
-                                    .try_send(Message::GetBlocks {
-                                        from_height: next_from,
-                                        max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                                    });
-                                last_sync_request_ms = now_ms();
+                                    SYNC_GETBLOCKS_MAX_COUNT,
+                                    sent_at,
+                                    false,
+                                ) {
+                                    eprintln!(
+                                        "[StarForge] sync continue from h={} after progressing {} block(s)",
+                                        next_from,
+                                        progressed_count
+                                    );
+                                    last_sync_request_ms = sent_at;
+                                }
                             }
                         }
                         Message::Vote(_) => {}
+                        Message::Handshake { tip, .. } => {
+                            if bootstrap_sync_dormant && tip > 0 {
+                                bootstrap_sync_dormant = false;
+                                bootstrap_sync_dormant_since_ms = 0;
+                                last_bootstrap_dormant_log_ms = 0;
+                                bootstrap_genesis_stall_count = 0;
+                                last_sync_request_ms = 0;
+                                eprintln!(
+                                    "[StarForge] waking sync from dormancy: peer handshake advertises tip={}",
+                                    tip
+                                );
+                            }
+                        }
                         Message::TimeoutVote(_) => {}
                         Message::TimeoutCertificate(_) => {}
                         Message::Slash(ev) => {
@@ -1056,7 +1564,104 @@ impl Node {
                 }
                 _ = ticker.tick() => {
                     let now = now_ms();
+                    let prev_active_peers = last_active_peers;
                     let active_peers = network.active_peer_count();
+                    if bootstrap_sync_dormant && active_peers > prev_active_peers {
+                        bootstrap_sync_dormant = false;
+                        bootstrap_sync_dormant_since_ms = 0;
+                        last_bootstrap_dormant_log_ms = 0;
+                        bootstrap_genesis_stall_count = 0;
+                        last_sync_request_ms = 0;
+                        eprintln!(
+                            "[StarForge] waking sync from dormancy: peers {} -> {}",
+                            prev_active_peers, active_peers
+                        );
+                    }
+                    last_active_peers = active_peers;
+                    if let Some(checkpoint) = chain_checkpoint {
+                        let checkpoint_status = match ledger.lock() {
+                            Ok(l) => local_checkpoint_status(&l, checkpoint),
+                            Err(_) => Err("ledger lock poisoned".to_string()),
+                        };
+                        match checkpoint_status {
+                            Ok(LocalCheckpointStatus::Pending) | Ok(LocalCheckpointStatus::Match) => {}
+                            Ok(LocalCheckpointStatus::Mismatch(local_hash)) => {
+                                chain_continuity_ok = false;
+                                chain_continuity_checked_once = true;
+                                chain_continuity_reason = format!(
+                                    "checkpoint mismatch at h={} local={} expected={}",
+                                    checkpoint.height,
+                                    hex_hash(local_hash),
+                                    hex_hash(checkpoint.hash)
+                                );
+                                if now.saturating_sub(last_chain_continuity_log_ms) >= 10_000 {
+                                    eprintln!(
+                                        "[StarForge] checkpoint mismatch at h={} local={} expected={} — mining disabled until checkpoint realigns",
+                                        checkpoint.height,
+                                        hex_hash(local_hash),
+                                        hex_hash(checkpoint.hash)
+                                    );
+                                    last_chain_continuity_log_ms = now;
+                                }
+                                if sync_auto_reset_on_conflict {
+                                    eprintln!(
+                                        "[StarForge] checkpoint recovery: clearing local chain for full resync"
+                                    );
+                                    let cleared = match ledger.lock() {
+                                        Ok(l) => l.clear_chain(),
+                                        Err(_) => Err("ledger lock poisoned".to_string()),
+                                    };
+                                    match cleared {
+                                        Ok(()) => {
+                                            last_sync_progress_height = 0;
+                                            last_sync_progress_ms = now_ms();
+                                            last_blocks_response_ms = now_ms();
+                                            bootstrap_genesis_stall_count = 0;
+                                            genesis_mismatch_hits = 0;
+                                            sync_conflict_hits = 0;
+                                            sync_conflict_height = 0;
+                                            fork_oo_stall_count = 0;
+                                            fork_oo_peer_max_h = 0;
+                                            chain_continuity_ok = false;
+                                            chain_continuity_checked_once = false;
+                                            pending_mining = None;
+                                            recent_sync_requests.clear();
+                                            let sent_at = now_ms();
+                                            if try_send_sync_getblocks(
+                                                &network,
+                                                &mut recent_sync_requests,
+                                                0,
+                                                SYNC_GETBLOCKS_MAX_COUNT,
+                                                sent_at,
+                                                true,
+                                            ) {
+                                                last_sync_request_ms = sent_at;
+                                            }
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            eprintln!(
+                                                "[StarForge] checkpoint recovery failed: {}",
+                                                err
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                chain_continuity_ok = false;
+                                chain_continuity_reason =
+                                    format!("checkpoint verification failed: {}", err);
+                                if now.saturating_sub(last_chain_continuity_log_ms) >= 10_000 {
+                                    eprintln!(
+                                        "[StarForge] checkpoint verification error: {}",
+                                        err
+                                    );
+                                    last_chain_continuity_log_ms = now;
+                                }
+                            }
+                        }
+                    }
                     if let Some(upstream_rpc) = upstream_sync_rpc.as_deref() {
                         if now.saturating_sub(last_chain_continuity_check_ms) >= CHAIN_CONTINUITY_CHECK_MS {
                             last_chain_continuity_check_ms = now;
@@ -1066,6 +1671,9 @@ impl Node {
                                     if status.ok {
                                         chain_continuity_ok = true;
                                         chain_continuity_reason.clear();
+                                        last_chain_continuity_ok_ms = now;
+                                        chain_continuity_mismatch_streak = 0;
+                                        last_chain_continuity_mismatch_signature.clear();
                                     } else {
                                         chain_continuity_ok = false;
                                         chain_continuity_reason = format!(
@@ -1074,6 +1682,22 @@ impl Node {
                                             status.local_hash,
                                             status.upstream_hash
                                         );
+                                        let mismatch_signature = format!(
+                                            "{}:{}:{}",
+                                            status.shared_height,
+                                            status.local_hash,
+                                            status.upstream_hash
+                                        );
+                                        if mismatch_signature
+                                            == last_chain_continuity_mismatch_signature
+                                        {
+                                            chain_continuity_mismatch_streak =
+                                                chain_continuity_mismatch_streak.saturating_add(1);
+                                        } else {
+                                            last_chain_continuity_mismatch_signature =
+                                                mismatch_signature;
+                                            chain_continuity_mismatch_streak = 1;
+                                        }
                                         if now.saturating_sub(last_chain_continuity_log_ms) >= 10_000 {
                                             eprintln!(
                                                 "[StarForge] chain continuity mismatch at h={} (local_tip={} upstream_tip={}) local={} upstream={} — mining disabled until chain realigns",
@@ -1085,15 +1709,36 @@ impl Node {
                                             );
                                             last_chain_continuity_log_ms = now;
                                         }
-                                        // When the mismatch is at or near the tip, the local
-                                        // chain has diverged.  Clear and resync immediately
-                                        // rather than waiting for 5+ P2P conflict hits.
+                                        // Recover not only immediate tip divergence, but also
+                                        // persistent continuity mismatch while sync remains stalled.
+                                        let tip_diverged = status.shared_height
+                                            >= status.local_tip.saturating_sub(1);
+                                        let persistent_stalled_mismatch = status.local_tip
+                                            > status.shared_height.saturating_add(1)
+                                            && now.saturating_sub(last_sync_progress_ms)
+                                                >= sync_stall_ms
+                                            && chain_continuity_mismatch_streak
+                                                >= CHAIN_CONTINUITY_MISMATCH_RECOVERY_STREAK;
                                         if sync_auto_reset_on_conflict
-                                            && status.shared_height >= status.local_tip.saturating_sub(1)
+                                            && (tip_diverged || persistent_stalled_mismatch)
                                         {
+                                            let recovery_reason = if tip_diverged {
+                                                format!(
+                                                    "tip diverged at h={}",
+                                                    status.shared_height
+                                                )
+                                            } else {
+                                                format!(
+                                                    "persistent mismatch while stalled (streak={} shared_h={} local_tip={} upstream_tip={})",
+                                                    chain_continuity_mismatch_streak,
+                                                    status.shared_height,
+                                                    status.local_tip,
+                                                    status.upstream_tip
+                                                )
+                                            };
                                             eprintln!(
-                                                "[StarForge] chain continuity recovery: tip diverged at h={} — clearing ledger for full resync",
-                                                status.shared_height
+                                                "[StarForge] chain continuity recovery: {} — clearing ledger for full resync",
+                                                recovery_reason
                                             );
                                             let cleared = match ledger.lock() {
                                                 Ok(l) => l.clear_chain(),
@@ -1112,13 +1757,22 @@ impl Node {
                                                     fork_oo_peer_max_h = 0;
                                                     chain_continuity_ok = false;
                                                     chain_continuity_checked_once = false;
+                                                    chain_continuity_mismatch_streak = 0;
+                                                    last_chain_continuity_mismatch_signature
+                                                        .clear();
                                                     pending_mining = None;
-                                                    network
-                                                        .try_send(Message::GetBlocks {
-                                                            from_height: 0,
-                                                            max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                                                        });
-                                                    last_sync_request_ms = now_ms();
+                                                    recent_sync_requests.clear();
+                                                    let sent_at = now_ms();
+                                                    if try_send_sync_getblocks(
+                                                        &network,
+                                                        &mut recent_sync_requests,
+                                                        0,
+                                                        SYNC_GETBLOCKS_MAX_COUNT,
+                                                        sent_at,
+                                                        true,
+                                                    ) {
+                                                        last_sync_request_ms = sent_at;
+                                                    }
                                                 }
                                                 Err(err) => {
                                                     eprintln!(
@@ -1130,11 +1784,37 @@ impl Node {
                                         }
                                     }
                                 }
-                                Ok(None) => {}
+                                Ok(None) => {
+                                    chain_continuity_mismatch_streak = 0;
+                                    last_chain_continuity_mismatch_signature.clear();
+                                    if chain_continuity_fail_closed {
+                                        chain_continuity_ok = false;
+                                        if chain_continuity_reason.is_empty() {
+                                            chain_continuity_reason =
+                                                "waiting for continuity anchor".to_string();
+                                        }
+                                    }
+                                }
                                 Err(err) => {
-                                    // RPC timeouts/errors should NOT block mining when
-                                    // we haven't yet proven a mismatch — only an actual
-                                    // mismatch (detected above) should disable mining.
+                                    chain_continuity_mismatch_streak = 0;
+                                    last_chain_continuity_mismatch_signature.clear();
+                                    if chain_continuity_fail_closed {
+                                        let unavailable_ms =
+                                            now.saturating_sub(last_chain_continuity_ok_ms);
+                                        if !chain_continuity_checked_once
+                                            || unavailable_ms >= chain_continuity_unavailable_grace_ms
+                                        {
+                                            chain_continuity_ok = false;
+                                            chain_continuity_reason = if chain_continuity_checked_once {
+                                                format!(
+                                                    "trusted continuity unavailable for {} ms",
+                                                    unavailable_ms
+                                                )
+                                            } else {
+                                                "awaiting first trusted continuity check".to_string()
+                                            };
+                                        }
+                                    }
                                     if now.saturating_sub(last_chain_continuity_log_ms) >= 10_000 {
                                         eprintln!("[StarForge] chain continuity check unavailable: {}", err);
                                         last_chain_continuity_log_ms = now;
@@ -1151,8 +1831,9 @@ impl Node {
                         };
                         let must_catch_up = min_local_height_for_mining > 0
                             && local_tip < min_local_height_for_mining;
+                        let should_try_upstream_sync = must_catch_up || local_tip == 0;
                         let stalled_rpc = now.saturating_sub(last_sync_progress_ms) >= sync_retry_ms;
-                        if must_catch_up && stalled_rpc {
+                        if should_try_upstream_sync && stalled_rpc {
                             let mut batch_loops = 0usize;
                             // When genesis is missing, request from h=0 so the
                             // upstream RPC sends the genesis block first.
@@ -1188,6 +1869,29 @@ impl Node {
                                             first_h,
                                             last_h
                                         );
+                                        if let Some(checkpoint) = chain_checkpoint {
+                                            if let Some(peer_hash) =
+                                                checkpoint_mismatch_in_blocks(&blocks, checkpoint)
+                                            {
+                                                if sync_conflict_height == checkpoint.height {
+                                                    sync_conflict_hits =
+                                                        sync_conflict_hits.saturating_add(1);
+                                                } else {
+                                                    sync_conflict_height = checkpoint.height;
+                                                    sync_conflict_hits = 1;
+                                                }
+                                                eprintln!(
+                                                    "[StarForge] upstream sync rejected range={}..{} checkpoint mismatch h={} expected={} got={} hit={}",
+                                                    first_h,
+                                                    last_h,
+                                                    checkpoint.height,
+                                                    hex_hash(checkpoint.hash),
+                                                    hex_hash(peer_hash),
+                                                    sync_conflict_hits
+                                                );
+                                                break;
+                                            }
+                                        }
                                         let batch_result = match ledger.lock() {
                                             Ok(l) => l.append_sync_batch(&blocks),
                                             Err(_) => {
@@ -1214,6 +1918,11 @@ impl Node {
                                                 last_sync_progress_ms = now_ms();
                                             }
                                             genesis_mismatch_hits = 0;
+                                            cancel_pending_mining_if_stale(
+                                                &ledger,
+                                                &mut pending_mining,
+                                                "upstream sync advanced local chain",
+                                            );
                                         }
                                         if batch_result.skipped_out_of_order > 0 {
                                             let local_tip = match ledger.lock() {
@@ -1332,67 +2041,135 @@ impl Node {
                         let stalled = has_genesis
                             && tip <= last_sync_progress_height
                             && now.saturating_sub(last_sync_progress_ms) >= sync_stall_ms;
-                        if !has_genesis || bootstrap_has_genesis || stalled {
-                            let no_block_response_ms = now.saturating_sub(last_blocks_response_ms);
-                            let dual_probe = bootstrap_has_genesis
-                                && bootstrap_genesis_stall_count >= 3
-                                && no_block_response_ms >= sync_stall_ms;
-                            let from = if !has_genesis {
-                                0
-                            } else if bootstrap_has_genesis {
-                                // Prefer h=1 during normal bootstrap. If this repeats while tip stays at 0,
-                                // fall back to h=0 so peers can resend genesis + first blocks.
-                                if bootstrap_genesis_stall_count >= 3 { 0 } else { 1 }
-                            } else {
-                                // When stalled above genesis, request from tip+1 (forward progress lane).
-                                // Requesting tip-2 can loop forever when peers chunk responses by byte-size,
-                                // repeatedly returning already-known low-height blocks.
-                                tip.saturating_add(1)
-                            };
-                            let reason = if !has_genesis {
-                                "bootstrap-no-genesis"
-                            } else if bootstrap_has_genesis {
-                                if from == 0 {
-                                    "bootstrap-has-genesis-fallback0"
-                                } else {
-                                    "bootstrap-has-genesis"
-                                }
-                            } else {
-                                "stalled"
-                            };
-                            eprintln!(
-                                "[StarForge] sync request from h={} (tip={}, peers={}, reason={})",
-                                from, tip, active_peers, reason
-                            );
-                            network
-                                .try_send(Message::GetBlocks {
-                                    from_height: from,
-                                    max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                                });
-                            if dual_probe {
-                                // Probe the opposite bootstrap lane to avoid deadlock when peers
-                                // have tip blocks but not an explicit h=0 genesis entry (or vice versa).
-                                let probe_from = if from == 0 { 1 } else { 0 };
+                        let no_block_response_ms = now.saturating_sub(last_blocks_response_ms);
+                        if bootstrap_has_genesis {
+                            if !bootstrap_sync_dormant
+                                && no_block_response_ms >= sync_bootstrap_dormant_ms
+                            {
+                                bootstrap_sync_dormant = true;
+                                bootstrap_sync_dormant_since_ms = now;
+                                last_bootstrap_dormant_log_ms = now;
                                 eprintln!(
-                                    "[StarForge] sync probe from h={} (tip=0, peers={}, reason=bootstrap-dual-probe)",
-                                    probe_from, active_peers
+                                    "[StarForge] sync dormancy entered at tip=0 after {} ms without block responses (peers={})",
+                                    no_block_response_ms, active_peers
                                 );
-                                network
-                                    .try_send(Message::GetBlocks {
-                                        from_height: probe_from,
-                                        max_count: SYNC_GETBLOCKS_MAX_COUNT,
-                                    });
+                            } else if bootstrap_sync_dormant
+                                && now.saturating_sub(last_bootstrap_dormant_log_ms)
+                                    >= SYNC_BOOTSTRAP_DORMANT_LOG_MS
+                            {
+                                eprintln!(
+                                    "[StarForge] sync dormancy active for {} ms at tip=0 (peers={})",
+                                    now.saturating_sub(bootstrap_sync_dormant_since_ms),
+                                    active_peers
+                                );
+                                last_bootstrap_dormant_log_ms = now;
                             }
-                            last_sync_request_ms = now;
-                            if bootstrap_has_genesis {
-                                bootstrap_genesis_stall_count =
-                                    bootstrap_genesis_stall_count.saturating_add(1);
-                            } else if tip > 0 {
-                                bootstrap_genesis_stall_count = 0;
-                            }
+                        } else if bootstrap_sync_dormant {
+                            bootstrap_sync_dormant = false;
+                            bootstrap_sync_dormant_since_ms = 0;
+                            last_bootstrap_dormant_log_ms = 0;
+                            bootstrap_genesis_stall_count = 0;
+                        }
+                        if !has_genesis || stalled || (bootstrap_has_genesis && !bootstrap_sync_dormant) {
+                            // Exponential backoff for stalled-at-tip sync requests.
+                            // Bootstrap always uses base retry rate; stalled uses 2^n * 1s capped at 30s.
+                            let effective_retry = if stalled && !bootstrap_has_genesis {
+                                let backoff_ms = (sync_retry_ms << consecutive_stall_syncs.min(5))
+                                    .min(SYNC_STALL_BACKOFF_CAP_MS);
+                                backoff_ms
+                            } else {
+                                consecutive_stall_syncs = 0;
+                                sync_retry_ms
+                            };
+                            if now.saturating_sub(last_sync_request_ms) < effective_retry {
+                                // Skip — backoff not elapsed yet.
+                            } else {
+                                let dual_probe = bootstrap_has_genesis
+                                    && bootstrap_genesis_stall_count >= 3
+                                    && no_block_response_ms >= sync_stall_ms;
+                                let from = if !has_genesis {
+                                    0
+                                } else if bootstrap_has_genesis {
+                                    if bootstrap_genesis_stall_count >= 3 { 0 } else { 1 }
+                                } else {
+                                    tip.saturating_add(1)
+                                };
+                                let reason = if !has_genesis {
+                                    "bootstrap-no-genesis"
+                                } else if bootstrap_has_genesis {
+                                    if from == 0 {
+                                        "bootstrap-has-genesis-fallback0"
+                                    } else {
+                                        "bootstrap-has-genesis"
+                                    }
+                                } else {
+                                    "stalled"
+                                };
+                                let mut sent_any = false;
+                                if try_send_sync_getblocks(
+                                    &network,
+                                    &mut recent_sync_requests,
+                                    from,
+                                    SYNC_GETBLOCKS_MAX_COUNT,
+                                    now,
+                                    false,
+                                ) {
+                                    eprintln!(
+                                        "[StarForge] sync request from h={} (tip={}, peers={}, reason={})",
+                                        from, tip, active_peers, reason
+                                    );
+                                    sent_any = true;
+                                }
+                                if dual_probe {
+                                    let probe_from = if from == 0 { 1 } else { 0 };
+                                    if try_send_sync_getblocks(
+                                        &network,
+                                        &mut recent_sync_requests,
+                                        probe_from,
+                                        SYNC_GETBLOCKS_MAX_COUNT,
+                                        now,
+                                        false,
+                                    ) {
+                                        eprintln!(
+                                            "[StarForge] sync probe from h={} (tip=0, peers={}, reason=bootstrap-dual-probe)",
+                                            probe_from, active_peers
+                                        );
+                                        sent_any = true;
+                                    }
+                                }
+                                if sent_any {
+                                    if stalled && !bootstrap_has_genesis {
+                                        consecutive_stall_syncs =
+                                            consecutive_stall_syncs.saturating_add(1);
+                                    }
+                                    last_sync_request_ms = now;
+                                    if bootstrap_has_genesis {
+                                        bootstrap_genesis_stall_count =
+                                            bootstrap_genesis_stall_count.saturating_add(1);
+                                    } else if tip > 0 {
+                                        bootstrap_genesis_stall_count = 0;
+                                    }
+                                }
+                            } // end effective_retry else
                         }
                     }
                     if !mining_enabled {
+                        continue;
+                    }
+                    if let Some(err) = chain_checkpoint_config_error.as_deref() {
+                        if pending_mining.is_some() {
+                            eprintln!(
+                                "[StarForge] cancel pending mining while checkpoint config is invalid"
+                            );
+                            pending_mining = None;
+                        }
+                        if now.saturating_sub(last_chain_continuity_log_ms) > 10_000 {
+                            eprintln!(
+                                "[StarForge] mining paused: invalid checkpoint configuration ({})",
+                                err
+                            );
+                            last_chain_continuity_log_ms = now;
+                        }
                         continue;
                     }
                     if min_peers_for_mining > 0 {
@@ -1407,11 +2184,11 @@ impl Node {
                             continue;
                         }
                     }
+                    let local_tip = match ledger.lock() {
+                        Ok(l) => l.height().unwrap_or(0),
+                        Err(_) => 0,
+                    };
                     if min_local_height_for_mining > 0 {
-                        let local_tip = match ledger.lock() {
-                            Ok(l) => l.height().unwrap_or(0),
-                            Err(_) => 0,
-                        };
                         if local_tip < min_local_height_for_mining {
                             if now.saturating_sub(last_peer_gate_log_ms) > 10_000 {
                                 eprintln!(
@@ -1423,7 +2200,71 @@ impl Node {
                             continue;
                         }
                     }
+                    if let Some(checkpoint) = chain_checkpoint {
+                        let checkpoint_status = match ledger.lock() {
+                            Ok(l) => local_checkpoint_status(&l, checkpoint),
+                            Err(_) => Err("ledger lock poisoned".to_string()),
+                        };
+                        match checkpoint_status {
+                            Ok(LocalCheckpointStatus::Match) => {}
+                            Ok(LocalCheckpointStatus::Pending) => {
+                                if pending_mining.is_some() {
+                                    eprintln!(
+                                        "[StarForge] cancel pending mining while waiting for checkpoint sync"
+                                    );
+                                    pending_mining = None;
+                                }
+                                if now.saturating_sub(last_chain_continuity_log_ms) > 10_000 {
+                                    eprintln!(
+                                        "[StarForge] mining paused: waiting to reach checkpoint h={} (local_tip={})",
+                                        checkpoint.height,
+                                        local_tip
+                                    );
+                                    last_chain_continuity_log_ms = now;
+                                }
+                                continue;
+                            }
+                            Ok(LocalCheckpointStatus::Mismatch(local_hash)) => {
+                                if pending_mining.is_some() {
+                                    eprintln!(
+                                        "[StarForge] cancel pending mining while checkpoint mismatch is active"
+                                    );
+                                    pending_mining = None;
+                                }
+                                if now.saturating_sub(last_chain_continuity_log_ms) > 10_000 {
+                                    eprintln!(
+                                        "[StarForge] mining paused: checkpoint mismatch h={} local={} expected={}",
+                                        checkpoint.height,
+                                        hex_hash(local_hash),
+                                        hex_hash(checkpoint.hash)
+                                    );
+                                    last_chain_continuity_log_ms = now;
+                                }
+                                continue;
+                            }
+                            Err(err) => {
+                                if pending_mining.is_some() {
+                                    eprintln!(
+                                        "[StarForge] cancel pending mining while checkpoint verification fails"
+                                    );
+                                    pending_mining = None;
+                                }
+                                if now.saturating_sub(last_chain_continuity_log_ms) > 10_000 {
+                                    eprintln!(
+                                        "[StarForge] mining paused: checkpoint verification failed ({})",
+                                        err
+                                    );
+                                    last_chain_continuity_log_ms = now;
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     if now < fork_guard_pause_until_ms {
+                        if pending_mining.is_some() {
+                            eprintln!("[StarForge] cancel pending mining while fork guard is active");
+                            pending_mining = None;
+                        }
                         if now.saturating_sub(last_fork_guard_log_ms) > 10_000 {
                             eprintln!(
                                 "[StarForge] mining paused by fork guard for {} ms",
@@ -1434,6 +2275,12 @@ impl Node {
                         continue;
                     }
                     if !chain_continuity_ok {
+                        if pending_mining.is_some() {
+                            eprintln!(
+                                "[StarForge] cancel pending mining while chain continuity is unverified"
+                            );
+                            pending_mining = None;
+                        }
                         if now.saturating_sub(last_chain_continuity_log_ms) > 10_000 {
                             eprintln!(
                                 "[StarForge] mining paused: chain continuity not verified ({})",
@@ -1449,7 +2296,7 @@ impl Node {
                     }
                     {
                         let ts_now = now_ms();
-                        let (height, proposer_streak, mining_rules, prev_block) = match ledger.lock() {
+                        let (height, proposer_streak, mining_rules, prev_block, prev, parent_ts, elected_leader) = match ledger.lock() {
                             Ok(l) => {
                                 let tip = l.height().unwrap_or(0);
                                 let has_genesis = l.get_block(0).unwrap_or(None).is_some();
@@ -1463,7 +2310,20 @@ impl Node {
                                     }
                                 };
                                 let prev = if height > 0 { l.get_block(height.saturating_sub(1)).ok().flatten() } else { None };
-                                (height, streak, rules, prev)
+                                let prev_hash = prev
+                                    .as_ref()
+                                    .map(|b| hash_header_for_link(&b.header))
+                                    .unwrap_or(Hash32::ZERO);
+                                let parent_ts = prev
+                                    .as_ref()
+                                    .map(|b| b.header.timestamp_ms)
+                                    .unwrap_or(0);
+                                let elected_leader = if forge_election_enabled && height > 1 {
+                                    forge_election_for_height(&l, height).map(|election| election.leader)
+                                } else {
+                                    None
+                                };
+                                (height, streak, rules, prev, prev_hash, parent_ts, elected_leader)
                             }
                             Err(_) => continue,
                         };
@@ -1474,20 +2334,11 @@ impl Node {
                         // Query the local ledger for the election result.
                         // All nodes compute the same result from chain state,
                         // so this works whether we're a ForgeTitan or a miner.
-                        if forge_election_enabled && height > 1 {
-                            if let Ok(l) = ledger.lock() {
-                                if let Some(election) = forge_election_for_height(&l, height) {
-                                    if election.leader != proposer_id {
-                                        // Not elected — wait FORGE_GRACE_MS from parent timestamp
-                                        let parent_ts = prev_block
-                                            .as_ref()
-                                            .map(|b| b.header.timestamp_ms)
-                                            .unwrap_or(0);
-                                        let grace_expires = parent_ts.saturating_add(FORGE_GRACE_MS);
-                                        if ts_now < grace_expires {
-                                            continue;
-                                        }
-                                    }
+                        if let Some(elected_leader) = elected_leader {
+                            if elected_leader != proposer_id {
+                                let grace_expires = parent_ts.saturating_add(FORGE_GRACE_MS);
+                                if ts_now < grace_expires {
+                                    continue;
                                 }
                             }
                         }
@@ -1521,10 +2372,6 @@ impl Node {
                             }
                         };
                         txs.insert(0, coinbase);
-                        let prev = prev_block
-                            .as_ref()
-                            .map(|b| hash_header_for_link(&b.header))
-                            .unwrap_or(Hash32::ZERO);
                         let tx_hashes = txs
                             .iter()
                             .filter_map(|t| bincode::encode_to_vec(t, bincode::config::standard()).ok().map(|v| hash_bytes(&v)))
@@ -1542,6 +2389,17 @@ impl Node {
                                 continue;
                             }
                         }
+                        let proposal_still_current = match ledger.lock() {
+                            Ok(l) => proposal_target_matches_current_chain(&l, height, prev),
+                            Err(_) => false,
+                        };
+                        if !proposal_still_current {
+                            eprintln!(
+                                "[StarForge] proposal aborted h={} — chain changed before mining start",
+                                height
+                            );
+                            continue;
+                        }
                         let header = BlockHeader {
                             version: 1,
                             height,
@@ -1554,6 +2412,20 @@ impl Node {
                             proposer: proposer_id,
                             qc: None,
                         };
+                        if let Some(checkpoint) = chain_checkpoint {
+                            if header.height == checkpoint.height {
+                                let proposed_hash = hash_header_for_link(&header);
+                                if proposed_hash != checkpoint.hash {
+                                    eprintln!(
+                                        "[StarForge] proposal aborted h={} checkpoint mismatch expected={} got={}",
+                                        checkpoint.height,
+                                        hex_hash(checkpoint.hash),
+                                        hex_hash(proposed_hash)
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         let hash = hash_header_for_signing(&header);
                         let sig = match sign_consensus(&secret, &hash.0) {
                             Ok(sig) => sig,
@@ -1673,7 +2545,22 @@ async fn request_diamond_signature(endpoint: &str, block: &Block) -> Result<Vec<
     }
 }
 
-async fn rpc_request_with_timeout(
+fn rpc_endpoint_candidates(addrs: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in addrs
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        if seen.insert(candidate.to_string()) {
+            out.push(candidate.to_string());
+        }
+    }
+    out
+}
+
+async fn rpc_request_single_with_timeout(
     addr: &str,
     req: WalletRequest,
     timeout_dur: Duration,
@@ -1715,6 +2602,46 @@ async fn rpc_request_with_timeout(
         )
             .map_err(|e| format!("decode response failed: {e}"))?;
     Ok(resp)
+}
+
+async fn rpc_request_with_timeout(
+    addrs: &str,
+    req: WalletRequest,
+    timeout_dur: Duration,
+) -> Result<WalletResponse, String> {
+    let endpoints = rpc_endpoint_candidates(addrs);
+    if endpoints.is_empty() {
+        return Err("no upstream rpc endpoints configured".to_string());
+    }
+    let endpoint_count = endpoints.len();
+    let mut errors = Vec::new();
+    for endpoint in endpoints {
+        match rpc_request_single_with_timeout(&endpoint, req.clone(), timeout_dur).await {
+            Ok(resp) => return Ok(resp),
+            Err(err) => errors.push(err),
+        }
+    }
+    if endpoint_count > 1 {
+        let host_errors: Vec<String> = errors
+            .iter()
+            .map(|err| {
+                err
+                    .strip_prefix("connect ")
+                    .and_then(|rest| rest.split_once(" failed:"))
+                    .map(|(host, detail)| format!("{} failed:{}", host, detail))
+                    .unwrap_or_else(|| err.clone())
+            })
+            .collect();
+        return Err(format!(
+            "all upstream rpc endpoints failed [{}]: {}",
+            endpoint_count,
+            host_errors.join(" | ")
+        ));
+    }
+    Err(format!(
+        "all upstream rpc endpoints failed: {}",
+        errors.join(" | ")
+    ))
 }
 
 async fn rpc_get_blocks_with_timeout(

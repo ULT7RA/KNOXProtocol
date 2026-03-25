@@ -50,24 +50,34 @@ const NETWORK_ENV_OVERRIDE_REQUESTED = /^(1|true|yes)$/i.test(
 const ALLOW_NETWORK_ENV_OVERRIDES = !app.isPackaged && !MAINNET_LOCKED && NETWORK_ENV_OVERRIDE_REQUESTED;
 
 const HARDCODED_P2P_SEEDS = [
-  // ForgeTitan node-a (:9735)
+  // Current mainnet public peers (:9735 primary lane, :9745 secondary lane)
+  '132.226.76.90:9735',
+  '141.148.131.54:9735',
   '129.146.133.68:9735',
-  '129.146.140.173:9735',
-  '161.153.118.97:9735',
-  // ForgeTitan node-b (:9745)
+  '132.226.119.131:9735',
+  '161.153.44.116:9735',
+  '129.153.196.159:9735',
+  '132.226.76.90:9745',
+  '141.148.131.54:9745',
   '129.146.133.68:9745',
-  '129.146.140.173:9745',
-  '161.153.118.97:9745',
+  '132.226.119.131:9745',
+  '161.153.44.116:9745',
+  '129.153.196.159:9745',
 ];
 const HARDCODED_RPC_CANDIDATES = [
-  // ForgeTitan node-a (:9736)
+  // Current mainnet public RPC endpoints
+  '132.226.76.90:9736',
+  '141.148.131.54:9736',
   '129.146.133.68:9736',
-  '129.146.140.173:9736',
-  '161.153.118.97:9736',
-  // ForgeTitan node-b (:9746)
+  '132.226.119.131:9736',
+  '161.153.44.116:9736',
+  '129.153.196.159:9736',
+  '132.226.76.90:9746',
+  '141.148.131.54:9746',
   '129.146.133.68:9746',
-  '129.146.140.173:9746',
-  '161.153.118.97:9746',
+  '132.226.119.131:9746',
+  '161.153.44.116:9746',
+  '129.153.196.159:9746',
 ];
 const DEFAULT_PUBLIC_P2P_SEEDS = (() => {
   const env = String(process.env.KNOX_DEFAULT_PUBLIC_P2P_SEEDS || '')
@@ -298,6 +308,10 @@ const UPSTREAM_MINING_SAFETY_AUTO_OFF = /^(1|true|yes)$/i.test(
 );
 const AUTOSTART_ON_OPEN = !/^(0|false|no)$/i.test(String(process.env.KNOX_DESKTOP_AUTOSTART || '1'));
 const AUTO_LEDGER_RESET_ENABLED = !/^(0|false|no)$/i.test(String(process.env.KNOX_DESKTOP_AUTO_LEDGER_RESET || '1'));
+const CONTINUITY_MISMATCH_RESET_THRESHOLD = Math.max(
+  2,
+  Math.min(12, Number.parseInt(String(process.env.KNOX_DESKTOP_CONTINUITY_RESET_THRESHOLD || '3'), 10) || 3)
+);
 const PURGE_LEDGER_ON_APP_UPDATE = !/^(0|false|no)$/i.test(String(process.env.KNOX_PURGE_LEDGER_ON_UPDATE || '1'));
 const TOKEN = process.env.KNOX_WALLETD_TOKEN || crypto.randomBytes(24).toString('hex');
 
@@ -385,6 +399,11 @@ const forkOoStallState = {
   peerMaxH: 0,
   firstAtMs: 0,
 };
+const continuityMismatchState = {
+  count: 0,
+  firstAtMs: 0,
+  signature: ''
+};
 const FORK_OO_DESKTOP_THRESHOLD = 5;
 
 function resetRuntimeMiningSession() {
@@ -400,6 +419,22 @@ function resetRuntimeMiningSession() {
 function resetUpstreamFailureState() {
   upstreamFailureStreak = 0;
   upstreamFailureFirstAtMs = 0;
+}
+
+function noteContinuityMismatch(signature) {
+  const now = Date.now();
+  if (!continuityMismatchState.firstAtMs || now - continuityMismatchState.firstAtMs > 120000) {
+    continuityMismatchState.count = 0;
+    continuityMismatchState.firstAtMs = now;
+    continuityMismatchState.signature = '';
+  }
+  if (signature !== continuityMismatchState.signature) {
+    continuityMismatchState.count = 0;
+    continuityMismatchState.firstAtMs = now;
+    continuityMismatchState.signature = signature;
+  }
+  continuityMismatchState.count += 1;
+  return continuityMismatchState.count;
 }
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
@@ -1067,6 +1102,40 @@ function parseRuntimeLine(key, line, win) {
       }
       return;
     }
+    const continuityMismatch = line.match(
+      /chain continuity mismatch at h=(\d+)\s+\(local_tip=(\d+)\s+upstream_tip=(\d+)\)\s+local=([0-9a-f]+)\s+upstream=([0-9a-f]+)/i
+    );
+    if (continuityMismatch) {
+      const sharedHeight = Number(continuityMismatch[1] || 0);
+      const localTip = Number(continuityMismatch[2] || 0);
+      const upstreamTip = Number(continuityMismatch[3] || 0);
+      const localHash = String(continuityMismatch[4] || '');
+      const upstreamHash = String(continuityMismatch[5] || '');
+      const signature = `${sharedHeight}:${localHash}:${upstreamHash}`;
+      const repeatedHits = noteContinuityMismatch(signature);
+      const divergedAndStalled = localTip > sharedHeight + 1 && localTip >= upstreamTip;
+      if (AUTO_LEDGER_RESET_ENABLED
+          && divergedAndStalled
+          && repeatedHits >= CONTINUITY_MISMATCH_RESET_THRESHOLD
+          && !autoLedgerResetInFlight
+          && Date.now() >= autoLedgerResetCooldownUntilMs) {
+        appendLog(
+          win,
+          `[repair] continuity mismatch persisted (${repeatedHits} hits @ h=${sharedHeight}, local_tip=${localTip}, upstream_tip=${upstreamTip}); resetting ledger`
+        );
+        continuityMismatchState.count = 0;
+        continuityMismatchState.firstAtMs = 0;
+        continuityMismatchState.signature = '';
+        setTimeout(() => {
+          resetLocalLedgerAndRestart(win, `continuity-mismatch@h${sharedHeight}-local${localTip}-upstream${upstreamTip}`)
+            .then((res) => {
+              if (!res?.ok) appendLog(win, `[repair] continuity auto reset failed: ${res?.error || 'unknown'}`);
+            })
+            .catch((err) => appendLog(win, `[repair] continuity auto reset crashed: ${String(err?.message || err)}`));
+        }, 0);
+      }
+      return;
+    }
     // Fork recovery: detect node's own fork-recovery clear (new binary)
     if (/FORK RECOVERY:.*clearing chain for full resync/i.test(line)
         || /sync conflict persists at h=.*clearing local ledger/i.test(line)) {
@@ -1074,6 +1143,9 @@ function parseRuntimeLine(key, line, win) {
       forkOoStallState.count = 0;
       forkOoStallState.peerMaxH = 0;
       forkOoStallState.firstAtMs = 0;
+      continuityMismatchState.count = 0;
+      continuityMismatchState.firstAtMs = 0;
+      continuityMismatchState.signature = '';
       return;
     }
     // Fork recovery: detect persistent out-of-order stalls (old binary fallback)
@@ -1685,10 +1757,17 @@ async function recoverWalletdIfRefused(pathname = '/unknown') {
   }
 }
 
-async function waitForRemoteTipVisible(win, minTip = 1, timeoutMs = 25000) {
-  const deadline = Date.now() + Math.max(3000, Number(timeoutMs) || 25000);
+async function waitForRemoteTipVisible(win, minTip = 1, timeoutMs = 45000) {
+  // Check if we already have a valid tip from a prior probe.
+  if (lastUpstreamTipSeen >= minTip) {
+    appendLog(win, `[sync] upstream tip already known h=${lastUpstreamTipSeen}; mining gate opened`);
+    return { ok: true, result: lastUpstreamTipSeen };
+  }
+
+  const deadline = Date.now() + Math.max(5000, Number(timeoutMs) || 45000);
   let lastErr = '';
-  const tipProbeTimeoutMs = Math.min(15000, Math.max(6000, UPSTREAM_PROBE_TIMEOUT_MS));
+  // Use a SHORT per-probe timeout (8s) so we can fit multiple attempts.
+  const tipProbeTimeoutMs = 8000;
   while (Date.now() < deadline) {
     const probe = await walletdCall('/upstream-tip', null, { timeoutMs: tipProbeTimeoutMs });
     if (probe.ok && probe.result) {
@@ -1702,7 +1781,7 @@ async function waitForRemoteTipVisible(win, minTip = 1, timeoutMs = 25000) {
     } else {
       lastErr = String(probe.error || 'upstream tip unavailable');
     }
-    await waitMs(1000);
+    await waitMs(500);
   }
   return { ok: false, error: `upstream tip not visible before timeout (${lastErr || 'unknown'})` };
 }
@@ -1712,36 +1791,73 @@ function canonicalMinTipHeight() {
 }
 
 async function resolveCanonicalMiningGate(win, context = 'startup') {
-  const allowDegraded = !MAINNET_LOCKED && !FORCE_REMOTE_WALLET_MODE && ALLOW_DEGRADED_UPSTREAM_BOOT;
-  const walletStart = await ensureWalletdUpstreamConnected(win, UPSTREAM_PROBE_TIMEOUT_MS);
-  if (!walletStart.ok) {
-    if (!allowDegraded) {
-      return { ok: false, error: walletStart.error || `${context}: no reachable upstream RPC endpoint` };
+  if (!service.walletd) {
+    const allEndpoints = rpcCandidateList().join(',');
+    if (!allEndpoints) return { ok: false, error: 'no rpc candidates' };
+    const started = startWalletdOnRpc(win, allEndpoints);
+    if (!started.ok) return { ok: false, error: String(started.error || 'failed to start walletd') };
+    const ready = await waitForWalletdReady(8000);
+    if (!ready) return { ok: false, error: 'walletd did not become ready in time' };
+  }
+  // Try to get upstream tip; fall back to cached tip from last successful run.
+  const minTip = canonicalMinTipHeight();
+  let tipHeight = lastUpstreamTipSeen || 0;
+
+  // Try live probe for 20s (4 attempts × 5s timeout).
+  const deadline = Date.now() + 20000;
+  while (tipHeight < minTip && Date.now() < deadline) {
+    const tip = await walletdCall('/upstream-tip', null, { timeoutMs: 5000, retryOnRefused: true });
+    if (tip.ok && tip.result) {
+      tipHeight = Number(tip.result.tip_height || 0);
+      if (tipHeight > 0) lastUpstreamTipSeen = Math.max(lastUpstreamTipSeen, tipHeight);
     }
-    appendLog(
-      win,
-      `[guard] ${context}: upstream RPC unavailable; forcing mining OFF (${walletStart.error || 'unknown'})`
-    );
+    if (tipHeight < minTip) await waitMs(500);
+  }
+
+  // If live probe failed, use cached tip from disk.
+  if (tipHeight < minTip) {
+    const cached = loadCachedUpstreamTip();
+    if (cached >= minTip) {
+      tipHeight = cached;
+      lastUpstreamTipSeen = Math.max(lastUpstreamTipSeen, cached);
+      appendLog(win, `[sync] live tip probe failed; using cached tip h=${cached}`);
+    }
+  }
+
+  // Still nothing? Start node anyway but with mining OFF — it can sync via P2P.
+  if (tipHeight < minTip) {
+    appendLog(win, `[guard] ${context}: upstream tip unknown; starting node with mining OFF to sync via P2P`);
     return { ok: true, allowMining: false, minLocalHeightForMining: 0 };
   }
 
-  const tipReady = await waitForRemoteTipVisible(win, canonicalMinTipHeight(), 25000);
-  if (!tipReady.ok) {
-    if (!allowDegraded) {
-      return { ok: false, error: tipReady.error || `${context}: canonical upstream tip not visible` };
-    }
-    appendLog(
-      win,
-      `[guard] ${context}: canonical upstream tip not visible; forcing mining OFF (${tipReady.error || 'unknown'})`
-    );
-    return { ok: true, allowMining: false, minLocalHeightForMining: 0 };
-  }
+  // Save tip to disk for next startup.
+  saveCachedUpstreamTip(tipHeight);
+  appendLog(win, `[sync] mining gate opened (tip=${tipHeight}, context=${context})`);
+  return { ok: true, allowMining: true, minLocalHeightForMining: Math.max(0, tipHeight) };
+}
 
-  return {
-    ok: true,
-    allowMining: true,
-    minLocalHeightForMining: Math.max(0, Number(tipReady.result) || 0)
-  };
+function cachedTipPath() {
+  return require('path').join(
+    process.env.APPDATA || require('os').homedir(),
+    'knox-wallet-desktop', 'data', 'cached-upstream-tip.json'
+  );
+}
+
+function loadCachedUpstreamTip() {
+  try {
+    const raw = require('fs').readFileSync(cachedTipPath(), 'utf8');
+    const obj = JSON.parse(raw);
+    const tip = Number(obj.tip || 0);
+    return Number.isFinite(tip) && tip > 0 ? tip : 0;
+  } catch { return 0; }
+}
+
+function saveCachedUpstreamTip(tip) {
+  try {
+    const p = cachedTipPath();
+    require('fs').mkdirSync(require('path').dirname(p), { recursive: true });
+    require('fs').writeFileSync(p, JSON.stringify({ tip, ts: Date.now() }), 'utf8');
+  } catch {}
 }
 
 async function resolveRequestedMiningState(win, requestedMine, context = 'startup') {
@@ -1944,14 +2060,11 @@ function saveMiningConfig(incoming) {
 }
 
 function nodeDesktopEnv(mine, profile = null, minLocalHeightForMining = 0, minerAddress = '') {
-  const upstreamRpcCandidate = normalizeRpcEndpoint(
-    String(walletdRpcTarget || RPC_UPSTREAM || '').trim(),
-    ''
-  );
-  const safeNodeUpstreamRpc = (
-    upstreamRpcCandidate
-    && upstreamRpcCandidate !== LOCAL_NODE_RPC
-  ) ? upstreamRpcCandidate : '';
+  // Use whitespace-separated endpoints for compatibility with older node binaries
+  // that may not split comma-separated KNOX_NODE_UPSTREAM_RPC reliably.
+  const safeNodeUpstreamRpc = rpcCandidateList()
+    .filter((ep) => ep && ep !== LOCAL_NODE_RPC)
+    .join(' ');
 
   const env = {
     KNOX_NODE_NO_MINE: mine ? '0' : '1',
@@ -1962,6 +2075,8 @@ function nodeDesktopEnv(mine, profile = null, minLocalHeightForMining = 0, miner
     // Keep sync polling tight so out-of-window batches do not stall for long.
     KNOX_SYNC_RETRY_MS: '1000',
     KNOX_SYNC_STALL_MS: '4000',
+    // Avoid endless bootstrap polling noise when a small private cluster is idle.
+    KNOX_SYNC_BOOTSTRAP_DORMANT_MS: '15000',
     KNOX_NODE_UPSTREAM_SYNC_BATCH_COUNT: String(DESKTOP_UPSTREAM_SYNC_BATCH),
     KNOX_NODE_UPSTREAM_SYNC_TIMEOUT_MS: String(DESKTOP_UPSTREAM_SYNC_TIMEOUT_MS),
     KNOX_TRUST_SYNC_BLOCKS: '1'
@@ -1971,6 +2086,7 @@ function nodeDesktopEnv(mine, profile = null, minLocalHeightForMining = 0, miner
   }
   if (MAINNET_LOCKED) {
     env.KNOX_MAINNET_LOCK = '1';
+    env.KNOX_CHAIN_CONTINUITY_FAIL_CLOSED = '1';
     const premineAddress =
       parseKnoxAddress(process.env.KNOX_MAINNET_PREMINE_ADDRESS || '') ||
       parseKnoxAddress(minerAddress) ||
@@ -1984,6 +2100,11 @@ function nodeDesktopEnv(mine, profile = null, minLocalHeightForMining = 0, miner
     if (/^[0-9a-f]{64}$/.test(genesisHash)) {
       env.KNOX_MAINNET_GENESIS_HASH = genesisHash;
     }
+    const configuredMinPeers = Number.parseInt(String(process.env.KNOX_MIN_PEERS_FOR_MINING || '').trim(), 10);
+    env.KNOX_MIN_PEERS_FOR_MINING =
+      Number.isFinite(configuredMinPeers) && configuredMinPeers >= 0
+        ? String(configuredMinPeers)
+        : '0';
   }
   const gateHeight = Number.isFinite(Number(minLocalHeightForMining))
     ? Math.max(0, Math.floor(Number(minLocalHeightForMining)))
@@ -2105,6 +2226,9 @@ function primeRuntimeNodeForStart(profile = null) {
   autoLedgerResetState.firstAtMs = 0;
   autoLedgerResetState.lastAtMs = 0;
   autoLedgerResetState.hitCount = 0;
+  continuityMismatchState.count = 0;
+  continuityMismatchState.firstAtMs = 0;
+  continuityMismatchState.signature = '';
 }
 
 async function resolveMinerAddress(options = {}) {
@@ -2285,6 +2409,9 @@ async function resetLocalLedgerAndRestart(win, reason = 'auto-ledger-reset') {
     forkOoStallState.count = 0;
     forkOoStallState.peerMaxH = 0;
     forkOoStallState.firstAtMs = 0;
+    continuityMismatchState.count = 0;
+    continuityMismatchState.firstAtMs = 0;
+    continuityMismatchState.signature = '';
     appendLog(win, '[repair] local ledger reset complete');
     return { ok: true, result: 'local ledger reset complete' };
   } finally {
